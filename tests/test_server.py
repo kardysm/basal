@@ -109,7 +109,7 @@ def test_benchmark_sync_and_memory_follow_backend_device(monkeypatch):
 
 @pytest.mark.parametrize(("mode", "quant"), [
     ("eager", "fp8"), ("fast", "q8"), ("mps", "fp8"), ("mlx", "nvfp4"), ("vllm", "fp8"), ("gguf", "q8"),
-    ("mlx", "fp8"), ("mps", "q8"), ("eager", "nvfp4"), ("sglang", "fp8"), ("ollama", "q8"),
+    ("mlx", "fp8"), ("mps", "q8"), ("eager", "nvfp4"), ("sglang", "fp8"), ("ollama", "q8"), ("npu", "fp8"),
 ])
 def test_unsupported_quant_fails_before_model_loading(monkeypatch, mode, quant):
     monkeypatch.setattr(sys, "argv", ["basal-serve", "--mode", mode, "--quant", quant])
@@ -123,6 +123,22 @@ def test_gguf_mode_needs_a_file_before_model_loading(monkeypatch):
     monkeypatch.setattr(server_module, "resolve", lambda *_, **__: pytest.fail("must reject before loading a model"))
     with pytest.raises(SystemExit, match="--gguf"):
         server_module.main()
+
+
+def test_npu_mode_needs_an_onnx_folder_before_model_loading(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["basal-serve", "--mode", "npu"])
+    monkeypatch.setattr(server_module, "resolve", lambda *_, **__: pytest.fail("must reject before loading a model"))
+    with pytest.raises(SystemExit, match="--onnx"):
+        server_module.main()
+
+
+def test_benchmark_times_npu_prompts_cold():
+    """The npu backend keeps its last prompt in the KV cache; a timed repeat must not reuse it."""
+    from types import SimpleNamespace
+    calls = []
+    npu = SimpleNamespace(reset_prefix_cache=lambda: calls.append("reset"))
+    bench_module.timed(lambda: calls.append("work"), 2, npu)
+    assert calls == ["reset", "work", "reset", "work"]
 
 
 def test_named_options_show_keys_by_default():

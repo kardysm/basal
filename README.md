@@ -90,7 +90,7 @@ calibration procedure.
 
 ## Engines
 
-basal runs on six engines, all behind the same `basal-serve` HTTP API (`POST /v1/systemone`). Commands below use
+basal runs on seven engines, all behind the same `basal-serve` HTTP API (`POST /v1/systemone`). Commands below use
 basal-1.5; replace the repository name for max or mini.
 
 <!-- engines -->
@@ -102,8 +102,9 @@ basal-1.5; replace the repository name for max or mini.
 | **MLX** | `mlx` (default on a Mac with `basal[mlx]`); `mlx-q8` | Apple Silicon | Macs: `-MLX-8bit` (recommended) or `-MLX-fp4` (half the memory); `mlx-q8` makes 8-bit weights from bf16 at load time | `basal-serve --model Remek/basal-1.5-4.5B-MLX-8bit --mode mlx` (extra `basal[mlx]`) | **verified** on an Apple M4 Pro (500 development decisions): agreement with bf16 0.992 (`-MLX-8bit`) / 0.970 (`-MLX-fp4`), 587 / 581 ms per question |
 | **Ollama** | `ollama` | CPU, Apple Silicon, consumer GPUs | local and desktop use with Ollama (`-GGUF`) | 1. `hf download Remek/basal-1.5-4.5B-GGUF --local-dir basal-1.5-4.5B-GGUF` 2. in that folder: `ollama create basal-1.5-4.5b:q8_0 -f Modelfile.Q8_0` 3. `basal-serve --model ./basal-1.5-4.5B-GGUF --mode ollama --ollama-model basal-1.5-4.5b:q8_0` | **verified** on an Apple M4 Pro (500 development decisions): agreement with bf16 0.994 (`Q8_0`) / 0.980 (`Q4_K_M`), 518 / 542 ms per question |
 | **llama.cpp** | `llamacpp`; `gguf` | CPU, Apple Silicon, consumer GPUs | `llama-server` with the `-GGUF` files; the engine's token ids are sent as is. `--mode gguf --gguf <file>` runs the file in process instead (extra `basal[gguf]`, [GGUF.md](docs/GGUF.md)) | 1. `llama-server -m basal-1.5-4.5B-GGUF/basal-1.5-4.5B-Q8_0.gguf -c 4096 --port 8080` 2. `basal-serve --model ./basal-1.5-4.5B-GGUF --mode llamacpp` | **verified** on an Apple M4 Pro (500 development decisions): agreement with bf16 0.994 (`Q8_0`) / 0.980 (`Q4_K_M`), 427 / 446 ms per question |
+| **ONNX Runtime GenAI** (AMD NPU) | `npu` | AMD Ryzen AI NPUs (XDNA 2): Strix Halo (Ryzen AI Max 300), Strix Point, Krackan Point | the NPU of Ryzen AI laptops and mini PCs, with a model folder you prepare with AMD Quark and Ryzen AI `model_generate` ([NPU.md](docs/NPU.md)) | `basal-serve --model Remek/basal-1.5-4.5B --mode npu --onnx <prepared folder>` (in the Ryzen AI environment) | **not measured on an NPU**: readout and prefix sharing match PyTorch with the CPU build of onnxruntime-genai (tiny model, `tests/test_npu.py`); no prepared checkpoint is published |
 
-**`basal-serve` is the decision layer in every row.** vLLM, SGLang, MLX, Ollama and llama.cpp run the weights; the typed answers (a calibrated probability for each of your options, both option orders, the state shared by several questions, `multi`, `act` and `facts`) come from `basal-serve --mode <engine>` in front of them, with the same HTTP API in every mode. A plain `ollama run` or `llama-cli` gives free text only. Evidence spans need the PyTorch engine (`fast`, `eager`); vLLM and SGLang start with a 4,096-token context (longer states are refused); raise it with `--max-len` (e.g. 32768 for long documents). Install and first request for each engine: [quick start](#quick-start).
+**`basal-serve` is the decision layer in every row.** vLLM, SGLang, MLX, Ollama, llama.cpp and ONNX Runtime GenAI run the weights; the typed answers (a calibrated probability for each of your options, both option orders, the state shared by several questions, `multi`, `act` and `facts`) come from `basal-serve --mode <engine>` in front of them, with the same HTTP API in every mode. A plain `ollama run` or `llama-cli` gives free text only. Evidence spans need the PyTorch engine (`fast`, `eager`); vLLM and SGLang start with a 4,096-token context (longer states are refused); raise it with `--max-len` (e.g. 32768 for long documents). Install and first request for each engine: [quick start](#quick-start).
 <!-- /engines -->
 
 > [!WARNING]
@@ -474,6 +475,22 @@ one after another, so the prompt cache of Ollama / llama.cpp computes the state 
 `OLLAMA_NUM_PARALLEL` / `llama-server -np`) serves concurrent clients. Evidence spans are not available in these modes.
 Details: [docs/PORTS.md](docs/PORTS.md), [docs/GGUF.md](docs/GGUF.md).
 
+### AMD NPU (Strix Halo, Ryzen AI)
+
+`--mode npu` runs basal on the NPU of AMD Ryzen AI processors (Strix Halo / Ryzen AI Max 300, Strix Point, Krackan
+Point) through ONNX Runtime GenAI, inside AMD's Ryzen AI Software environment. A basal decision is one prefill, which
+Ryzen AI's NPU-only and hybrid models both run on the NPU. No prepared checkpoint is published yet: you quantise the bf16
+model with AMD Quark and prepare it with Ryzen AI's `model_generate` (Windows), then point `--onnx` at the folder:
+
+```bash
+basal-serve --model Remek/basal-1.5-4.5B --mode npu --onnx basal-1.5-4.5B-rai-hybrid --port 8000
+```
+
+`--model` gives the tokenizer, chat template and calibration (downloaded without weights); requests and responses are
+those of every other mode, without evidence spans. This mode has not been measured on an NPU yet: check the port with
+`basal-bench --modes eager-fp32 npu --onnx <folder>` first. Preparation, Windows and Linux setup:
+[docs/NPU.md](docs/NPU.md).
+
 ### CPU
 
 `basal-serve --model Remek/basal-1.5-mini --mode eager --device cpu` runs everywhere, for tests and low volumes.
@@ -539,6 +556,7 @@ for f in choice noul score complex; do basal-run --input basal/examples/$f.jsonl
 | `gguf` | a GGUF file in process through llama.cpp (`--gguf <file>`, extra `basal[gguf]`); SOAM as llama.cpp sequences | Apple Silicon (Metal), CUDA, CPU |
 | `ollama` | the basal server in front of Ollama (GGUF ports; `--ollama-model`, `--ollama-url`) | anything Ollama runs on |
 | `llamacpp` | the basal server in front of `llama-server` (GGUF ports; `--llamacpp-url`) | anything llama.cpp runs on |
+| `npu` | an ONNX Runtime GenAI folder prepared for the AMD NPU (`--onnx <folder>`); shared prefixes by rewinding one KV cache ([docs/NPU.md](docs/NPU.md)) | AMD Ryzen AI NPUs: Strix Halo, Strix Point, Krackan Point |
 
 - Without `--mode`: `fast` on CUDA, `mlx` on Apple Silicon (`mps` without `basal[mlx]`), `eager` otherwise.
   `--quant fp8|nvfp4` applies to the CUDA graph modes and `--quant q8` to `mlx`; other combinations are refused at

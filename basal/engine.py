@@ -18,6 +18,8 @@ Backends:
                     time); shared-prefix KV cache
   GGUFBackend       a GGUF file in process through llama.cpp (llama-cpp-python; Metal, CUDA or CPU); shared prefix as
                     llama.cpp sequences
+  OGABackend        AMD Ryzen AI NPU (XDNA 2: Strix Halo, Strix Point, Krackan Point) through ONNX Runtime GenAI; shared
+                    prefixes by rewinding one KV cache
   OllamaBackend     Ollama with the GGUF exports (1.5): raw prompt, one token, top log-probabilities of the letters
   LlamaCppBackend   llama.cpp server with the GGUF exports (1.5): token-id prompt, `n_probs` log-probabilities
 """
@@ -900,6 +902,138 @@ class GGUFBackend(GraphBackend):
             for k in idx:
                 n = len(units[k][1]); probs[k] = pr[j: j + n]; j += n
         return self._assemble(groups, units, probs)
+
+
+def _softmax(z):
+    z = np.asarray(z, dtype=np.float64)
+    e = np.exp(z - z.max())
+    return e / e.sum()
+
+
+class OGABackend:
+    """AMD Ryzen AI NPU (XDNA 2: Strix Halo, Strix Point, Krackan Point) through ONNX Runtime GenAI (OGA): a model
+    folder prepared by Ryzen AI's `model_generate` (NPU-only or hybrid; its genai_config.json selects the RyzenAI
+    execution provider), or any other OGA folder (CPU, DirectML or CUDA builds of onnxruntime-genai). A basal decision
+    is one prefill and no decoding, so with a hybrid model (NPU prefill, iGPU decode) it runs on the NPU as well. Only
+    the weights come from the OGA folder; tokenizer, chat template and CALIBRATION.json come from the Hugging Face model
+    directory, so the token ids are those of the other backends; the readout is the softmax over the letters' logits at
+    the last position (`get_logits`).
+
+    NPU models take one sequence at a time. The prompts of a call are evaluated in lexicographic token order (the
+    depth-first order of their prefix trie) with one KV cache: each prompt rewinds the cache to its common prefix with
+    the previous prompt and appends only the rest, so a shared prefix (the system prompt, the state of a request, the
+    question of both option orders) is computed once, and every readout sees its own prompt only. If `rewind_to` fails
+    or disagrees with a fresh prefill at start-up, every prompt is computed in full."""
+
+    TOL = 0.02  # start-up check: largest total variation between rewound and fresh next-token distributions
+
+    def __init__(self, model_dir, onnx_dir, prefix=True):
+        import threading
+
+        import onnxruntime_genai as og
+        self.og = og
+        self.tok = AutoTokenizer.from_pretrained(model_dir)
+        self.prefill = PREFILL
+        onnx_dir = Path(onnx_dir)
+        gp = onnx_dir / "genai_config.json"
+        if not gp.exists():
+            raise ValueError(f"{onnx_dir} is not an ONNX Runtime GenAI model folder (no genai_config.json)")
+        full = json.loads(gp.read_text())
+        self._validate(Path(model_dir), onnx_dir, full["model"])
+        self.n_ctx = int(full["model"].get("context_length") or full.get("search", {}).get("max_length", 4096))
+        self.oga = og.Model(str(onnx_dir))
+        self.lock = threading.Lock()
+        self.gen, self.cached = None, []
+        self.prefix = prefix and self._rewind_ok()
+
+    def _validate(self, model_dir, onnx_dir, gc):
+        """The OGA folder must hold this model: layers, hidden size and vocabulary as in config.json (when the model
+        directory has one), and a vocabulary that covers the tokenizer."""
+        cp = model_dir / "config.json"
+        cfg = json.loads(cp.read_text()) if cp.exists() else {}
+        dec = gc.get("decoder", {})
+        for name, got in (("num_hidden_layers", dec.get("num_hidden_layers")), ("hidden_size", dec.get("hidden_size")),
+                          ("vocab_size", gc.get("vocab_size"))):
+            if got is not None and cfg.get(name) is not None and got != cfg[name]:
+                raise ValueError(f"{onnx_dir}: {name} is {got}, "
+                                 f"but {model_dir}/config.json specifies {name}={cfg[name]}")
+        if gc.get("vocab_size") is not None and gc["vocab_size"] < len(self.tok):
+            raise ValueError(f"{onnx_dir}: vocabulary of {gc['vocab_size']} tokens, tokenizer of {model_dir} has "
+                             f"{len(self.tok)}")
+
+    def encode(self, prompts):
+        return EagerBackend.encode(self, prompts)
+
+    def _generator(self):
+        p = self.og.GeneratorParams(self.oga)
+        p.set_search_options(max_length=self.n_ctx)
+        return self.og.Generator(self.oga, p)
+
+    def _rewind_ok(self):
+        """rewind_to must leave exactly the prefix in the cache: one short check against a fresh prefill at start-up
+        (execution providers differ); prefix reuse is turned off if it fails."""
+        import warnings
+        ids = self.tok("State once, ask many: one shared prefix, then every question and option order.",
+                       add_special_tokens=False).input_ids
+        a, b = ids[: len(ids) // 2], ids[len(ids) // 2:]
+        try:
+            g = self._generator()
+            g.append_tokens(np.asarray([a + b], dtype=np.int32))
+            g.rewind_to(len(a))
+            g.append_tokens(np.asarray([b[::-1]], dtype=np.int32))
+            got = g.get_logits().reshape(-1)
+        except Exception as e:  # noqa: BLE001
+            warnings.warn(f"ONNX Runtime GenAI: rewind_to is not supported here ({e}); "
+                          "every prompt is computed in full")
+            return False
+        f = self._generator()
+        f.append_tokens(np.asarray([a + b[::-1]], dtype=np.int32))
+        tv = 0.5 * float(np.abs(_softmax(got) - _softmax(f.get_logits().reshape(-1))).sum())
+        if tv > self.TOL:
+            warnings.warn(f"ONNX Runtime GenAI: rewind_to differs from a fresh prefill (total variation {tv:.3f}); "
+                          "every prompt is computed in full")
+            return False
+        return True
+
+    def _logits(self, t):
+        """Next-token logits after prompt t (float32 [vocab]); the cache continues from the previous prompt's common
+        prefix with t."""
+        if len(t) > self.n_ctx:
+            raise ValueError(f"prompt too long for the ONNX model: {len(t)} tokens (context {self.n_ctx}; "
+                             "a long-context model takes more)")
+        import os
+        try:
+            if self.prefix and self.gen is not None:
+                n = min(len(os.path.commonprefix([self.cached, t])), len(t) - 1)
+                if n < len(self.cached):
+                    self.gen.rewind_to(n)
+            else:
+                self.gen, n = self._generator(), 0
+            self.gen.append_tokens(np.asarray([t[n:]], dtype=np.int32))
+            self.cached = list(t)
+            return self.gen.get_logits().reshape(-1)
+        except Exception:
+            self.gen, self.cached = None, []  # cache state unknown: the next prompt starts a new generator
+            raise
+
+    def reset_prefix_cache(self):
+        """Forget the cached prompt: the next prompt is computed in full (basal-bench times cold prompts)."""
+        with self.lock:
+            if self.gen is not None and self.prefix:
+                self.gen.rewind_to(0)
+            self.cached = []
+
+    def run_shared(self, groups, policy=None):
+        flat = [t for prompts, _ in groups for t in self.encode(prompts)]
+        lids = [ids for _, x in groups for ids in x]
+        res = [None] * len(flat)
+        with self.lock:
+            for k in sorted(range(len(flat)), key=flat.__getitem__):  # depth-first order of the prefix trie
+                res[k] = _softmax(self._logits(flat[k])[list(lids[k])]).tolist()
+        return _split(res, groups)
+
+    def run(self, prompts, ids_list):
+        return [r[0] for r in self.run_shared([([p], [x]) for p, x in zip(prompts, ids_list)])]
 
 
 class _HTTPLetters:

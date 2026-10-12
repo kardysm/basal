@@ -27,7 +27,7 @@ from pathlib import Path
 import torch
 
 from .engine import (EagerBackend, ExitGraphBackend, GGUFBackend, GraphBackend, LlamaCppBackend, MLXBackend,
-                     MPSBackend, OllamaBackend, SGLangBackend, VLLMBackend, resolve)
+                     MPSBackend, OGABackend, OllamaBackend, SGLangBackend, VLLMBackend, resolve)
 from .evidence import Evidence
 from .facts import inject as inject_facts
 from .prompt import MAX_OPTIONS, lang_of, letter_ids, render
@@ -48,6 +48,7 @@ MODES = {
     "mlx-q8": ("mlx", "q8", False),         # "mlx" with 8-bit weights made at load time (less memory, not faster)
     "mps": ("mps", None, False),            # Apple Silicon: PyTorch MPS + shared prefix, no graphs
     "gguf": ("gguf", None, False),          # llama.cpp in process on a GGUF file (--gguf; Metal, CUDA or CPU)
+    "npu": ("npu", None, False),            # AMD Ryzen AI NPU (Strix Halo, ...) through ONNX Runtime GenAI (--onnx)
     "ollama": ("ollama", None, False),      # Ollama with the GGUF exports (1.5); --ollama-url, --ollama-model
     "llamacpp": ("llamacpp", None, False),  # llama.cpp server with the GGUF exports (1.5); --llamacpp-url
 }
@@ -232,8 +233,12 @@ class Server:
         kind, quant, comp = MODES[a.mode]
         if kind == "gguf" and not a.gguf:
             raise SystemExit("--mode gguf needs --gguf <file.gguf> (--model gives tokenizer and calibration)")
-        # GGUF modes: the engine serves the GGUF weights, so only tokenizer, template and calibration are downloaded
-        md = resolve(a.model, a.revision, metadata_only=kind in ("gguf", "ollama", "llamacpp"))
+        if kind == "npu" and not a.onnx:
+            raise SystemExit("--mode npu needs --onnx <folder> (an ONNX Runtime GenAI model folder prepared for the "
+                             "NPU; --model gives tokenizer and calibration)")
+        # GGUF and ONNX modes: the engine serves its own weights, so only tokenizer, template and calibration are
+        # downloaded
+        md = resolve(a.model, a.revision, metadata_only=kind in ("gguf", "ollama", "llamacpp", "npu"))
         self.name = a.name or a.model.rstrip("/").split("/")[-1]
         quant = a.quant or quant
         if kind == "eager":
@@ -251,6 +256,8 @@ class Server:
             self.backend = MPSBackend(md, a.dtype, shared=a.orders == 2)
         elif kind == "gguf":
             self.backend = GGUFBackend(md, a.gguf)
+        elif kind == "npu":
+            self.backend = OGABackend(md, resolve(a.onnx))
         elif kind == "ollama":
             self.backend = OllamaBackend(md, a.ollama_url, a.ollama_model, parallel=a.http_parallel)
         elif kind == "llamacpp":
@@ -261,7 +268,8 @@ class Server:
         model = getattr(self.backend, "model", None)  # evidence head: needs the in-process HF model
         self.evidence = Evidence(md, model, self.tok) if isinstance(model, torch.nn.Module) else None
         cal = md / f"CALIBRATION.{kind}.json"  # 1.5: each engine has its own calibration file when shipped
-        cal = cal if kind in ("vllm", "sglang", "mlx", "ollama", "llamacpp") and cal.exists() else md / "CALIBRATION.json"
+        own = ("vllm", "sglang", "mlx", "ollama", "llamacpp", "npu")
+        cal = cal if kind in own and cal.exists() else md / "CALIBRATION.json"
         cal = Path(a.calibration) if a.calibration else cal
         self.cal = {} if a.no_calibration or not cal.exists() else json.loads(cal.read_text())
         self.temps = self.cal.get("temperature_per_prim", {})
@@ -447,6 +455,9 @@ def parser():
     ap.add_argument("--max-len", dest="max_len", type=int, default=4096,
                     help="--mode vllm / sglang: context length in tokens (longer states are refused; raise it for long documents)")
     ap.add_argument("--gguf", default=None, help="--mode gguf: GGUF weights (a -GGUF file or one converted from --model)")
+    ap.add_argument("--onnx", default=None,
+                    help="--mode npu: ONNX Runtime GenAI model folder (local or Hugging Face repo id; for the AMD NPU, "
+                         "prepared by Ryzen AI model_generate)")
     ap.add_argument("--ollama-url", dest="ollama_url", default="http://127.0.0.1:11434", help="--mode ollama")
     ap.add_argument("--ollama-model", dest="ollama_model", default=None,
                     help="--mode ollama: Ollama model name (the -GGUF repositories); --model gives the tokenizer")

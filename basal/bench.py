@@ -23,15 +23,16 @@ from pathlib import Path
 import torch
 
 from .engine import (EagerBackend, ExitGraphBackend, GGUFBackend, GraphBackend, LlamaCppBackend, MLXBackend,
-                     MPSBackend, OllamaBackend, SGLangBackend, VLLMBackend, resolve)
+                     MPSBackend, OGABackend, OllamaBackend, SGLangBackend, VLLMBackend, resolve)
 from .prompt import letter_ids, render
 from .server import MODES, default_mode
 
-GGUF_KINDS = ("gguf", "ollama", "llamacpp")  # the engine serves GGUF weights: --model gives tokenizer and calibration
+# the engine serves GGUF or ONNX weights: --model gives tokenizer and calibration
+GGUF_KINDS = ("gguf", "ollama", "llamacpp", "npu")
 
 
 def build(mode, md, vllm_model=None, gguf=None, ollama_model=None, ollama_url="http://127.0.0.1:11434",
-          llamacpp_url="http://127.0.0.1:8080"):
+          llamacpp_url="http://127.0.0.1:8080", onnx=None):
     if mode == "eager-fp32":
         return EagerBackend(md, "float32")
     if mode.startswith("fast-exit@"):
@@ -41,6 +42,11 @@ def build(mode, md, vllm_model=None, gguf=None, ollama_model=None, ollama_url="h
         if not path:
             raise SystemExit("mode gguf needs --gguf <file.gguf> (or gguf@<file.gguf>)")
         return GGUFBackend(md, path)
+    if mode == "npu" or mode.startswith("npu@"):
+        path = mode.split("@", 1)[1] if "@" in mode else onnx
+        if not path:
+            raise SystemExit("mode npu needs --onnx <folder> (or npu@<folder>)")
+        return OGABackend(md, resolve(path))
     kind, quant, comp = MODES[mode]
     if kind == "eager":
         return EagerBackend(md, "bfloat16")
@@ -75,6 +81,13 @@ def device_name():
         return torch.cuda.get_device_name(0)
     import platform
     import subprocess
+    if platform.system() == "Linux":  # e.g. "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S" (Strix Halo)
+        try:
+            for line in Path("/proc/cpuinfo").read_text().splitlines():
+                if line.startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+        except OSError:
+            pass
     try:
         return subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True).stdout.strip()
     except OSError:
@@ -95,7 +108,7 @@ def reset_memory():
 
 def memory_gb(be):
     """Peak allocated memory (CUDA, MLX); for MPS the memory held by the Metal driver at the end of the run; NaN for
-    backends without memory tracking (GGUF, Ollama, llama.cpp server, CPU)."""
+    backends without memory tracking (GGUF, ONNX Runtime GenAI, Ollama, llama.cpp server, CPU)."""
     if isinstance(be, MLXBackend):
         return be.mx.get_peak_memory() / 2**30
     dev = getattr(be, "dev", None)
@@ -159,13 +172,15 @@ def decisions(groups, res):
 
 
 def cold(be):
-    """vLLM keeps finished prompts in its prefix cache; a repeated prompt would be answered almost for free. Clear it so
-    that every timed call computes its prompt (the second option order may still reuse the first order's prefix, as in
-    real serving)."""
+    """vLLM keeps finished prompts in its prefix cache (the npu mode its last prompt); a repeated prompt would be
+    answered almost for free. Clear it so that every timed call computes its prompt (the second option order may still
+    reuse the first order's prefix, as in real serving)."""
     if hasattr(be, "llm"):
         clear = getattr(be.llm, "reset_prefix_cache", None) or getattr(be.llm, "flush_cache", None)  # vLLM / SGLang
         if clear is not None:
             clear()
+    elif hasattr(be, "reset_prefix_cache"):  # ONNX Runtime GenAI (npu)
+        be.reset_prefix_cache()
 
 
 def timed(fn, reps, be=None):
@@ -204,11 +219,13 @@ def main():
     ap.add_argument("--ollama-model", dest="ollama_model", default=None, help="Ollama model name for --modes ollama")
     ap.add_argument("--ollama-url", dest="ollama_url", default="http://127.0.0.1:11434")
     ap.add_argument("--llamacpp-url", dest="llamacpp_url", default="http://127.0.0.1:8080")
+    ap.add_argument("--onnx", default=None, help="ONNX Runtime GenAI folder for --modes npu (several: npu@<folder>)")
     ap.add_argument("--modes", nargs="+", default=None,
                     help="default: eager-fp32 and the serving default (fast on CUDA); on Apple Silicon bf16 mps and mlx "
                          "(--modes eager-fp32 mps mlx for fp32 agreement if memory allows). Modes: eager-fp32, eager, "
                          "fast, fast-nocompile, fp8, nvfp4, vllm, sglang, fast-exit@off|0.999|0.995|0.99|0.98; Apple "
-                         "Silicon: mlx, mlx-q8, mps; GGUF: gguf, gguf@<file.gguf>, ollama, llamacpp")
+                         "Silicon: mlx, mlx-q8, mps; GGUF: gguf, gguf@<file.gguf>, ollama, llamacpp; AMD NPU: npu, "
+                         "npu@<folder>")
     ap.add_argument("--questions", nargs="+", default=DEFAULT_QUESTIONS,
                     help="JSONL file(s) with simple items (default: the bundled examples, 44 items)")
     ap.add_argument("--n", type=int, default=500)
@@ -223,7 +240,7 @@ def main():
     for mode in a.modes:
         reset_memory()
         t0 = time.time()
-        be = build(mode, md, vm, a.gguf, a.ollama_model, a.ollama_url, a.llamacpp_url)
+        be = build(mode, md, vm, a.gguf, a.ollama_model, a.ollama_url, a.llamacpp_url, a.onnx)
         load_s = time.time() - t0
         groups = groups_for(be.tok, qs)
         dec, r = measure(be, groups, min(a.lat_n, len(groups) - 5))
