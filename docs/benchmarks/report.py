@@ -62,6 +62,11 @@ def case_pairs(a, b):
     return [(a["cases"][c]["answers"], b["cases"][c]["answers"]) for c in a["cases"] if c in b["cases"]]
 
 
+def fmt(x, spec):
+    """A number in the given format; – for a check that could not run (its request failed)."""
+    return "–" if x is None else format(x, spec)
+
+
 def ms(x):
     return f"{x / 1000:.2f} s" if x >= 1000 else f"{x:.0f} ms"
 
@@ -101,6 +106,8 @@ print("|---|---|---|" + "---|" * len(timed))
 for c in cases:
     st, q = c.split("-q")
     vals = {e: lat(e, c) for e in timed if lat(e, c)}
+    if not vals:
+        continue
     best = min(vals.values())
     cells = [(f"**{ms(vals[e])}**" if vals[e] == best else ms(vals[e])) if e in vals else "–" for e in timed]
     print(f"| {st} | {q} | {R[timed[0]]['cases'][c]['branches']} | " + " | ".join(cells) + " |")
@@ -174,5 +181,5 @@ if E and E.exists():
                     for n in ER[e]["sequential"] if "answers" in ER[e]["sequential"][n]
                     and "answers" in ER[e]["concurrent"][n]])
         print(f"| {NAMES[e]} | {len(c['errors']) or 'none'} | {cs[0]}/{cs[1]} | {c['concurrent_vs_sequential_max_dp']:.4f} | "
-              f"{c['duplicate_questions_max_dp']:.1e} | {c['multi_selected_within_min_max']} | {c['act_action']} | "
+              f"{fmt(c['duplicate_questions_max_dp'], '.1e')} | {c['multi_selected_within_min_max']} | {c['act_action']} | "
               f"{vs[0]} | {vs[1]} |")

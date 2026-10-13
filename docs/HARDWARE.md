@@ -371,8 +371,10 @@ the top option equals that of bf16 `fast-nocompile` on all 78 readouts (mean |Δ
   (`PYTORCH_TUNABLEOP_ENABLED=1 PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED=0`: the hipBLASLt solutions fail inside HIP
   graph capture), tuned once in a process that exits normally (the results file is written at exit; about 4 minutes)
   and served with `PYTORCH_TUNABLEOP_TUNING=0` (rocBLAS defaults reach 13–16 TFLOPS on these GEMMs, tuned 20–21); and
-  `BASAL_TOKEN_BUDGET=4096 BASAL_WARMUP=1` with `BASAL_LENS` extended to 8192 (`…,3072,3584,4096,5120,6144,8192`) so
-  that a long state with several questions stays one packed row (5 questions over 2,400 tokens: 3.7 → 2.2 s).
+  `BASAL_TOKEN_BUDGET=4096 BASAL_WARMUP=1` with longer captured lengths, so that a long state with several questions
+  stays one packed row (5 questions over 2,400 tokens: 3.7 → 2.2 s). `BASAL_LENS` replaces the whole list, so give
+  the short lengths too, or every request is padded to the shortest one given:
+  `BASAL_LENS=128,192,256,320,384,448,512,640,768,896,1024,1280,1536,1792,2048,2304,2560,3072,3584,4096,5120,6144,8192`.
 - `--mode fast` (torch.compile + HIP graphs) works on ROCm with the same settings: 216 s start-up, 5–15% faster than
   `fast-nocompile`, still behind `gguf` on most request shapes.
 - Full benchmarks (1–20 questions over states of 100–6,000 tokens, concurrency up to 64 clients, agreement with an

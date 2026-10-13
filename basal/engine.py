@@ -116,15 +116,29 @@ class GraphBackend(EagerBackend):
         large batches add no throughput anyway: BASAL_TOKEN_BUDGET=4096 BASAL_WARMUP=1 starts in about 2 minutes."""
         import os
 
+        def env(name):  # unset and empty (BASAL_X=${UNSET} in a unit file) both mean the default
+            return (os.environ.get(name) or "").strip()
+
         def ints(name, default):
-            v = os.environ.get(name)
-            return sorted(int(x) for x in v.split(",")) if v else default
+            v = env(name)
+            xs = sorted(int(x) for x in v.split(",")) if v else default
+            if xs[0] < 1:
+                raise ValueError(f"{name} must be positive integers, got {v!r}")
+            return xs
+
+        def num(name, default):
+            v = env(name)
+            x = int(v) if v else default
+            if x < 1:
+                raise ValueError(f"{name} must be at least 1, got {v!r} (BASAL_WARMUP: lazy initialisation must not "
+                                 "happen during capture)")
+            return x
         cls = type(self)  # defaults: the class values (not overrides already set on this instance)
         self.LENS, self.BATCHES = ints("BASAL_LENS", cls.LENS), ints("BASAL_BATCHES", cls.BATCHES)
-        self.TOKEN_BUDGET = int(os.environ.get("BASAL_TOKEN_BUDGET", cls.TOKEN_BUDGET))
-        self.WARMUP = int(os.environ.get("BASAL_WARMUP", cls.WARMUP))
-        if self.WARMUP < 1:
-            raise ValueError("BASAL_WARMUP must be at least 1 (lazy initialisation must not happen during capture)")
+        if self.BATCHES[0] != 1:  # one row of every length is always captured, so no shape is captured under load
+            raise ValueError(f"BASAL_BATCHES must include 1, got {env('BASAL_BATCHES')!r}")
+        self.TOKEN_BUDGET = num("BASAL_TOKEN_BUDGET", cls.TOKEN_BUDGET)
+        self.WARMUP = num("BASAL_WARMUP", cls.WARMUP)
 
     def __init__(self, model_dir, dtype="bfloat16", quant=None, compile=False, shared=True, warm=True):
         self._shape_config()
@@ -526,6 +540,7 @@ class MPSBackend(GraphBackend):
     row of the chunk."""
 
     def __init__(self, model_dir, dtype="bfloat16", shared=True, device="mps"):
+        self._shape_config()  # BASAL_LENS / BATCHES / TOKEN_BUDGET set the batching here too (no graphs, no warm-up)
         EagerBackend.__init__(self, model_dir, dtype, device)
         self.dev = torch.device(device)
         self.shared = shared
@@ -839,15 +854,15 @@ class GGUFBackend(GraphBackend):
                              f"but {model_dir}/config.json specifies vocab_size={expected_vocab}")
         if self.n_vocab < len(self.tok):
             raise ValueError(f"{gguf}: vocabulary of {self.n_vocab} tokens, tokenizer of {model_dir} has {len(self.tok)}")
-        cp = C.llama_context_default_params()
-        cp.n_ctx = cp.n_batch = self.N_CTX
-        cp.n_ubatch = 512
-        if prefixes is None:  # a tokenizer without a chat template (tests) has no fixed prompt start
+        if prefixes is None:
             from .prompt import fixed_prefixes
-            prefixes = fixed_prefixes(self.tok) if hasattr(self.tok, "apply_chat_template") else []
+            prefixes = fixed_prefixes(self.tok)
         self.prefixes = [list(x) for x in prefixes if len(x) > 0]
         self.n_read = self.N_SEQ  # readout sequences are 0..n_read-1, the cached prefixes follow
-        self.n_cells = self.N_CTX - sum(map(len, self.prefixes))  # KV cells left for the rows of a chunk
+        cp = C.llama_context_default_params()
+        cp.n_batch = self.N_CTX
+        cp.n_ctx = self.N_CTX + sum(map(len, self.prefixes))  # the cached prefixes keep cells of their own
+        cp.n_ubatch = 512
         cp.n_seq_max = self.n_read + len(self.prefixes)
         cp.kv_unified = True  # sequences share the cells of their common prefix
         self.ctx = C.llama_init_from_model(self.cmodel, cp)
@@ -879,17 +894,25 @@ class GGUFBackend(GraphBackend):
         if getattr(self, "cmodel", None):
             C.llama_model_free(self.cmodel)
 
+    def _cost(self, pack):
+        """KV cells a packed row adds: its tokens minus a cached prefix it starts with."""
+        return len(pack[0]) - self._cached(pack)[0]
+
+    def _max_read(self):
+        """Readouts per chunk: N_SEQ, but never more than the readout sequences of the context (N_SEQ at start-up)."""
+        return min(self.N_SEQ, self.n_read)
+
     def _oversize(self, pack, n):
-        return len(pack[0]) > self.n_cells or n > self.N_SEQ
+        return self._cost(pack) > self.N_CTX or n > self._max_read()
 
     def _decode_chunks(self, units):
-        """Units sorted by length, cut into chunks of at most n_cells tokens and N_SEQ readouts."""
+        """Units sorted by length, cut into chunks of at most N_CTX new tokens and _max_read() readouts."""
         out, cur, n_tok, n_seq = [], [], 0, 0
         for k in sorted(range(len(units)), key=lambda k: len(units[k][0][0])):
-            t, r = len(units[k][0][0]), len(units[k][1])
-            if t > self.n_cells:
-                raise ValueError(f"prompt too long for the GGUF backend: {t} tokens (max {self.n_cells})")
-            if cur and (n_tok + t > self.n_cells or n_seq + r > self.N_SEQ):
+            t, r = self._cost(units[k][0]), len(units[k][1])
+            if t > self.N_CTX:
+                raise ValueError(f"prompt too long for the GGUF backend: {t} tokens (max {self.N_CTX})")
+            if cur and (n_tok + t > self.N_CTX or n_seq + r > self._max_read()):
                 out.append(cur); cur, n_tok, n_seq = [], 0, 0
             cur.append(k); n_tok += t; n_seq += r
         return out + ([cur] if cur else [])
@@ -910,6 +933,9 @@ class GGUFBackend(GraphBackend):
         C, b = self.C, self.batch
         for q in range(self._used):  # the readouts of the last chunk; the cached prefixes stay
             C.llama_memory_seq_rm(self.mem, q, -1, -1)
+        # every readout sequence of this chunk, recorded before any of them gets cells: after an error half-way the
+        # next call still removes them all
+        self._used = sum(len(packs[k][3]) for k in idx)
         n, base, reads = 0, 0, []
         for k in idx:
             t, pos, seg, last, parent = packs[k]
@@ -933,7 +959,6 @@ class GGUFBackend(GraphBackend):
                 reads.append(start + i)
             base += len(last)
         b.n_tokens = n
-        self._used = base
         if C.llama_decode(self.ctx, b) != 0:
             raise RuntimeError("llama_decode failed")
         return np.stack([np.ctypeslib.as_array(C.llama_get_logits_ith(self.ctx, r), shape=(self.n_vocab,))

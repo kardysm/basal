@@ -100,10 +100,11 @@ async def main(a):
             print(f"{a.label} {name:8s} branches {rec['branches']:3d} tokens {rec['input_tokens']:6d} "
                   f"p50 {rec['p50_ms']:8.1f} ms", flush=True)
         # concurrency: single questions over the short states of the examples (unique per request)
-        sing = singles()
+        sing, qs = singles(), pool()
+        first = len(qs) - len(sing)  # the single questions close the pool, in the order of singles()
         for conc in a.conc:
             n = max(48, 4 * conc)
-            reqs = [mark({"state": sing[i % len(sing)]["state"], "questions": {"q": pool()[16 + i % len(sing)][1]}},
+            reqs = [mark({"state": sing[i % len(sing)]["state"], "questions": {"q": qs[first + i % len(sing)][1]}},
                          f"c{conc}:{i}") for i in range(n)]
             sem = asyncio.Semaphore(conc)
             lat = []

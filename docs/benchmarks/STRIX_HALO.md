@@ -94,8 +94,13 @@ python docs/benchmarks/report.py results/matrix results/edge > report.md
   The tests fail when the attention mask lets sibling branches see each other (6 of 9) or when positions do not
   restart per branch (5 of 9).
 - `tests/test_gguf.py`: rows that begin with either cached prefix, and rows that do not, equal a full decode, also on a
-  second round after the first chunk's readout sequences were removed.
-- Full suite on this machine: 68 passed, 3 skipped (MLX / Apple only).
+  second round after the first chunk's readout sequences were removed. Regression tests from the code review (each
+  fails on the first version of the cache): a row may add N_CTX tokens after a cached prefix (the prefixes have cells
+  of their own); readouts never reach the prefix sequences when `N_SEQ` is raised after start-up (the first version
+  aborted in llama.cpp); a failure half-way through sharing the prefix cells leaves no stale cells behind.
+- `tests/test_graphs.py` also checks the `BASAL_*` validation (empty means default, `BASAL_BATCHES` must include 1,
+  positive values only) and that `--mode mps` reads the overrides.
+- Full suite on this machine: 78 passed, 3 skipped (MLX / Apple only).
 
 ## Results
 

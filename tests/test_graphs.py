@@ -26,6 +26,32 @@ def test_shape_config_env(monkeypatch):
         be._shape_config()
 
 
+@pytest.mark.parametrize("name,value,error", [
+    ("BASAL_TOKEN_BUDGET", "", None), ("BASAL_WARMUP", " ", None), ("BASAL_LENS", "", None),  # empty = default
+    ("BASAL_BATCHES", "2,4", "must include 1"), ("BASAL_LENS", "0,128", "positive"),
+    ("BASAL_TOKEN_BUDGET", "-5", "at least 1")])
+def test_shape_config_validation(monkeypatch, name, value, error):
+    monkeypatch.setenv(name, value)
+    be = GraphBackend.__new__(GraphBackend)
+    if error is None:
+        be._shape_config()
+        assert (be.LENS, be.BATCHES, be.TOKEN_BUDGET, be.WARMUP) == (GraphBackend.LENS, GraphBackend.BATCHES, 12288, 3)
+    else:
+        with pytest.raises(ValueError, match=error):
+            be._shape_config()
+
+
+def test_mps_backend_reads_the_overrides(monkeypatch):
+    """The MPS backend batches with the same shapes (no graphs): the overrides apply there too (run on the CPU)."""
+    from basal.engine import MPSBackend
+    for k, v in ENV.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setattr("basal.engine.AutoTokenizer.from_pretrained", lambda _: Tok())
+    monkeypatch.setattr("basal.engine.AutoModelForCausalLM.from_pretrained", lambda _, dtype: tiny().to(dtype))
+    be = MPSBackend("tiny", "float32", device="cpu")
+    assert (be.LENS, be.BATCHES, be.TOKEN_BUDGET) == ([16, 32, 64], [1, 2, 4], 128)
+
+
 gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA or ROCm GPU (graph capture)")
 
 
@@ -44,14 +70,13 @@ def tiny():
 
 @pytest.fixture(scope="module")
 def be():
-    mp = pytest.MonkeyPatch()
-    for k, v in ENV.items():
-        mp.setenv(k, v)
     m = tiny()
-    mp.setattr("basal.engine.AutoTokenizer.from_pretrained", lambda _: Tok())
-    mp.setattr("basal.engine.AutoModelForCausalLM.from_pretrained", lambda _, dtype: m.to(dtype))
-    yield GraphBackend("tiny", dtype="float32", shared=True, warm=True)
-    mp.undo()
+    with pytest.MonkeyPatch.context() as mp:
+        for k, v in ENV.items():
+            mp.setenv(k, v)
+        mp.setattr("basal.engine.AutoTokenizer.from_pretrained", lambda _: Tok())
+        mp.setattr("basal.engine.AutoModelForCausalLM.from_pretrained", lambda _, dtype: m.to(dtype))
+        yield GraphBackend("tiny", dtype="float32", shared=True, warm=True)
 
 
 def separate(m, toks, lids):

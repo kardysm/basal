@@ -87,6 +87,7 @@ async def main(a):
         out["concurrent"] = dict(zip(rq, res))
     seq, con = out["sequential"], out["concurrent"]
     errors = {n: r["error"] for n, r in seq.items() if "error" in r}
+    errors.update({f"{n} (concurrent)": r["error"] for n, r in con.items() if "error" in r})
     dmax = 0.0
     for n in rq:
         if "error" in seq[n] or "error" in con[n]:
