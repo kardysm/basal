@@ -3,7 +3,8 @@
   python docs/benchmarks/report.py results/matrix results/edge > report.md
 
 PRE = before the optimisation (what basal.service ran: llama-server in a Vulkan / Mesa 25.3 container + basal
---mode llamacpp; and upstream graph defaults). POST = basal.service now (in-process --mode gguf + prefix cache).
+--mode llamacpp; and upstream graph defaults). POST = basal.service now (--mode gguf-strix:
+in-process llama.cpp with the cached prompt start).
 """
 import json
 import sys
@@ -11,12 +12,12 @@ from pathlib import Path
 
 D, E = Path(sys.argv[1]), Path(sys.argv[2]) if len(sys.argv) > 2 else None
 ORDER = ["pre-llamacpp-vulkan", "llamacpp-rocm", "pre-graph-default", "graph-nosoam", "graph-soam", "graph-compile",
-         "gguf-nocache", "gguf", "ref-fp32"]
+         "gguf", "gguf-strix", "ref-fp32"]
 NAMES = {"pre-llamacpp-vulkan": "**PRE** llama-server Vulkan", "llamacpp-rocm": "llama-server ROCm",
          "pre-graph-default": "**PRE** graph, upstream defaults", "graph-nosoam": "graph tuned, SOAM off",
-         "graph-soam": "graph tuned", "graph-compile": "graph tuned + compile", "gguf-nocache": "gguf, no prefix cache",
-         "gguf": "**POST** gguf + prefix cache", "ref-fp32": "eager fp32 (reference)"}
-PRE, POST = "pre-llamacpp-vulkan", "gguf"
+         "graph-soam": "graph tuned", "graph-compile": "graph tuned + compile", "gguf": "gguf",
+         "gguf-strix": "**POST** gguf-strix", "ref-fp32": "eager fp32 (reference)"}
+PRE, POST = "pre-llamacpp-vulkan", "gguf-strix"
 
 
 def load(d):
@@ -79,8 +80,8 @@ def lat(e, c):
 if PRE in R and POST in R:
     print("## PRE → POST per request shape\n")
     print("PRE: llama-server (Vulkan, Mesa 25.3 container) + `basal-serve --mode llamacpp`, what `basal.service` ran "
-          "before. POST: `basal-serve --mode gguf` (llama.cpp in process, Vulkan, Mesa 26.2) with the prefix cache, what "
-          "it runs now. p50 of 2 timed passes, unique states.\n")
+          "before. POST: `basal-serve --mode gguf-strix` (llama.cpp in process, Vulkan, Mesa 26.2, cached prompt "
+          "start), what it runs now. p50 of 2 timed passes, unique states.\n")
     print("| state | questions | prompt tokens | PRE | POST | speed-up |\n|---|---|---|---|---|---|")
     for c in cases:
         st, q = c.split("-q")
@@ -145,11 +146,11 @@ if "ref-fp32" in R:
 print("\n## Engine against engine (whole matrix)\n")
 print("| comparison | same decision | mean \\|Δp\\| | max \\|Δp\\| |\n|---|---|---|---|")
 for a, b, what in (("graph-nosoam", "graph-soam", "graph tuned: SOAM on vs off"),
-                   ("gguf-nocache", "gguf", "gguf: prefix cache on vs off"),
+                   ("gguf", "gguf-strix", "gguf vs gguf-strix (cached prompt start)"),
                    ("graph-soam", "graph-compile", "graph tuned: compiled vs not"),
                    ("pre-graph-default", "graph-soam", "graph: upstream defaults vs tuned"),
-                   ("pre-llamacpp-vulkan", "gguf", "PRE vs POST"),
-                   ("graph-soam", "gguf", "graph bf16 vs gguf Q8_0")):
+                   ("pre-llamacpp-vulkan", "gguf-strix", "PRE vs POST"),
+                   ("graph-soam", "gguf-strix", "graph bf16 vs gguf-strix Q8_0")):
     if a in R and b in R:
         s, n, m, x = agree(case_pairs(R[a], R[b]))
         print(f"| {what} | {s}/{n} | {m:.4f} | {x:.3f} |")

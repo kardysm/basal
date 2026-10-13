@@ -351,7 +351,8 @@ the top option equals that of bf16 `fast-nocompile` on all 78 readouts (mean |Δ
 
 | engine | 1 question | 5 complex | 14 questions | long state: 1 q / 5 q | dec/s | start-up | GPU memory |
 |---|---|---|---|---|---|---|---|
-| **`gguf` Q8_0** in process (llama-cpp-python 0.3.36, Vulkan, Mesa 26.2) | **119 ms** | **314 ms** | **1.27 s** | **1.36 / 1.82 s** | **10.1** | 1 s | 6.3 GiB |
+| **`gguf-strix` Q8_0**: in process (llama-cpp-python 0.3.36, Vulkan, Mesa 26.2), cached prompt start | **119 ms** | **314 ms** | **1.27 s** | **1.36 / 1.82 s** | **10.1** | 1 s | 6.3 GiB |
+| `gguf` Q8_0: the same without the cache | 143 ms | 357 ms | 1.27 s | 1.38 / 1.86 s | 7.8 | 1 s | 6.3 GiB |
 | `fast-nocompile` bf16, tuned (below) | 155 ms | 342 ms | 1.48 s | 1.47 / 2.22 s | 6.9 | 76 s | 14.5 GiB |
 | `llamacpp` Q8_0, `llama-server` ROCm 7.2.4 (`-fa on -ub 2048`) | 166 ms | 475 ms | 2.15 s | 1.49 / 2.30 s | 6.1 | 5 s | – |
 | `llamacpp` Q8_0, `llama-server` Vulkan (Mesa 25.3) | 256 ms | 710 ms | 3.61 s | 1.90 / 3.15 s | 4.3 | 5 s | 5.3 GiB |
@@ -361,8 +362,9 @@ the top option equals that of bf16 `fast-nocompile` on all 78 readouts (mean |Δ
 
 - **Compute-bound.** A token costs about 9.2 GFLOP; one question is a packed row of about 240 tokens. Quantisation saves
   memory, not time: an F16 GGUF prefills slower than Q8_0 (ROCm 1,259 vs 1,575 tokens/s at 384 tokens).
-- **`gguf` is the fastest route**: the whole request goes into one `llama_decode` (no request per prompt as with
-  `llama-server`, no padding to captured shapes as with the CUDA-graph path) and the fixed prompt start is cached.
+- **In-process llama.cpp is the fastest route**: with `gguf` the whole request goes into one `llama_decode` (no request
+  per prompt as with `llama-server`, no padding to captured shapes as with the CUDA-graph path); `gguf-strix` also
+  caches the fixed prompt start (opt-in, [GGUF.md](GGUF.md)).
   Build llama-cpp-python with Vulkan ([GGUF.md](GGUF.md#serve)); the host's newer Mesa matters: `llama-server` in a
   Mesa 25.3 container prefills 1,336 tokens/s at 2,048 tokens, the in-process build on Mesa 26.2 about 1,700.
 - **PyTorch on gfx1151** needs three settings to be competitive:
@@ -376,7 +378,7 @@ the top option equals that of bf16 `fast-nocompile` on all 78 readouts (mean |Δ
   the short lengths too, or every request is padded to the shortest one given:
   `BASAL_LENS=128,192,256,320,384,448,512,640,768,896,1024,1280,1536,1792,2048,2304,2560,3072,3584,4096,5120,6144,8192`.
 - `--mode fast` (torch.compile + HIP graphs) works on ROCm with the same settings: 216 s start-up, 5–15% faster than
-  `fast-nocompile`, still behind `gguf` on most request shapes.
+  `fast-nocompile`, still behind `gguf-strix` on most request shapes.
 - Full benchmarks (1–20 questions over states of 100–6,000 tokens, concurrency up to 64 clients, agreement with an
   fp32 reference, edge cases), before and after: [benchmarks/STRIX_HALO.md](benchmarks/STRIX_HALO.md).
 - `llama-server`: ROCm prefills 22–27% faster than Vulkan on Mesa 25.3 (1,575 vs 1,286 tokens/s at 384 tokens;

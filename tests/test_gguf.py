@@ -62,10 +62,11 @@ def model(tmp_path_factory):
 
 @pytest.fixture(scope="module")
 def backend(model):
+    mp = pytest.MonkeyPatch()  # stand-in tokenizer instead of a Hugging Face model directory
     gguf_path, model_dir = model
-    with pytest.MonkeyPatch.context() as mp:  # stand-in tokenizer instead of a Hugging Face model directory
-        mp.setattr("basal.engine.AutoTokenizer.from_pretrained", lambda _: Tok())
-        yield GGUFBackend(model_dir, gguf_path, n_gpu_layers=0, prefixes=[])  # the full-decode reference
+    mp.setattr("basal.engine.AutoTokenizer.from_pretrained", lambda _: Tok())
+    yield GGUFBackend(model_dir, gguf_path, n_gpu_layers=0)
+    mp.undo()
 
 
 def test_mismatched_architecture_fails_before_context_creation(model, tmp_path, monkeypatch):
@@ -133,85 +134,3 @@ def test_readouts_beyond_n_seq_are_split(backend):
     finally:
         del backend.N_SEQ  # back to the class value
     assert np.allclose(full, split, atol=5e-3)
-
-
-PREFIXES = [Tok()("a shared state").input_ids, Tok()("other start").input_ids]
-
-
-@pytest.fixture(scope="module")
-def cached(model):
-    gguf_path, model_dir = model
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr("basal.engine.AutoTokenizer.from_pretrained", lambda _: Tok())
-        yield GGUFBackend(model_dir, gguf_path, n_gpu_layers=0, prefixes=PREFIXES)
-
-
-def test_cached_prefix_equals_full_decode(backend, cached):
-    """The fixed prompt starts, decoded once at start-up and shared by every row that begins with one of them, give
-    the readouts of a full decode; rows with another start are decoded in full. The second round reuses the prefixes
-    after the first chunk's readout sequences were removed."""
-    state = "a shared state of a request, long enough to matter: "
-    prompts = [state + q + o for q in ("q1? ", "question two? ") for o in (" A. x B. y C. z", " A. z B. y C. x")]
-    groups = [(prompts, [IDS] * 4), group("other start; question?"), group("no cached prefix here")]
-    assert [cached._cached(cached._pack(cached.encode(g[0])))[0] for g in groups] == [14, 11, 0]
-    for _ in range(2):
-        for a, b in zip(cached.run_shared(groups), backend.run_shared(groups)):
-            assert np.allclose(a, b, atol=5e-3)
-
-
-def test_cached_rows_use_the_whole_context(model, monkeypatch):
-    """The cached prefixes have cells of their own: a row is charged only for the tokens it adds, so a row that starts
-    with a cached prefix may add N_CTX tokens, a row without one may have N_CTX tokens, and one more is refused."""
-    gguf_path, model_dir = model
-    monkeypatch.setattr("basal.engine.AutoTokenizer.from_pretrained", lambda _: Tok())
-
-    class Small(GGUFBackend):
-        N_CTX = 128  # llama.cpp needs n_batch (= N_CTX) >= the sequences (64 readouts + 2 prefixes)
-    small = Small(model_dir, gguf_path, n_gpu_layers=0, prefixes=PREFIXES)
-    full = GGUFBackend(model_dir, gguf_path, n_gpu_layers=0, prefixes=[])
-    P = len(PREFIXES[0])
-    long_cached = "a shared state" + "x" * 128  # P + 128 tokens: 128 new cells
-    exact = "y" * 128
-    for prompts in ([long_cached], [exact]):
-        got, ref = small.run_shared([(prompts, [IDS])])[0], full.run_shared([(prompts, [IDS])])[0]
-        assert np.allclose(got, ref, atol=5e-3)
-    assert small._cost(small._pack(small.encode([long_cached]))) == 128 and len(long_cached) == P + 128
-    with pytest.raises(ValueError, match="prompt too long"):
-        small.run_shared([(["y" * 129], [IDS])])
-
-
-def test_readouts_never_reach_the_prefix_sequences(backend, cached):
-    """N_SEQ raised after start-up: readouts stay within the sequences made at start-up (the cached prefixes follow
-    them), so the prefixes survive and the answers stay right."""
-    prompts = [f"a shared state; option set {k:02d}" for k in range(70)]
-    cached.N_SEQ = 200
-    try:
-        assert cached._max_read() == 64
-        got = cached.run_shared([(prompts, [IDS] * 70)])[0]
-    finally:
-        del cached.N_SEQ
-    assert np.allclose(got, backend.run_shared([(prompts, [IDS] * 70)])[0], atol=5e-3)
-    g = [group("other start; question?")]
-    assert np.allclose(cached.run_shared(g)[0], backend.run_shared(g)[0], atol=5e-3)
-
-
-def test_failure_half_way_leaves_no_stale_cells(backend, cached, monkeypatch):
-    """A failure while the prefix cells are being shared (after some readouts got them) must not break the next call:
-    every readout sequence of the failed chunk is removed before the next one."""
-    C = cached.C
-    calls, real = [], C.llama_memory_seq_cp
-
-    def flaky(*a):
-        calls.append(a)
-        if len(calls) == 3:
-            raise RuntimeError("interrupted")
-        return real(*a)
-    state = "a shared state of a request, long enough to matter: "
-    prompts = [state + q + o for q in ("q1? ", "question two? ") for o in (" A. x B. y C. z", " A. z B. y C. x")]
-    monkeypatch.setattr(C, "llama_memory_seq_cp", flaky)
-    with pytest.raises(RuntimeError, match="interrupted"):
-        cached.run_shared([(prompts, [IDS] * 4)])
-    monkeypatch.setattr(C, "llama_memory_seq_cp", real)
-    for g in ([group("no cached prefix here")], [(prompts, [IDS] * 4)]):  # rows 0 and 1 got prefix cells above
-        for a, b in zip(cached.run_shared(g), backend.run_shared(g)):
-            assert np.allclose(a, b, atol=5e-3)

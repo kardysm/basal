@@ -7,9 +7,13 @@ without a separate Ollama or `llama-server`. Only the weights come from the GGUF
 exactly those of the other backends. The packed rows of a request (the state once, then every question and option
 order: [SOAM](SOAM.md)) become llama.cpp *sequences*: every readout has its own sequence, every token belongs to the
 sequences of all readouts below it, and all rows of a batch go through one `llama_decode`.
-The fixed start of every prompt (chat template, system prompt and state label: 53 tokens in Polish, 66 in English) is
-decoded once at start-up into sequences of its own; every row that begins with it shares those cells instead of
-computing them again (on the Radeon 8060S: 143 → 119 ms for one question, 7.8 → 10.1 decisions/s).
+
+`--mode gguf-strix` is the same plus a cache of the fixed start of every prompt (chat template, system prompt and
+state label: 53 tokens in Polish, 66 in English): decoded once at start-up into sequences of its own, shared by every
+row that begins with it instead of computed again. Measured on AMD Strix Halo (Radeon 8060S, Vulkan build): one
+question 143 → 119 ms, 7.8 → 10.1 decisions/s with 32 clients, the same decisions as `gguf`
+([benchmarks](benchmarks/STRIX_HALO.md)). It is opt-in and was not measured with the CUDA or Metal builds of llama.cpp;
+`--mode gguf` is unchanged.
 
 This mode was contributed by Paweł Kiszczak ([#4](https://github.com/rkinas/basal/pull/4)) for basal-1.0 and extended to
 the nested prefixes of SOAM in basal 1.5.

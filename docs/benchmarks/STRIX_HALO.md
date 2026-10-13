@@ -2,7 +2,8 @@
 
 **PRE** is what the machine served before this work: `llama-server` in a Vulkan container (Mesa 25.3) behind
 `basal-serve --mode llamacpp`, and the graph modes with upstream defaults. **POST** is what it serves now:
-`basal-serve --mode gguf` (llama.cpp in process, Vulkan, Mesa 26.2) with the cached prompt prefix of this branch.
+`basal-serve --mode gguf-strix`: llama.cpp in process (Vulkan, Mesa 26.2) with the cached prompt start of this branch.
+`gguf-strix` is a mode of its own, chosen explicitly; `--mode gguf` and every other mode behave as on `main`.
 
 Machine: AMD Ryzen AI Max+ PRO 395, Radeon 8060S (gfx1151, 40 CUs), 128 GB unified memory; Fedora 44, kernel 7.2.8.
 Model: basal-1.5 (4.5B); `Q8_0` GGUF for the llama.cpp engines, bf16 for PyTorch. Software: PyTorch 2.12.0 + ROCm 7.2,
@@ -15,7 +16,7 @@ run came out 4–20% slower.
 The bundled examples (44 single questions, the five `complex.jsonl` requests, their 14 questions over one state, a
 ~2,400-token state with 1 and with 5 questions); p50 per request, unique states, HTTP.
 
-| | **PRE** llama-server Vulkan | **POST** gguf + prefix cache | change |
+| | **PRE** llama-server Vulkan | **POST** `gguf-strix` | change |
 |---|---|---|---|
 | one question | 256 ms | **119 ms** | 2.2× faster |
 | five complex requests | 710 ms | **314 ms** | 2.3× faster |
@@ -30,8 +31,8 @@ The bundled examples (44 single questions, the five `complex.jsonl` requests, th
 |---|---|---|---|---|---|---|---|
 | **PRE** | llama-server, Vulkan (container, Mesa 25.3) | 256 ms | 710 ms | 3.61 s | 1.90 / 3.15 s | 4.3/s | ~5 s |
 | | llama-server on ROCm 7.2.4, `-fa on -ub 2048` | 166 ms | 475 ms | 2.15 s | 1.49 / 2.30 s | 6.1/s | ~4 s |
-| | `gguf` in process (llama.cpp Vulkan, host Mesa 26.2) | 143 ms | 357 ms | 1.27 s | 1.38 / 1.86 s | 7.8/s | 1–4 s |
-| **POST** | + cached prompt prefix (this branch) | **119 ms** | **314 ms** | **1.27 s** | **1.36 / 1.82 s** | **10.1/s** | 1–4 s |
+| | `--mode gguf`: llama.cpp in process (Vulkan, host Mesa 26.2) | 143 ms | 357 ms | 1.27 s | 1.38 / 1.86 s | 7.8/s | 1–4 s |
+| **POST** | `--mode gguf-strix`: + cached prompt start | **119 ms** | **314 ms** | **1.27 s** | **1.36 / 1.82 s** | **10.1/s** | 1–4 s |
 
 The PyTorch graph path, PRE (upstream defaults) → POST (settings of this branch, see below):
 
@@ -68,8 +69,12 @@ then all at once (the server batches them).
 | llama-server ROCm | the same with `-dev ROCm0 -ub 2048` (ROCm 7.2.4 build) |
 | **PRE** graph, upstream defaults | `--mode fast-nocompile` |
 | graph tuned | `--mode fast-nocompile` (or `fast`; or `--soam off`) with the environment below |
-| **POST** gguf | `--mode gguf --gguf basal-1.5-4.5B-Q8_0.gguf`, llama-cpp-python built with `-DGGML_VULKAN=on` |
-| gguf, no prefix cache | the same with `GGUFBackend(..., prefixes=[])` |
+| **POST** `gguf-strix` | `--mode gguf-strix --gguf basal-1.5-4.5B-Q8_0.gguf`, llama-cpp-python built with `-DGGML_VULKAN=on` |
+| `gguf` | `--mode gguf --gguf basal-1.5-4.5B-Q8_0.gguf` (same build) ² |
+
+² Measured with the cache of `gguf-strix` turned off (`prefixes=[]`), which decodes the same tokens in the same
+`llama_decode` calls as `--mode gguf`; between chunks it removes the readout sequences one by one where `gguf` clears
+the whole memory.
 
 Graph environment: `BASAL_LENS=128,192,256,320,384,448,512,640,768,896,1024,1280,1536,1792,2048,2304,2560,3072,3584,4096,5120,6144,8192
 BASAL_TOKEN_BUDGET=4096 BASAL_WARMUP=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 PYTORCH_TUNABLEOP_ENABLED=1
@@ -79,8 +84,8 @@ with `PYTORCH_TUNABLEOP_TUNING=1` in a process that exits normally (the file is 
 Reproduce: start an engine, then
 
 ```bash
-python docs/benchmarks/bench_matrix.py --url http://127.0.0.1:8000/v1/systemone --label gguf
-python docs/benchmarks/edge_check.py --url http://127.0.0.1:8000/v1/systemone --label gguf
+python docs/benchmarks/bench_matrix.py --url http://127.0.0.1:8000/v1/systemone --label gguf-strix
+python docs/benchmarks/edge_check.py --url http://127.0.0.1:8000/v1/systemone --label gguf-strix
 python docs/benchmarks/report.py results/matrix results/edge > report.md
 ```
 
@@ -93,14 +98,18 @@ python docs/benchmarks/report.py results/matrix results/edge > report.md
   forward of its prompt. Passes with the default attention and with `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1`.
   The tests fail when the attention mask lets sibling branches see each other (6 of 9) or when positions do not
   restart per branch (5 of 9).
-- `tests/test_gguf.py`: rows that begin with either cached prefix, and rows that do not, equal a full decode, also on a
-  second round after the first chunk's readout sequences were removed. Regression tests from the code review (each
-  fails on the first version of the cache): a row may add N_CTX tokens after a cached prefix (the prefixes have cells
-  of their own); readouts never reach the prefix sequences when `N_SEQ` is raised after start-up (the first version
-  aborted in llama.cpp); a failure half-way through sharing the prefix cells leaves no stale cells behind.
+- `tests/test_gguf_strix.py` (new; `tests/test_gguf.py` is unchanged): rows of `--mode gguf-strix` that begin with
+  either cached prefix, and rows that do not, equal a full decode, also on a second round after the first chunk's
+  readout sequences were removed; with the cache off it equals `gguf`. Plain `gguf` keeps its decode: a context of
+  N_CTX cells and N_SEQ sequences, the whole memory cleared per chunk, no sequence copied or removed. Regression tests
+  from the code review (each fails on the first version of the cache): a row may add N_CTX tokens after a cached
+  prefix (the prefixes have cells of their own); readouts never reach the prefix sequences when `N_SEQ` is raised
+  after start-up (the first version aborted in llama.cpp); a failure half-way through sharing the prefix cells leaves
+  no stale cells behind. `basal-serve` / `basal-bench` select `GGUFBackend` for `gguf` and `StrixHaloGGUFBackend`
+  only for `gguf-strix`.
 - `tests/test_graphs.py` also checks the `BASAL_*` validation (empty means default, `BASAL_BATCHES` must include 1,
   positive values only) and that `--mode mps` reads the overrides.
-- Full suite on this machine: 78 passed, 3 skipped (MLX / Apple only).
+- Full suite on this machine: 84 passed, 3 skipped (MLX / Apple only).
 
 ## Results
 
@@ -108,7 +117,7 @@ Generated by `report.py` from `results/` (raw answers and latencies of every run
 
 - **POST is the fastest engine on 12 of the 20 request shapes.** The compiled graph mode (`--mode fast`: torch.compile
   plus HIP graphs, works on ROCm, 216 s start-up) is 2–8% ahead on 5 of them (M with 2–10 questions, L with 1 and 5).
-  gguf without the prefix cache ties POST on large requests, where the cache saves the same ~60 tokens out of thousands.
+  `gguf` ties POST on large requests, where the cached start saves the same ~60 tokens out of thousands.
 - **The cache pays off on small requests and under load**: one question over a short state 181 → 163 ms;
   7.3 → 9.4 decisions/s with 32 clients.
 - **Every decision that differs between engines is one of two near-ties**, in the fp32 reference as well:
@@ -121,14 +130,14 @@ Generated by `report.py` from `results/` (raw answers and latencies of every run
   (XL with 20 questions: 156 s instead of 13.6 s).
 - **Graph mode on long states**: a 6,269-token row is padded to the 8,192 shape (about 30% extra compute) and XL with
   20 questions (more than 8,192 packed tokens) is split into two rows, each with the state again; finer `BASAL_LENS`
-  steps would reduce the padding. gguf has no shapes and computes exactly the packed tokens. With the upstream defaults
+  steps would reduce the padding. `gguf` and `gguf-strix` have no shapes and compute exactly the packed tokens. With the upstream defaults
   rows over 3,072 tokens run eagerly with the math attention path (XL: 34–67 s per request).
 - **Throughput**: PRE stays at 3.8 decisions/s for any number of clients (one llama-server slot, one HTTP request per
   prompt); POST batches concurrent requests into one `llama_decode` and reaches 9.4–9.5.
 
 ### PRE → POST per request shape
 
-PRE: llama-server (Vulkan, Mesa 25.3 container) + `basal-serve --mode llamacpp`, what `basal.service` ran before. POST: `basal-serve --mode gguf` (llama.cpp in process, Vulkan, Mesa 26.2) with the prefix cache, what it runs now. p50 of 2 timed passes, unique states.
+PRE: llama-server (Vulkan, Mesa 25.3 container) + `basal-serve --mode llamacpp`, what `basal.service` ran before. POST: `basal-serve --mode gguf-strix` (llama.cpp in process, Vulkan, Mesa 26.2, cached prompt start), what it runs now. p50 of 2 timed passes, unique states.
 
 | state | questions | prompt tokens | PRE | POST | speed-up |
 |---|---|---|---|---|---|
@@ -172,13 +181,13 @@ PRE: llama-server (Vulkan, Mesa 25.3 container) + `basal-serve --mode llamacpp`,
 | graph tuned, SOAM off | 78.1 s | 14.5 GiB |
 | graph tuned | 78.5 s | 14.5 GiB |
 | graph tuned + compile | 216.2 s | 14.3 GiB |
-| gguf, no prefix cache | 3.1 s | 6.5 GiB |
-| **POST** gguf + prefix cache | 3.6 s | 6.5 GiB |
+| gguf | 3.1 s | 6.5 GiB |
+| **POST** gguf-strix | 3.6 s | 6.5 GiB |
 | eager fp32 (reference) | 5.6 s | 18.4 GiB |
 
 ### Latency per request, all engines (p50; bold: fastest)
 
-| state | q | branches | **PRE** llama-server Vulkan | llama-server ROCm | **PRE** graph, upstream defaults | graph tuned, SOAM off | graph tuned | graph tuned + compile | gguf, no prefix cache | **POST** gguf + prefix cache |
+| state | q | branches | **PRE** llama-server Vulkan | llama-server ROCm | **PRE** graph, upstream defaults | graph tuned, SOAM off | graph tuned | graph tuned + compile | gguf | **POST** gguf-strix |
 |---|---|---|---|---|---|---|---|---|---|---|
 | S | 1 | 1 | 342 ms | 208 ms | 309 ms | 227 ms | 224 ms | 202 ms | 181 ms | **163 ms** |
 | S | 2 | 2 | 488 ms | 330 ms | 362 ms | 336 ms | 281 ms | 248 ms | 243 ms | **224 ms** |
@@ -203,7 +212,7 @@ PRE: llama-server (Vulkan, Mesa 25.3 container) + `basal-serve --mode llamacpp`,
 
 ### Cost of one more question (1 → 20 questions, per added question)
 
-| state | **PRE** llama-server Vulkan | llama-server ROCm | **PRE** graph, upstream defaults | graph tuned, SOAM off | graph tuned | graph tuned + compile | gguf, no prefix cache | **POST** gguf + prefix cache |
+| state | **PRE** llama-server Vulkan | llama-server ROCm | **PRE** graph, upstream defaults | graph tuned, SOAM off | graph tuned | graph tuned + compile | gguf | **POST** gguf-strix |
 |---|---|---|---|---|---|---|---|---|
 | S | 258 ms | 161 ms | 262 ms | 226 ms | 104 ms | 94 ms | 85 ms | 86 ms |
 | M | 261 ms | 169 ms | 344 ms | 522 ms | 133 ms | 128 ms | 89 ms | 90 ms |
@@ -212,7 +221,7 @@ PRE: llama-server (Vulkan, Mesa 25.3 container) + `basal-serve --mode llamacpp`,
 
 ### Concurrency (single questions over short states, unique per request)
 
-| clients | **PRE** llama-server Vulkan | llama-server ROCm | **PRE** graph, upstream defaults | graph tuned, SOAM off | graph tuned | graph tuned + compile | gguf, no prefix cache | **POST** gguf + prefix cache |
+| clients | **PRE** llama-server Vulkan | llama-server ROCm | **PRE** graph, upstream defaults | graph tuned, SOAM off | graph tuned | graph tuned + compile | gguf | **POST** gguf-strix |
 |---|---|---|---|---|---|---|---|---|
 | 1 | 3.8/s · 257 ms | 5.7/s · 175 ms | 3.8/s · 246 ms | 5.7/s · 153 ms | 5.7/s · 155 ms | 6.4/s · 139 ms | 6.3/s · 155 ms | 7.6/s · 130 ms |
 | 4 | 3.8/s · 1.01 s | 5.8/s · 697 ms | 3.8/s · 1.10 s | – | 4.8/s · 858 ms | 5.5/s · 759 ms | 6.9/s · 578 ms | 8.5/s · 476 ms |
@@ -233,19 +242,19 @@ Reference: `--mode eager --dtype float32 --soam off --max-batch 1` (every prompt
 | graph tuned, SOAM off | 144/144 | 0.0036 | 0.029 |
 | graph tuned | 143/144 | 0.0045 | 0.028 |
 | graph tuned + compile | 143/144 | 0.0037 | 0.024 |
-| gguf, no prefix cache | 143/144 | 0.0067 | 0.078 |
-| **POST** gguf + prefix cache | 143/144 | 0.0066 | 0.066 |
+| gguf | 143/144 | 0.0067 | 0.078 |
+| **POST** gguf-strix | 143/144 | 0.0066 | 0.066 |
 
 ### Engine against engine (whole matrix)
 
 | comparison | same decision | mean \|Δp\| | max \|Δp\| |
 |---|---|---|---|
 | graph tuned: SOAM on vs off | 187/188 | 0.0046 | 0.042 |
-| gguf: prefix cache on vs off | 188/188 | 0.0052 | 0.065 |
+| gguf vs gguf-strix (cached prompt start) | 188/188 | 0.0052 | 0.065 |
 | graph tuned: compiled vs not | 188/188 | 0.0047 | 0.036 |
 | graph: upstream defaults vs tuned | 142/144 | 0.0044 | 0.035 |
 | PRE vs POST | 187/188 | 0.0061 | 0.067 |
-| graph bf16 vs gguf Q8_0 | 186/188 | 0.0082 | 0.064 |
+| graph bf16 vs gguf-strix Q8_0 | 186/188 | 0.0082 | 0.064 |
 
 ### Edge cases
 
@@ -255,6 +264,6 @@ Reference: `--mode eager --dtype float32 --soam off --max-batch 1` (every prompt
 |---|---|---|---|---|---|---|---|---|
 | llama-server ROCm | none | 26/26 | 0.0068 | 5.6e-05 | True | human | 26/26 | 0.026 |
 | graph tuned | none | 26/26 | 0.0146 | 0.0e+00 | True | human | 26/26 | 0.014 |
-| gguf, no prefix cache | none | 26/26 | 0.0183 | 0.0e+00 | True | human | 26/26 | 0.016 |
-| **POST** gguf + prefix cache | none | 26/26 | 0.0158 | 0.0e+00 | True | human | 26/26 | 0.018 |
+| gguf | none | 26/26 | 0.0183 | 0.0e+00 | True | human | 26/26 | 0.016 |
+| **POST** gguf-strix | none | 26/26 | 0.0158 | 0.0e+00 | True | human | 26/26 | 0.018 |
 | eager fp32 (reference) | none | 26/26 | 0.0000 | 0.0e+00 | True | human | – | – |

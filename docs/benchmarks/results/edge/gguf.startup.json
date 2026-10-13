@@ -1,1 +1,5 @@
-{"label": "gguf", "startup_s": 3.563673933, "gtt_gib": 6.6}
+{
+ "label": "gguf",
+ "startup_s": 3.564702485,
+ "gtt_gib": 6.6
+}

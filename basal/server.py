@@ -27,7 +27,7 @@ from pathlib import Path
 import torch
 
 from .engine import (EagerBackend, ExitGraphBackend, GGUFBackend, GraphBackend, LlamaCppBackend, MLXBackend,
-                     MPSBackend, OllamaBackend, SGLangBackend, VLLMBackend, resolve)
+                     MPSBackend, OllamaBackend, SGLangBackend, StrixHaloGGUFBackend, VLLMBackend, resolve)
 from .evidence import Evidence
 from .facts import inject as inject_facts
 from .prompt import MAX_OPTIONS, lang_of, letter_ids, render
@@ -48,6 +48,7 @@ MODES = {
     "mlx-q8": ("mlx", "q8", False),         # "mlx" with 8-bit weights made at load time (less memory, not faster)
     "mps": ("mps", None, False),            # Apple Silicon: PyTorch MPS + shared prefix, no graphs
     "gguf": ("gguf", None, False),          # llama.cpp in process on a GGUF file (--gguf; Metal, CUDA or CPU)
+    "gguf-strix": ("gguf-strix", None, False),  # "gguf" + cached prompt start, measured on AMD Strix Halo (Vulkan)
     "ollama": ("ollama", None, False),      # Ollama with the GGUF exports (1.5); --ollama-url, --ollama-model
     "llamacpp": ("llamacpp", None, False),  # llama.cpp server with the GGUF exports (1.5); --llamacpp-url
 }
@@ -230,10 +231,10 @@ class Server:
     def __init__(self, a):
         validate_quant(a.mode, a.quant)
         kind, quant, comp = MODES[a.mode]
-        if kind == "gguf" and not a.gguf:
-            raise SystemExit("--mode gguf needs --gguf <file.gguf> (--model gives tokenizer and calibration)")
+        if kind in ("gguf", "gguf-strix") and not a.gguf:
+            raise SystemExit(f"--mode {a.mode} needs --gguf <file.gguf> (--model gives tokenizer and calibration)")
         # GGUF modes: the engine serves the GGUF weights, so only tokenizer, template and calibration are downloaded
-        md = resolve(a.model, a.revision, metadata_only=kind in ("gguf", "ollama", "llamacpp"))
+        md = resolve(a.model, a.revision, metadata_only=kind in ("gguf", "gguf-strix", "ollama", "llamacpp"))
         self.name = a.name or a.model.rstrip("/").split("/")[-1]
         quant = a.quant or quant
         if kind == "eager":
@@ -251,6 +252,8 @@ class Server:
             self.backend = MPSBackend(md, a.dtype, shared=a.orders == 2)
         elif kind == "gguf":
             self.backend = GGUFBackend(md, a.gguf)
+        elif kind == "gguf-strix":
+            self.backend = StrixHaloGGUFBackend(md, a.gguf)
         elif kind == "ollama":
             self.backend = OllamaBackend(md, a.ollama_url, a.ollama_model, parallel=a.http_parallel)
         elif kind == "llamacpp":
@@ -446,7 +449,8 @@ def parser():
     ap.add_argument("--gpu-memory", dest="gpu_memory", type=float, default=0.6, help="vLLM memory fraction")
     ap.add_argument("--max-len", dest="max_len", type=int, default=4096,
                     help="--mode vllm / sglang: context length in tokens (longer states are refused; raise it for long documents)")
-    ap.add_argument("--gguf", default=None, help="--mode gguf: GGUF weights (a -GGUF file or one converted from --model)")
+    ap.add_argument("--gguf", default=None,
+                    help="--mode gguf / gguf-strix: GGUF weights (a -GGUF file or one converted from --model)")
     ap.add_argument("--ollama-url", dest="ollama_url", default="http://127.0.0.1:11434", help="--mode ollama")
     ap.add_argument("--ollama-model", dest="ollama_model", default=None,
                     help="--mode ollama: Ollama model name (the -GGUF repositories); --model gives the tokenizer")

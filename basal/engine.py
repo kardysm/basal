@@ -20,6 +20,7 @@ Backends:
                     llama.cpp sequences
   OllamaBackend     Ollama with the GGUF exports (1.5): raw prompt, one token, top log-probabilities of the letters
   LlamaCppBackend   llama.cpp server with the GGUF exports (1.5): token-id prompt, `n_probs` log-probabilities
+  StrixHaloGGUFBackend  GGUFBackend + a cache of the fixed prompt start (`--mode gguf-strix`, AMD Strix Halo)
 """
 import json
 from pathlib import Path
@@ -811,14 +812,12 @@ class GGUFBackend(GraphBackend):
     GraphBackend: the state once, every question and option order after it) becomes llama.cpp sequences: every readout
     has its own sequence and every token belongs to the sequences of all readouts below its block, so a shared prefix
     is computed once and each readout sees its own prompt only. All rows of a chunk go through one llama_decode
-    (unified KV cache, cleared per chunk). The fixed start of every prompt (chat template, system prompt, state label;
-    one per language) is decoded once at start-up into sequences of its own and copied into the readout sequences of
-    every row that begins with it (the cells are shared, not recomputed): about 55-65 tokens less per request."""
+    (unified KV cache, cleared per chunk)."""
 
     N_CTX = 16384  # KV cells per chunk: room for a single long prompt
     N_SEQ = 64     # readouts (sequences) per chunk
 
-    def __init__(self, model_dir, gguf, n_gpu_layers=-1, prefixes=None):
+    def __init__(self, model_dir, gguf, n_gpu_layers=-1):
         import logging
 
         import llama_cpp as C
@@ -854,34 +853,15 @@ class GGUFBackend(GraphBackend):
                              f"but {model_dir}/config.json specifies vocab_size={expected_vocab}")
         if self.n_vocab < len(self.tok):
             raise ValueError(f"{gguf}: vocabulary of {self.n_vocab} tokens, tokenizer of {model_dir} has {len(self.tok)}")
-        if prefixes is None:
-            from .prompt import fixed_prefixes
-            prefixes = fixed_prefixes(self.tok)
-        self.prefixes = [list(x) for x in prefixes if len(x) > 0]
-        self.n_read = self.N_SEQ  # readout sequences are 0..n_read-1, the cached prefixes follow
         cp = C.llama_context_default_params()
-        cp.n_batch = self.N_CTX
-        cp.n_ctx = self.N_CTX + sum(map(len, self.prefixes))  # the cached prefixes keep cells of their own
+        cp.n_ctx = cp.n_batch = self.N_CTX
         cp.n_ubatch = 512
-        cp.n_seq_max = self.n_read + len(self.prefixes)
+        cp.n_seq_max = self.N_SEQ
         cp.kv_unified = True  # sequences share the cells of their common prefix
         self.ctx = C.llama_init_from_model(self.cmodel, cp)
         if not self.ctx:
             raise ValueError("llama.cpp could not create a context")
         self.batch = C.llama_batch_init(self.N_CTX, 0, self.N_SEQ)  # a prefix token belongs to every readout below it
-        self.mem = C.llama_get_memory(self.ctx)
-        self._used = 0  # readout sequences of the last chunk (removed before the next one)
-        if self.prefixes:
-            b, n = self.batch, 0
-            for j, pre in enumerate(self.prefixes):
-                for i, tok in enumerate(pre):
-                    b.token[n], b.pos[n], b.logits[n], b.n_seq_id[n] = tok, i, 0, 1
-                    b.seq_id[n][0] = self.n_read + j
-                    n += 1
-            b.logits[n - 1] = 1
-            b.n_tokens = n
-            if C.llama_decode(self.ctx, b) != 0:
-                raise RuntimeError("llama_decode failed (fixed prompt prefixes)")
 
     def __del__(self):
         C = getattr(self, "C", None)
@@ -893,6 +873,106 @@ class GGUFBackend(GraphBackend):
             C.llama_free(self.ctx)
         if getattr(self, "cmodel", None):
             C.llama_model_free(self.cmodel)
+
+    def _oversize(self, pack, n):
+        return len(pack[0]) > self.N_CTX or n > self.N_SEQ
+
+    def _decode_chunks(self, units):
+        """Units sorted by length, cut into chunks of at most N_CTX tokens and N_SEQ readouts."""
+        out, cur, n_tok, n_seq = [], [], 0, 0
+        for k in sorted(range(len(units)), key=lambda k: len(units[k][0][0])):
+            t, r = len(units[k][0][0]), len(units[k][1])
+            if t > self.N_CTX:
+                raise ValueError(f"prompt too long for the GGUF backend: {t} tokens (max {self.N_CTX})")
+            if cur and (n_tok + t > self.N_CTX or n_seq + r > self.N_SEQ):
+                out.append(cur); cur, n_tok, n_seq = [], 0, 0
+            cur.append(k); n_tok += t; n_seq += r
+        return out + ([cur] if cur else [])
+
+    def _decode(self, packs, idx):
+        """One llama_decode for the packed rows idx -> readout logits [n_readouts, n_vocab] (float32)."""
+        C, b = self.C, self.batch
+        n, base, reads = 0, 0, []
+        for k in idx:
+            t, pos, seg, last, parent = packs[k]
+            below = [[] for _ in parent]  # sequences (readouts) below every block of the trie
+            for r, i in enumerate(last):
+                blk = seg[i]
+                while blk >= 0:
+                    below[blk].append(base + r); blk = parent[blk]
+            for tok, p, s in zip(t, pos, seg):
+                b.token[n], b.pos[n], b.logits[n] = tok, p, 0
+                b.n_seq_id[n] = len(below[s])
+                for j, q in enumerate(below[s]):
+                    b.seq_id[n][j] = q
+                n += 1
+            for i in last:
+                b.logits[n - len(t) + i] = 1
+                reads.append(n - len(t) + i)
+            base += len(last)
+        b.n_tokens = n
+        C.llama_memory_clear(C.llama_get_memory(self.ctx), False)
+        if C.llama_decode(self.ctx, b) != 0:
+            raise RuntimeError("llama_decode failed")
+        return np.stack([np.ctypeslib.as_array(C.llama_get_logits_ith(self.ctx, r), shape=(self.n_vocab,))
+                         for r in reads])
+
+    def run(self, prompts, ids_list):
+        return [r[0] for r in self.run_shared([([p], [x]) for p, x in zip(prompts, ids_list)])]
+
+    def run_shared(self, groups, policy=None):
+        units = self._units(groups)
+        probs = [None] * len(units)
+        for idx in self._decode_chunks(units):
+            lg = self._decode([u[0] for u in units], idx)
+            pr = []
+            for m, ids in enumerate(x for k in idx for x in units[k][1]):
+                z = lg[m, list(ids)].astype(np.float64)
+                e = np.exp(z - z.max())
+                pr.append((e / e.sum()).tolist())
+            j = 0
+            for k in idx:
+                n = len(units[k][1]); probs[k] = pr[j: j + n]; j += n
+        return self._assemble(groups, units, probs)
+
+
+class StrixHaloGGUFBackend(GGUFBackend):
+    """`--mode gguf-strix`: GGUFBackend plus a cache of the fixed prompt start, measured on AMD Strix Halo (Radeon
+    8060S, llama.cpp Vulkan; docs/benchmarks/STRIX_HALO.md). The start of every prompt (chat template, system prompt,
+    state label: 53 tokens in Polish, 66 in English) is decoded once at start-up into sequences of its own, after the
+    readout sequences; every row that begins with it shares those cells (llama_memory_seq_cp) instead of computing them
+    again, and between chunks only the previous readout sequences are removed. One question 143 -> 119 ms, 7.8 -> 10.1
+    decisions/s with 32 clients on the 8060S; same decisions as `gguf`. Opt-in: not measured with the CUDA or Metal
+    builds of llama.cpp. `prefixes=[]` turns the cache off (then it decodes like `gguf`)."""
+
+    def __init__(self, model_dir, gguf, n_gpu_layers=-1, prefixes=None):
+        if prefixes is None:
+            from .prompt import fixed_prefixes
+            prefixes = fixed_prefixes(AutoTokenizer.from_pretrained(model_dir))
+        self.prefixes = [list(x) for x in prefixes if len(x) > 0]
+        self.n_read = self.N_SEQ  # readout sequences are 0..n_read-1, the cached prefixes follow
+        # GGUFBackend sizes the context and the batch from N_CTX and N_SEQ: room for the prefixes' cells and sequences
+        # on top while it builds them, then the class values again (a row may still add N_CTX tokens)
+        self.N_CTX = type(self).N_CTX + sum(map(len, self.prefixes))
+        self.N_SEQ = self.n_read + len(self.prefixes)
+        try:
+            super().__init__(model_dir, gguf, n_gpu_layers)
+        finally:
+            del self.N_CTX, self.N_SEQ
+        C, b = self.C, self.batch
+        self.mem = C.llama_get_memory(self.ctx)
+        self._used = 0  # readout sequences of the last chunk (removed before the next one)
+        if self.prefixes:
+            n = 0
+            for j, pre in enumerate(self.prefixes):
+                for i, tok in enumerate(pre):
+                    b.token[n], b.pos[n], b.logits[n], b.n_seq_id[n] = tok, i, 0, 1
+                    b.seq_id[n][0] = self.n_read + j
+                    n += 1
+            b.logits[n - 1] = 1
+            b.n_tokens = n
+            if C.llama_decode(self.ctx, b) != 0:
+                raise RuntimeError("llama_decode failed (fixed prompt prefixes)")
 
     def _cost(self, pack):
         """KV cells a packed row adds: its tokens minus a cached prefix it starts with."""
@@ -963,24 +1043,6 @@ class GGUFBackend(GraphBackend):
             raise RuntimeError("llama_decode failed")
         return np.stack([np.ctypeslib.as_array(C.llama_get_logits_ith(self.ctx, r), shape=(self.n_vocab,))
                          for r in reads])
-
-    def run(self, prompts, ids_list):
-        return [r[0] for r in self.run_shared([([p], [x]) for p, x in zip(prompts, ids_list)])]
-
-    def run_shared(self, groups, policy=None):
-        units = self._units(groups)
-        probs = [None] * len(units)
-        for idx in self._decode_chunks(units):
-            lg = self._decode([u[0] for u in units], idx)
-            pr = []
-            for m, ids in enumerate(x for k in idx for x in units[k][1]):
-                z = lg[m, list(ids)].astype(np.float64)
-                e = np.exp(z - z.max())
-                pr.append((e / e.sum()).tolist())
-            j = 0
-            for k in idx:
-                n = len(units[k][1]); probs[k] = pr[j: j + n]; j += n
-        return self._assemble(groups, units, probs)
 
 
 class _HTTPLetters:

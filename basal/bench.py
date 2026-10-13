@@ -23,11 +23,12 @@ from pathlib import Path
 import torch
 
 from .engine import (EagerBackend, ExitGraphBackend, GGUFBackend, GraphBackend, LlamaCppBackend, MLXBackend,
-                     MPSBackend, OllamaBackend, SGLangBackend, VLLMBackend, resolve)
+                     MPSBackend, OllamaBackend, SGLangBackend, StrixHaloGGUFBackend, VLLMBackend, resolve)
 from .prompt import letter_ids, render
 from .server import MODES, default_mode
 
-GGUF_KINDS = ("gguf", "ollama", "llamacpp")  # the engine serves GGUF weights: --model gives tokenizer and calibration
+# the engine serves GGUF weights: --model gives tokenizer and calibration
+GGUF_KINDS = ("gguf", "gguf-strix", "ollama", "llamacpp")
 
 
 def build(mode, md, vllm_model=None, gguf=None, ollama_model=None, ollama_url="http://127.0.0.1:11434",
@@ -36,11 +37,12 @@ def build(mode, md, vllm_model=None, gguf=None, ollama_model=None, ollama_url="h
         return EagerBackend(md, "float32")
     if mode.startswith("fast-exit@"):
         return ExitGraphBackend(md, "bfloat16", compile=True, default_policy=mode.split("@")[1])
-    if mode == "gguf" or mode.startswith("gguf@"):
+    kind = mode.split("@", 1)[0]
+    if kind in ("gguf", "gguf-strix"):
         path = mode.split("@", 1)[1] if "@" in mode else gguf
         if not path:
-            raise SystemExit("mode gguf needs --gguf <file.gguf> (or gguf@<file.gguf>)")
-        return GGUFBackend(md, path)
+            raise SystemExit(f"mode {kind} needs --gguf <file.gguf> (or {kind}@<file.gguf>)")
+        return (StrixHaloGGUFBackend if kind == "gguf-strix" else GGUFBackend)(md, path)
     kind, quant, comp = MODES[mode]
     if kind == "eager":
         return EagerBackend(md, "bfloat16")
@@ -200,7 +202,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", default="Remek/basal-1.5-4.5B")
     ap.add_argument("--vllm-model", dest="vllm_model", default=None, help="checkpoint for --modes vllm (e.g. the NVFP4 repo)")
-    ap.add_argument("--gguf", default=None, help="GGUF weights for --modes gguf (several files: gguf@<file> per mode)")
+    ap.add_argument("--gguf", default=None,
+                    help="GGUF weights for --modes gguf / gguf-strix (several files: gguf@<file> per mode)")
     ap.add_argument("--ollama-model", dest="ollama_model", default=None, help="Ollama model name for --modes ollama")
     ap.add_argument("--ollama-url", dest="ollama_url", default="http://127.0.0.1:11434")
     ap.add_argument("--llamacpp-url", dest="llamacpp_url", default="http://127.0.0.1:8080")
@@ -208,7 +211,8 @@ def main():
                     help="default: eager-fp32 and the serving default (fast on CUDA); on Apple Silicon bf16 mps and mlx "
                          "(--modes eager-fp32 mps mlx for fp32 agreement if memory allows). Modes: eager-fp32, eager, "
                          "fast, fast-nocompile, fp8, nvfp4, vllm, sglang, fast-exit@off|0.999|0.995|0.99|0.98; Apple "
-                         "Silicon: mlx, mlx-q8, mps; GGUF: gguf, gguf@<file.gguf>, ollama, llamacpp")
+                         "Silicon: mlx, mlx-q8, mps; GGUF: gguf, gguf@<file.gguf>, gguf-strix, gguf-strix@<file.gguf>, "
+                         "ollama, llamacpp")
     ap.add_argument("--questions", nargs="+", default=DEFAULT_QUESTIONS,
                     help="JSONL file(s) with simple items (default: the bundled examples, 44 items)")
     ap.add_argument("--n", type=int, default=500)
