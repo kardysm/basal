@@ -373,6 +373,10 @@ the top option equals that of bf16 `fast-nocompile` on all 78 readouts (mean |Δ
   and served with `PYTORCH_TUNABLEOP_TUNING=0` (rocBLAS defaults reach 13–16 TFLOPS on these GEMMs, tuned 20–21); and
   `BASAL_TOKEN_BUDGET=4096 BASAL_WARMUP=1` with `BASAL_LENS` extended to 8192 (`…,3072,3584,4096,5120,6144,8192`) so
   that a long state with several questions stays one packed row (5 questions over 2,400 tokens: 3.7 → 2.2 s).
+- `--mode fast` (torch.compile + HIP graphs) works on ROCm with the same settings: 216 s start-up, 5–15% faster than
+  `fast-nocompile`, still behind `gguf` on most request shapes.
+- Full benchmarks (1–20 questions over states of 100–6,000 tokens, concurrency up to 64 clients, agreement with an
+  fp32 reference, edge cases), before and after: [benchmarks/STRIX_HALO.md](benchmarks/STRIX_HALO.md).
 - `llama-server`: ROCm prefills 22–27% faster than Vulkan on Mesa 25.3 (1,575 vs 1,286 tokens/s at 384 tokens;
   `-fa on -ub 2048`: 1,699 vs 1,336 at 2,048). Keep `-np 1`: with several slots the option orders of one question run
   in different slots and each computes the state again.
