@@ -119,9 +119,10 @@ class GraphBackend(EagerBackend):
         def ints(name, default):
             v = os.environ.get(name)
             return sorted(int(x) for x in v.split(",")) if v else default
-        self.LENS, self.BATCHES = ints("BASAL_LENS", self.LENS), ints("BASAL_BATCHES", self.BATCHES)
-        self.TOKEN_BUDGET = int(os.environ.get("BASAL_TOKEN_BUDGET", self.TOKEN_BUDGET))
-        self.WARMUP = int(os.environ.get("BASAL_WARMUP", self.WARMUP))
+        cls = type(self)  # defaults: the class values (not overrides already set on this instance)
+        self.LENS, self.BATCHES = ints("BASAL_LENS", cls.LENS), ints("BASAL_BATCHES", cls.BATCHES)
+        self.TOKEN_BUDGET = int(os.environ.get("BASAL_TOKEN_BUDGET", cls.TOKEN_BUDGET))
+        self.WARMUP = int(os.environ.get("BASAL_WARMUP", cls.WARMUP))
         if self.WARMUP < 1:
             raise ValueError("BASAL_WARMUP must be at least 1 (lazy initialisation must not happen during capture)")
 

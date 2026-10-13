@@ -1,0 +1,127 @@
+"""The CUDA / HIP graph path itself: shapes captured under the BASAL_* overrides, packed requests (every question x
+option order over one state, several requests per replay), rows bisected or run eagerly when longer than the largest
+captured length -- every readout equals a separate fp32 forward of its prompt (tiny random Llama on the GPU)."""
+import pytest
+import torch
+from transformers import LlamaConfig, LlamaForCausalLM
+
+from basal.engine import GraphBackend
+
+ENV = {"BASAL_LENS": "64,16,32", "BASAL_BATCHES": "1,2,4", "BASAL_TOKEN_BUDGET": "128", "BASAL_WARMUP": "1"}
+
+
+def test_shape_config_env(monkeypatch):
+    for k, v in ENV.items():
+        monkeypatch.setenv(k, v)
+    be = GraphBackend.__new__(GraphBackend)
+    be._shape_config()
+    assert (be.LENS, be.BATCHES, be.TOKEN_BUDGET, be.WARMUP) == ([16, 32, 64], [1, 2, 4], 128, 1)
+    assert GraphBackend.LENS[-1] == 3072 and GraphBackend.TOKEN_BUDGET == 12288 and GraphBackend.WARMUP == 3
+    for k in ENV:
+        monkeypatch.delenv(k)
+    be._shape_config()  # unset: the class defaults
+    assert (be.LENS, be.TOKEN_BUDGET, be.WARMUP) == (GraphBackend.LENS, 12288, 3)
+    monkeypatch.setenv("BASAL_WARMUP", "0")
+    with pytest.raises(ValueError, match="BASAL_WARMUP"):
+        be._shape_config()
+
+
+gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA or ROCm GPU (graph capture)")
+
+
+class Tok:
+    pad_token, eos_token, pad_token_id = "<pad>", "</s>", 0
+
+
+def tiny():
+    torch.manual_seed(0)
+    cfg = LlamaConfig(vocab_size=50, hidden_size=32, intermediate_size=64, num_hidden_layers=2, num_attention_heads=4,
+                      num_key_value_heads=2, max_position_embeddings=256, attention_bias=True, mlp_bias=True)
+    m = LlamaForCausalLM(cfg).eval()
+    m.config._attn_implementation = "sdpa"
+    return m
+
+
+@pytest.fixture(scope="module")
+def be():
+    mp = pytest.MonkeyPatch()
+    for k, v in ENV.items():
+        mp.setenv(k, v)
+    m = tiny()
+    mp.setattr("basal.engine.AutoTokenizer.from_pretrained", lambda _: Tok())
+    mp.setattr("basal.engine.AutoModelForCausalLM.from_pretrained", lambda _, dtype: m.to(dtype))
+    yield GraphBackend("tiny", dtype="float32", shared=True, warm=True)
+    mp.undo()
+
+
+def separate(m, toks, lids):
+    """Reference: one forward per prompt, full log-softmax over the vocabulary, softmax over the letters."""
+    out = []
+    with torch.no_grad():
+        for t, ids in zip(toks, lids):
+            lp = torch.log_softmax(m(input_ids=torch.tensor([t], device=m.device)).logits[0, -1].float(), -1)
+            out.append(torch.softmax(lp[ids], -1).cpu())
+    return out
+
+
+def request(state, n_q, first=20):
+    """n_q questions over one state, each in two option orders (the server's layout), letters [7, 8] or [7, 8, 9]."""
+    toks, lids = [], []
+    for q in range(n_q):
+        for o in range(2):
+            toks.append(state + [first + q, 21, 30 + o, 31 - o, 40 + q % 9, 41])
+            lids.append([7, 8, 9] if q % 2 else [7, 8])
+    return toks, lids
+
+
+def check(be, groups, atol=1e-4):
+    res = be.run_shared(groups)
+    for (toks, lids), got in zip(groups, res):
+        for g, e in zip(got, separate(be.model, toks, lids)):
+            assert torch.allclose(torch.tensor(g), e, atol=atol)
+
+
+@gpu
+def test_captured_shapes_follow_the_env(be):
+    want = {("s", b, L) for L in (16, 32, 64) for b in (1, 2, 4) if b * L <= 128 or b == 1}
+    assert set(be.graphs) == want and be.WARMUP == 1
+
+
+@gpu
+@pytest.mark.parametrize("n_q", [1, 2, 3, 5])
+def test_questions_over_one_state_equal_separate(be, n_q):
+    """One request, every question x option order in one packed row (state 4 tokens: 1 + 2 x 6 per question fits the
+    captured lengths up to 5 questions)."""
+    check(be, [request([1, 5, 9, 11], n_q)])
+
+
+@gpu
+def test_requests_batched_into_one_replay(be):
+    """Several requests of different lengths go through one replay of a b > 1 graph; each answer equals its separate
+    forward, and equals the same request served alone (an answer never depends on the other rows of the batch)."""
+    groups = [request([1, 5, 9, 11], 2), request([2, 6], 1), request([3, 4, 12, 13, 14, 15], 3), ([[1, 2, 3, 4]], [[7, 8]])]
+    chunks = be._chunks([len(u[0][0]) for u in be._units(groups)])
+    assert len(chunks) < len(groups)  # some rows really share a replay
+    check(be, groups)
+    alone = be.run_shared([groups[2]])[0]
+    batched = be.run_shared(groups)[2]
+    for x, y in zip(alone, batched):
+        assert torch.allclose(torch.tensor(x), torch.tensor(y), atol=1e-5)
+
+
+@gpu
+def test_long_request_is_bisected_and_exact(be):
+    """A request whose packed row is longer than the largest captured length (64) is split into smaller rows, each with
+    the state again; a single prompt longer than 64 runs eagerly. Both stay exact."""
+    toks, lids = request(list(range(1, 21)), 6)  # 20-token state + 6 questions: packed row 20 + 6 x 14 > 64
+    units = be._units([(toks, lids)])
+    assert len(units) > 1 and all(len(u[0][0]) <= 64 for u in units)
+    check(be, [(toks, lids)])
+    long_prompt = [[(7 * i) % 47 + 3 for i in range(80)]]
+    check(be, [(long_prompt, [[7, 8]]), request([1, 5], 1)])
+
+
+@gpu
+def test_replay_is_deterministic(be):
+    g = [request([1, 5, 9, 11], 3), request([2, 6], 2)]
+    assert be.run_shared(g) == be.run_shared(g)
