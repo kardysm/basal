@@ -23,7 +23,8 @@ from pathlib import Path
 import torch
 
 from .engine import (EagerBackend, ExitGraphBackend, GGUFBackend, GraphBackend, LlamaCppBackend, MLXBackend,
-                     MPSBackend, OllamaBackend, SGLangBackend, StrixHaloGGUFBackend, VLLMBackend, resolve)
+                     MPSBackend, OllamaBackend, SGLangBackend, StrixHaloGGUFBackend, StrixHaloGraphBackend, VLLMBackend,
+                     resolve)
 from .prompt import letter_ids, render
 from .server import MODES, default_mode
 
@@ -60,6 +61,8 @@ def build(mode, md, vllm_model=None, gguf=None, ollama_model=None, ollama_url="h
         return LlamaCppBackend(md, llamacpp_url)
     if kind == "exit":
         return ExitGraphBackend(md, "bfloat16", quant, compile=comp)
+    if kind == "graph-strix":
+        return StrixHaloGraphBackend(md, "bfloat16", quant, compile=comp, shared=True)
     return GraphBackend(md, "bfloat16", quant, compile=comp, shared=True)
 
 
@@ -212,7 +215,7 @@ def main():
                          "(--modes eager-fp32 mps mlx for fp32 agreement if memory allows). Modes: eager-fp32, eager, "
                          "fast, fast-nocompile, fp8, nvfp4, vllm, sglang, fast-exit@off|0.999|0.995|0.99|0.98; Apple "
                          "Silicon: mlx, mlx-q8, mps; GGUF: gguf, gguf@<file.gguf>, gguf-strix, gguf-strix@<file.gguf>, "
-                         "ollama, llamacpp")
+                         "ollama, llamacpp; AMD Strix Halo: fast-strix, fast-nocompile-strix, gguf-strix")
     ap.add_argument("--questions", nargs="+", default=DEFAULT_QUESTIONS,
                     help="JSONL file(s) with simple items (default: the bundled examples, 44 items)")
     ap.add_argument("--n", type=int, default=500)

@@ -27,7 +27,8 @@ from pathlib import Path
 import torch
 
 from .engine import (EagerBackend, ExitGraphBackend, GGUFBackend, GraphBackend, LlamaCppBackend, MLXBackend,
-                     MPSBackend, OllamaBackend, SGLangBackend, StrixHaloGGUFBackend, VLLMBackend, resolve)
+                     MPSBackend, OllamaBackend, SGLangBackend, StrixHaloGGUFBackend, StrixHaloGraphBackend, VLLMBackend,
+                     resolve)
 from .evidence import Evidence
 from .facts import inject as inject_facts
 from .prompt import MAX_OPTIONS, lang_of, letter_ids, render
@@ -49,6 +50,8 @@ MODES = {
     "mps": ("mps", None, False),            # Apple Silicon: PyTorch MPS + shared prefix, no graphs
     "gguf": ("gguf", None, False),          # llama.cpp in process on a GGUF file (--gguf; Metal, CUDA or CPU)
     "gguf-strix": ("gguf-strix", None, False),  # "gguf" + cached prompt start, measured on AMD Strix Halo (Vulkan)
+    "fast-strix": ("graph-strix", None, True),  # "fast" with the shapes and warm-up measured on AMD Strix Halo (ROCm)
+    "fast-nocompile-strix": ("graph-strix", None, False),  # the same without torch.compile
     "ollama": ("ollama", None, False),      # Ollama with the GGUF exports (1.5); --ollama-url, --ollama-model
     "llamacpp": ("llamacpp", None, False),  # llama.cpp server with the GGUF exports (1.5); --llamacpp-url
 }
@@ -254,6 +257,8 @@ class Server:
             self.backend = GGUFBackend(md, a.gguf)
         elif kind == "gguf-strix":
             self.backend = StrixHaloGGUFBackend(md, a.gguf)
+        elif kind == "graph-strix":
+            self.backend = StrixHaloGraphBackend(md, a.dtype, quant, compile=comp, shared=a.orders == 2)
         elif kind == "ollama":
             self.backend = OllamaBackend(md, a.ollama_url, a.ollama_model, parallel=a.http_parallel)
         elif kind == "llamacpp":

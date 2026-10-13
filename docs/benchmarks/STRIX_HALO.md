@@ -34,16 +34,18 @@ The bundled examples (44 single questions, the five `complex.jsonl` requests, th
 | | `--mode gguf`: llama.cpp in process (Vulkan, host Mesa 26.2) | 143 ms | 357 ms | 1.27 s | 1.38 / 1.86 s | 7.8/s | 1–4 s |
 | **POST** | `--mode gguf-strix`: + cached prompt start | **119 ms** | **314 ms** | **1.27 s** | **1.36 / 1.82 s** | **10.1/s** | 1–4 s |
 
-The PyTorch graph path, PRE (upstream defaults) → POST (settings of this branch, see below):
+The PyTorch graph path, PRE (`--mode fast-nocompile`, upstream defaults) → POST (`--mode fast-nocompile-strix` of
+this branch with AOTriton attention and TunableOp, see below):
 
 | stage | graph mode | one question | 5 complex | 14 questions | long 1 q / 5 q | 32 clients | start-up / GTT |
 |---|---|---|---|---|---|---|---|
 | **PRE** | `fast-nocompile`, rocBLAS, math attention ¹ | 250 ms | 496 ms | 3.69 s | 3.69 / 10.1 s | 4.7/s | 888–942 s / 31–32 GiB |
 | | + `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` | 217 ms | 368 ms | 1.57 s | 1.57 / 3.94 s | 6.3/s | 60 s / 12.7 GiB |
 | | + TunableOp (rocBLAS solutions) | 154 ms | 338 ms | 1.48 s | 1.49 / 3.74 s | 7.0/s | 55 s / 12.7 GiB |
-| **POST** | + captured lengths up to 8,192 | 155 ms | 342 ms | 1.48 s | 1.47 / 2.22 s | 6.9/s | 76 s / 14.5 GiB |
+| **POST** | + captured lengths up to 8,192 (= `fast-nocompile-strix`) | 155 ms | 342 ms | 1.48 s | 1.47 / 2.22 s | 6.9/s | 76 s / 14.5 GiB |
 
-¹ latencies measured with `BASAL_TOKEN_BUDGET=4096 BASAL_WARMUP=1` (same kernels as the defaults, shorter start-up).
+¹ latencies measured with 4,096 tokens per forward and one warm-up forward (same kernels as the defaults, shorter
+start-up).
 
 ## Method
 
@@ -67,8 +69,8 @@ then all at once (the server batches them).
 |---|---|
 | **PRE** llama-server Vulkan | `llama-server -m basal-1.5-4.5B-Q8_0.gguf -ngl 99 -fa on --no-mmap -c 8192 -np 1` (Vulkan build, Mesa 25.3) + `--mode llamacpp` |
 | llama-server ROCm | the same with `-dev ROCm0 -ub 2048` (ROCm 7.2.4 build) |
-| **PRE** graph, upstream defaults | `--mode fast-nocompile` |
-| graph tuned | `--mode fast-nocompile` (or `fast`; or `--soam off`) with the environment below |
+| **PRE** `fast-nocompile` | `--mode fast-nocompile` (upstream defaults) |
+| `fast-nocompile-strix` | `--mode fast-nocompile-strix` (or `fast-strix`; or `--soam off`) with the environment below ³ |
 | **POST** `gguf-strix` | `--mode gguf-strix --gguf basal-1.5-4.5B-Q8_0.gguf`, llama-cpp-python built with `-DGGML_VULKAN=on` |
 | `gguf` | `--mode gguf --gguf basal-1.5-4.5B-Q8_0.gguf` (same build) ² |
 
@@ -76,10 +78,13 @@ then all at once (the server batches them).
 `llama_decode` calls as `--mode gguf`; between chunks it removes the readout sequences one by one where `gguf` clears
 the whole memory.
 
-Graph environment: `BASAL_LENS=128,192,256,320,384,448,512,640,768,896,1024,1280,1536,1792,2048,2304,2560,3072,3584,4096,5120,6144,8192
-BASAL_TOKEN_BUDGET=4096 BASAL_WARMUP=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 PYTORCH_TUNABLEOP_ENABLED=1
+Graph environment: `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 PYTORCH_TUNABLEOP_ENABLED=1
 PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED=0 PYTORCH_TUNABLEOP_TUNING=0 PYTORCH_TUNABLEOP_FILENAME=<file>`, after one tuning run
 with `PYTORCH_TUNABLEOP_TUNING=1` in a process that exits normally (the file is written at exit; about 4 minutes).
+
+³ Measured as `--mode fast-nocompile` / `fast` with `BASAL_LENS=128,…,3072,3584,4096,5120,6144,8192
+BASAL_TOKEN_BUDGET=4096 BASAL_WARMUP=1`, the shapes that are now the defaults of the `-strix` graph modes (the
+`BASAL_*` variables apply to those modes only).
 
 Reproduce: start an engine, then
 
@@ -91,8 +96,8 @@ python docs/benchmarks/report.py results/matrix results/edge > report.md
 
 ## Tests
 
-- `tests/test_graphs.py` (new) runs the real `GraphBackend` start-up with a tiny random Llama on the GPU: the shapes
-  captured under the `BASAL_*` overrides, 1–5 questions over one state, several requests in one replay of a batch
+- `tests/test_graphs.py` (new) runs the real start-up of `StrixHaloGraphBackend` (the `-strix` graph modes) with a
+  tiny random Llama on the GPU: the shapes captured under the `BASAL_*` overrides, 1–5 questions over one state, several requests in one replay of a batch
   graph (and the same answer as alone), a request bisected because its packed row is longer than the largest captured
   length, a prompt longer than every shape run eagerly, deterministic replay. Every readout equals a separate fp32
   forward of its prompt. Passes with the default attention and with `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1`.
@@ -108,15 +113,16 @@ python docs/benchmarks/report.py results/matrix results/edge > report.md
   no stale cells behind. `basal-serve` / `basal-bench` select `GGUFBackend` for `gguf` and `StrixHaloGGUFBackend`
   only for `gguf-strix`.
 - `tests/test_graphs.py` also checks the `BASAL_*` validation (empty means default, `BASAL_BATCHES` must include 1,
-  positive values only) and that `--mode mps` reads the overrides.
-- Full suite on this machine: 84 passed, 3 skipped (MLX / Apple only).
+  positive values only), that `fast` / `fast-nocompile` (all 81 default shapes) and `mps` ignore those variables, and
+  that `basal-serve` / `basal-bench` pick the Strix Halo classes for the `-strix` modes only.
+- Full suite on this machine: 91 passed, 3 skipped (MLX / Apple only).
 
 ## Results
 
 Generated by `report.py` from `results/` (raw answers and latencies of every run).
 
-- **POST is the fastest engine on 12 of the 20 request shapes.** The compiled graph mode (`--mode fast`: torch.compile
-  plus HIP graphs, works on ROCm, 216 s start-up) is 2–8% ahead on 5 of them (M with 2–10 questions, L with 1 and 5).
+- **POST is the fastest engine on 12 of the 20 request shapes.** The compiled graph mode (`--mode fast-strix`:
+  torch.compile plus HIP graphs, works on ROCm, 216 s start-up) is 2–8% ahead on 5 of them (M with 2–10 questions, L with 1 and 5).
   `gguf` ties POST on large requests, where the cached start saves the same ~60 tokens out of thousands.
 - **The cache pays off on small requests and under load**: one question over a short state 181 → 163 ms;
   7.3 → 9.4 decisions/s with 32 clients.
@@ -130,7 +136,7 @@ Generated by `report.py` from `results/` (raw answers and latencies of every run
   (XL with 20 questions: 156 s instead of 13.6 s).
 - **Graph mode on long states**: a 6,269-token row is padded to the 8,192 shape (about 30% extra compute) and XL with
   20 questions (more than 8,192 packed tokens) is split into two rows, each with the state again; finer `BASAL_LENS`
-  steps would reduce the padding. `gguf` and `gguf-strix` have no shapes and compute exactly the packed tokens. With the upstream defaults
+  steps (`BASAL_LENS`) would reduce the padding. `gguf` and `gguf-strix` have no shapes and compute exactly the packed tokens. With the upstream defaults
   rows over 3,072 tokens run eagerly with the math attention path (XL: 34–67 s per request).
 - **Throughput**: PRE stays at 3.8 decisions/s for any number of clients (one llama-server slot, one HTTP request per
   prompt); POST batches concurrent requests into one `llama_decode` and reaches 9.4–9.5.
@@ -177,17 +183,17 @@ PRE: llama-server (Vulkan, Mesa 25.3 container) + `basal-serve --mode llamacpp`,
 |---|---|---|
 | **PRE** llama-server Vulkan | 3.6 s | 6.0 GiB |
 | llama-server ROCm | 3.6 s | 6.2 GiB |
-| **PRE** graph, upstream defaults | 888.4 s | 32.1 GiB |
-| graph tuned, SOAM off | 78.1 s | 14.5 GiB |
-| graph tuned | 78.5 s | 14.5 GiB |
-| graph tuned + compile | 216.2 s | 14.3 GiB |
+| **PRE** fast-nocompile | 888.4 s | 32.1 GiB |
+| fast-nocompile-strix, SOAM off | 78.1 s | 14.5 GiB |
+| fast-nocompile-strix | 78.5 s | 14.5 GiB |
+| fast-strix | 216.2 s | 14.3 GiB |
 | gguf | 3.1 s | 6.5 GiB |
 | **POST** gguf-strix | 3.6 s | 6.5 GiB |
 | eager fp32 (reference) | 5.6 s | 18.4 GiB |
 
 ### Latency per request, all engines (p50; bold: fastest)
 
-| state | q | branches | **PRE** llama-server Vulkan | llama-server ROCm | **PRE** graph, upstream defaults | graph tuned, SOAM off | graph tuned | graph tuned + compile | gguf | **POST** gguf-strix |
+| state | q | branches | **PRE** llama-server Vulkan | llama-server ROCm | **PRE** fast-nocompile | fast-nocompile-strix, SOAM off | fast-nocompile-strix | fast-strix | gguf | **POST** gguf-strix |
 |---|---|---|---|---|---|---|---|---|---|---|
 | S | 1 | 1 | 342 ms | 208 ms | 309 ms | 227 ms | 224 ms | 202 ms | 181 ms | **163 ms** |
 | S | 2 | 2 | 488 ms | 330 ms | 362 ms | 336 ms | 281 ms | 248 ms | 243 ms | **224 ms** |
@@ -212,7 +218,7 @@ PRE: llama-server (Vulkan, Mesa 25.3 container) + `basal-serve --mode llamacpp`,
 
 ### Cost of one more question (1 → 20 questions, per added question)
 
-| state | **PRE** llama-server Vulkan | llama-server ROCm | **PRE** graph, upstream defaults | graph tuned, SOAM off | graph tuned | graph tuned + compile | gguf | **POST** gguf-strix |
+| state | **PRE** llama-server Vulkan | llama-server ROCm | **PRE** fast-nocompile | fast-nocompile-strix, SOAM off | fast-nocompile-strix | fast-strix | gguf | **POST** gguf-strix |
 |---|---|---|---|---|---|---|---|---|
 | S | 258 ms | 161 ms | 262 ms | 226 ms | 104 ms | 94 ms | 85 ms | 86 ms |
 | M | 261 ms | 169 ms | 344 ms | 522 ms | 133 ms | 128 ms | 89 ms | 90 ms |
@@ -221,7 +227,7 @@ PRE: llama-server (Vulkan, Mesa 25.3 container) + `basal-serve --mode llamacpp`,
 
 ### Concurrency (single questions over short states, unique per request)
 
-| clients | **PRE** llama-server Vulkan | llama-server ROCm | **PRE** graph, upstream defaults | graph tuned, SOAM off | graph tuned | graph tuned + compile | gguf | **POST** gguf-strix |
+| clients | **PRE** llama-server Vulkan | llama-server ROCm | **PRE** fast-nocompile | fast-nocompile-strix, SOAM off | fast-nocompile-strix | fast-strix | gguf | **POST** gguf-strix |
 |---|---|---|---|---|---|---|---|---|
 | 1 | 3.8/s · 257 ms | 5.7/s · 175 ms | 3.8/s · 246 ms | 5.7/s · 153 ms | 5.7/s · 155 ms | 6.4/s · 139 ms | 6.3/s · 155 ms | 7.6/s · 130 ms |
 | 4 | 3.8/s · 1.01 s | 5.8/s · 697 ms | 3.8/s · 1.10 s | – | 4.8/s · 858 ms | 5.5/s · 759 ms | 6.9/s · 578 ms | 8.5/s · 476 ms |
@@ -238,10 +244,10 @@ Reference: `--mode eager --dtype float32 --soam off --max-batch 1` (every prompt
 |---|---|---|---|
 | **PRE** llama-server Vulkan | 144/144 | 0.0065 | 0.081 |
 | llama-server ROCm | 143/144 | 0.0062 | 0.057 |
-| **PRE** graph, upstream defaults | 143/144 | 0.0045 | 0.037 |
-| graph tuned, SOAM off | 144/144 | 0.0036 | 0.029 |
-| graph tuned | 143/144 | 0.0045 | 0.028 |
-| graph tuned + compile | 143/144 | 0.0037 | 0.024 |
+| **PRE** fast-nocompile | 143/144 | 0.0045 | 0.037 |
+| fast-nocompile-strix, SOAM off | 144/144 | 0.0036 | 0.029 |
+| fast-nocompile-strix | 143/144 | 0.0045 | 0.028 |
+| fast-strix | 143/144 | 0.0037 | 0.024 |
 | gguf | 143/144 | 0.0067 | 0.078 |
 | **POST** gguf-strix | 143/144 | 0.0066 | 0.066 |
 
@@ -249,12 +255,12 @@ Reference: `--mode eager --dtype float32 --soam off --max-batch 1` (every prompt
 
 | comparison | same decision | mean \|Δp\| | max \|Δp\| |
 |---|---|---|---|
-| graph tuned: SOAM on vs off | 187/188 | 0.0046 | 0.042 |
+| fast-nocompile-strix: SOAM on vs off | 187/188 | 0.0046 | 0.042 |
 | gguf vs gguf-strix (cached prompt start) | 188/188 | 0.0052 | 0.065 |
-| graph tuned: compiled vs not | 188/188 | 0.0047 | 0.036 |
-| graph: upstream defaults vs tuned | 142/144 | 0.0044 | 0.035 |
+| fast-nocompile-strix vs fast-strix | 188/188 | 0.0047 | 0.036 |
+| fast-nocompile vs fast-nocompile-strix | 142/144 | 0.0044 | 0.035 |
 | PRE vs POST | 187/188 | 0.0061 | 0.067 |
-| graph bf16 vs gguf-strix Q8_0 | 186/188 | 0.0082 | 0.064 |
+| fast-nocompile-strix (bf16) vs gguf-strix (Q8_0) | 186/188 | 0.0082 | 0.064 |
 
 ### Edge cases
 
@@ -263,7 +269,7 @@ Reference: `--mode eager --dtype float32 --soam off --max-batch 1` (every prompt
 | engine | errors | concurrent = sequential decisions | concurrent vs sequential, max \|Δp\| | duplicate questions, max \|Δp\| | multi within min/max | act action | vs fp32: same decision | vs fp32: max \|Δp\| |
 |---|---|---|---|---|---|---|---|---|
 | llama-server ROCm | none | 26/26 | 0.0068 | 5.6e-05 | True | human | 26/26 | 0.026 |
-| graph tuned | none | 26/26 | 0.0146 | 0.0e+00 | True | human | 26/26 | 0.014 |
+| fast-nocompile-strix | none | 26/26 | 0.0146 | 0.0e+00 | True | human | 26/26 | 0.014 |
 | gguf | none | 26/26 | 0.0183 | 0.0e+00 | True | human | 26/26 | 0.016 |
 | **POST** gguf-strix | none | 26/26 | 0.0158 | 0.0e+00 | True | human | 26/26 | 0.018 |
 | eager fp32 (reference) | none | 26/26 | 0.0000 | 0.0e+00 | True | human | – | – |

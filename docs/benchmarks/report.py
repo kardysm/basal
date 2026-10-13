@@ -14,8 +14,8 @@ D, E = Path(sys.argv[1]), Path(sys.argv[2]) if len(sys.argv) > 2 else None
 ORDER = ["pre-llamacpp-vulkan", "llamacpp-rocm", "pre-graph-default", "graph-nosoam", "graph-soam", "graph-compile",
          "gguf", "gguf-strix", "ref-fp32"]
 NAMES = {"pre-llamacpp-vulkan": "**PRE** llama-server Vulkan", "llamacpp-rocm": "llama-server ROCm",
-         "pre-graph-default": "**PRE** graph, upstream defaults", "graph-nosoam": "graph tuned, SOAM off",
-         "graph-soam": "graph tuned", "graph-compile": "graph tuned + compile", "gguf": "gguf",
+         "pre-graph-default": "**PRE** fast-nocompile", "graph-nosoam": "fast-nocompile-strix, SOAM off",
+         "graph-soam": "fast-nocompile-strix", "graph-compile": "fast-strix", "gguf": "gguf",
          "gguf-strix": "**POST** gguf-strix", "ref-fp32": "eager fp32 (reference)"}
 PRE, POST = "pre-llamacpp-vulkan", "gguf-strix"
 
@@ -145,12 +145,12 @@ if "ref-fp32" in R:
 
 print("\n## Engine against engine (whole matrix)\n")
 print("| comparison | same decision | mean \\|Δp\\| | max \\|Δp\\| |\n|---|---|---|---|")
-for a, b, what in (("graph-nosoam", "graph-soam", "graph tuned: SOAM on vs off"),
+for a, b, what in (("graph-nosoam", "graph-soam", "fast-nocompile-strix: SOAM on vs off"),
                    ("gguf", "gguf-strix", "gguf vs gguf-strix (cached prompt start)"),
-                   ("graph-soam", "graph-compile", "graph tuned: compiled vs not"),
-                   ("pre-graph-default", "graph-soam", "graph: upstream defaults vs tuned"),
+                   ("graph-soam", "graph-compile", "fast-nocompile-strix vs fast-strix"),
+                   ("pre-graph-default", "graph-soam", "fast-nocompile vs fast-nocompile-strix"),
                    ("pre-llamacpp-vulkan", "gguf-strix", "PRE vs POST"),
-                   ("graph-soam", "gguf-strix", "graph bf16 vs gguf-strix Q8_0")):
+                   ("graph-soam", "gguf-strix", "fast-nocompile-strix (bf16) vs gguf-strix (Q8_0)")):
     if a in R and b in R:
         s, n, m, x = agree(case_pairs(R[a], R[b]))
         print(f"| {what} | {s}/{n} | {m:.4f} | {x:.3f} |")

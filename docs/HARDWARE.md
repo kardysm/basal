@@ -353,12 +353,13 @@ the top option equals that of bf16 `fast-nocompile` on all 78 readouts (mean |Δ
 |---|---|---|---|---|---|---|---|
 | **`gguf-strix` Q8_0**: in process (llama-cpp-python 0.3.36, Vulkan, Mesa 26.2), cached prompt start | **119 ms** | **314 ms** | **1.27 s** | **1.36 / 1.82 s** | **10.1** | 1 s | 6.3 GiB |
 | `gguf` Q8_0: the same without the cache | 143 ms | 357 ms | 1.27 s | 1.38 / 1.86 s | 7.8 | 1 s | 6.3 GiB |
-| `fast-nocompile` bf16, tuned (below) | 155 ms | 342 ms | 1.48 s | 1.47 / 2.22 s | 6.9 | 76 s | 14.5 GiB |
+| `fast-nocompile-strix` bf16 (settings below) | 155 ms | 342 ms | 1.48 s | 1.47 / 2.22 s | 6.9 | 76 s | 14.5 GiB |
 | `llamacpp` Q8_0, `llama-server` ROCm 7.2.4 (`-fa on -ub 2048`) | 166 ms | 475 ms | 2.15 s | 1.49 / 2.30 s | 6.1 | 5 s | – |
 | `llamacpp` Q8_0, `llama-server` Vulkan (Mesa 25.3) | 256 ms | 710 ms | 3.61 s | 1.90 / 3.15 s | 4.3 | 5 s | 5.3 GiB |
 | `fast-nocompile` bf16, rocBLAS, math attention | 250 ms | 496 ms | 3.69 s | 3.69 / 10.1 s | 4.7 | 93 s ¹ | 17.5 GiB ¹ |
 
-¹ with `BASAL_TOKEN_BUDGET=4096 BASAL_WARMUP=1`; with the defaults `fast-nocompile` starts in 942 s and holds 31 GiB.
+¹ with 4,096 tokens per forward and one warm-up forward (`BASAL_TOKEN_BUDGET=4096 BASAL_WARMUP=1` on
+`fast-nocompile-strix`); `fast-nocompile` itself starts in 942 s and holds 31 GiB.
 
 - **Compute-bound.** A token costs about 9.2 GFLOP; one question is a packed row of about 240 tokens. Quantisation saves
   memory, not time: an F16 GGUF prefills slower than Q8_0 (ROCm 1,259 vs 1,575 tokens/s at 384 tokens).
@@ -367,18 +368,19 @@ the top option equals that of bf16 `fast-nocompile` on all 78 readouts (mean |Δ
   caches the fixed prompt start (opt-in, [GGUF.md](GGUF.md)).
   Build llama-cpp-python with Vulkan ([GGUF.md](GGUF.md#serve)); the host's newer Mesa matters: `llama-server` in a
   Mesa 25.3 container prefills 1,336 tokens/s at 2,048 tokens, the in-process build on Mesa 26.2 about 1,700.
-- **PyTorch on gfx1151** needs three settings to be competitive:
+- **PyTorch on gfx1151**: `--mode fast-nocompile-strix` (or `fast-strix` with torch.compile) plus two settings:
   `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` (otherwise attention with the block mask falls back to the math path,
   small fp32 GEMMs: a 2,560-token forward takes 3.63 instead of 1.55 s); TunableOp with rocBLAS solutions
   (`PYTORCH_TUNABLEOP_ENABLED=1 PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED=0`: the hipBLASLt solutions fail inside HIP
   graph capture), tuned once in a process that exits normally (the results file is written at exit; about 4 minutes)
-  and served with `PYTORCH_TUNABLEOP_TUNING=0` (rocBLAS defaults reach 13–16 TFLOPS on these GEMMs, tuned 20–21); and
-  `BASAL_TOKEN_BUDGET=4096 BASAL_WARMUP=1` with longer captured lengths, so that a long state with several questions
-  stays one packed row (5 questions over 2,400 tokens: 3.7 → 2.2 s). `BASAL_LENS` replaces the whole list, so give
-  the short lengths too, or every request is padded to the shortest one given:
-  `BASAL_LENS=128,192,256,320,384,448,512,640,768,896,1024,1280,1536,1792,2048,2304,2560,3072,3584,4096,5120,6144,8192`.
-- `--mode fast` (torch.compile + HIP graphs) works on ROCm with the same settings: 216 s start-up, 5–15% faster than
-  `fast-nocompile`, still behind `gguf-strix` on most request shapes.
+  and served with `PYTORCH_TUNABLEOP_TUNING=0` (rocBLAS defaults reach 13–16 TFLOPS on these GEMMs, tuned 20–21).
+  The `-strix` graph modes capture lengths up to 8,192, so that a long state with several questions stays one packed
+  row (5 questions over 2,400 tokens: 3.7 → 2.2 s), with 4,096 tokens per forward and one warm-up forward per shape
+  (start-up ~76 s instead of 942 s). `BASAL_LENS`, `BASAL_BATCHES`, `BASAL_TOKEN_BUDGET` and `BASAL_WARMUP` change
+  that in these modes only (`BASAL_LENS` replaces the whole list, so give the short lengths too); `fast`,
+  `fast-nocompile` and `mps` keep their shapes.
+- `--mode fast-strix` (torch.compile + HIP graphs) works on ROCm: 216 s start-up, 5–15% faster than
+  `fast-nocompile-strix`, still behind `gguf-strix` on most request shapes.
 - Full benchmarks (1–20 questions over states of 100–6,000 tokens, concurrency up to 64 clients, agreement with an
   fp32 reference, edge cases), before and after: [benchmarks/STRIX_HALO.md](benchmarks/STRIX_HALO.md).
 - `llama-server`: ROCm prefills 22–27% faster than Vulkan on Mesa 25.3 (1,575 vs 1,286 tokens/s at 384 tokens;

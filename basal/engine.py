@@ -11,6 +11,7 @@ Backends:
   GraphBackend      static shapes + CUDA graphs, optional torch.compile, shared prefix for the two option orders,
                     token-budget batching, optional torchao FP8 / NVFP4 quantisation
   ExitGraphBackend  GraphBackend split into graph segments at trained early-exit layers; exit policy per request
+  StrixHaloGraphBackend  GraphBackend with the shapes and warm-up measured on AMD Strix Halo (`--mode fast-strix`)
   MPSBackend        GraphBackend's shared prefix + token-budget batching on Apple MPS (PyTorch, no graphs)
   VLLMBackend       vLLM, for ModelOpt FP8 / NVFP4 checkpoints (native low-precision kernels)
   SGLangBackend     SGLang offline engine (1.5): the same letter readout from the log-probabilities of the option tokens
@@ -109,40 +110,8 @@ class GraphBackend(EagerBackend):
     LENS = [128, 192, 256, 320, 384, 448, 512, 640, 768, 896, 1024, 1280, 1536, 1792, 2048, 2304, 2560, 3072]
     BATCHES = [1, 2, 4, 8, 16, 32]
     TOKEN_BUDGET = 12288  # max batch x bucket length per forward
-    WARMUP = 3  # forwards per shape before its graph is captured
-
-    def _shape_config(self):
-        """Environment overrides of the captured shapes. Start-up runs WARMUP + 1 forwards of every shape, which is
-        seconds on an H100 but minutes on a compute-bound iGPU (Radeon 8060S: 81 shapes, ~11 PFLOP, ~15 min), where
-        large batches add no throughput anyway: BASAL_TOKEN_BUDGET=4096 BASAL_WARMUP=1 starts in about 2 minutes."""
-        import os
-
-        def env(name):  # unset and empty (BASAL_X=${UNSET} in a unit file) both mean the default
-            return (os.environ.get(name) or "").strip()
-
-        def ints(name, default):
-            v = env(name)
-            xs = sorted(int(x) for x in v.split(",")) if v else default
-            if xs[0] < 1:
-                raise ValueError(f"{name} must be positive integers, got {v!r}")
-            return xs
-
-        def num(name, default):
-            v = env(name)
-            x = int(v) if v else default
-            if x < 1:
-                raise ValueError(f"{name} must be at least 1, got {v!r} (BASAL_WARMUP: lazy initialisation must not "
-                                 "happen during capture)")
-            return x
-        cls = type(self)  # defaults: the class values (not overrides already set on this instance)
-        self.LENS, self.BATCHES = ints("BASAL_LENS", cls.LENS), ints("BASAL_BATCHES", cls.BATCHES)
-        if self.BATCHES[0] != 1:  # one row of every length is always captured, so no shape is captured under load
-            raise ValueError(f"BASAL_BATCHES must include 1, got {env('BASAL_BATCHES')!r}")
-        self.TOKEN_BUDGET = num("BASAL_TOKEN_BUDGET", cls.TOKEN_BUDGET)
-        self.WARMUP = num("BASAL_WARMUP", cls.WARMUP)
 
     def __init__(self, model_dir, dtype="bfloat16", quant=None, compile=False, shared=True, warm=True):
-        self._shape_config()
         torch.backends.cuda.enable_cudnn_sdp(False)  # before capture: a captured graph keeps its attention kernel
         self.tok = AutoTokenizer.from_pretrained(model_dir)
         self.tok.pad_token = self.tok.pad_token or self.tok.eos_token
@@ -197,7 +166,7 @@ class GraphBackend(EagerBackend):
     def _capture(self, key, fn, *static):
         st = torch.cuda.Stream(); st.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(st):
-            for _ in range(self.WARMUP):
+            for _ in range(3):
                 fn(*static)
         torch.cuda.current_stream().wait_stream(st)
         g = torch.cuda.CUDAGraph()
@@ -476,7 +445,7 @@ class ExitGraphBackend(GraphBackend):
             return h, cos, sin
         st = torch.cuda.Stream(); st.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(st):
-            for _ in range(self.WARMUP):
+            for _ in range(3):
                 h, cos, sin = emb()
                 for f in self.segs:
                     h = f(h, mask, pos, cos, sin)
@@ -535,13 +504,70 @@ class ExitGraphBackend(GraphBackend):
         return self._assemble(groups, units, res)
 
 
+class StrixHaloGraphBackend(GraphBackend):
+    """`--mode fast-strix` / `fast-nocompile-strix`: the CUDA-graph path with the shapes measured on AMD Strix Halo
+    (Radeon 8060S, ROCm; docs/benchmarks/STRIX_HALO.md). Start-up runs WARMUP + 1 forwards of every captured shape:
+    seconds on an H100, but ~15 minutes on this compute-bound iGPU with the defaults of GraphBackend (81 shapes,
+    ~11 PFLOP), where big batches add no throughput anyway. Here: lengths up to 8,192 (a long state with several
+    questions stays one packed row), 4,096 tokens per forward, one warm-up forward: start-up ~76 s, 14.5 GiB.
+    BASAL_LENS (it replaces the whole list), BASAL_BATCHES, BASAL_TOKEN_BUDGET and BASAL_WARMUP override them. Pair it
+    with TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 and TunableOp (docs/HARDWARE.md, section "AMD Strix Halo")."""
+
+    LENS = GraphBackend.LENS + [3584, 4096, 5120, 6144, 8192]
+    TOKEN_BUDGET = 4096
+    WARMUP = 1  # forwards per shape before its graph is captured
+
+    def __init__(self, *args, **kwargs):
+        self._shape_config()
+        super().__init__(*args, **kwargs)
+
+    def _shape_config(self):
+        """The class values, overridden by BASAL_LENS / BASAL_BATCHES / BASAL_TOKEN_BUDGET / BASAL_WARMUP."""
+        import os
+
+        def env(name):  # unset and empty (BASAL_X=${UNSET} in a unit file) both mean the default
+            return (os.environ.get(name) or "").strip()
+
+        def ints(name, default):
+            v = env(name)
+            xs = sorted(int(x) for x in v.split(",")) if v else default
+            if xs[0] < 1:
+                raise ValueError(f"{name} must be positive integers, got {v!r}")
+            return xs
+
+        def num(name, default):
+            v = env(name)
+            x = int(v) if v else default
+            if x < 1:
+                raise ValueError(f"{name} must be at least 1, got {v!r} (BASAL_WARMUP: lazy initialisation must not "
+                                 "happen during capture)")
+            return x
+        cls = type(self)  # defaults: the class values (not overrides already set on this instance)
+        self.LENS, self.BATCHES = ints("BASAL_LENS", cls.LENS), ints("BASAL_BATCHES", cls.BATCHES)
+        if self.BATCHES[0] != 1:  # one row of every length is always captured, so no shape is captured under load
+            raise ValueError(f"BASAL_BATCHES must include 1, got {env('BASAL_BATCHES')!r}")
+        self.TOKEN_BUDGET = num("BASAL_TOKEN_BUDGET", cls.TOKEN_BUDGET)
+        self.WARMUP = num("BASAL_WARMUP", cls.WARMUP)
+
+    def _capture(self, key, fn, *static):
+        st = torch.cuda.Stream(); st.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(st):
+            for _ in range(self.WARMUP):
+                fn(*static)
+        torch.cuda.current_stream().wait_stream(st)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, pool=self.pool):
+            out = fn(*static)
+        self.graphs[key] = (g, *static, out)
+        return self.graphs[key]
+
+
 class MPSBackend(GraphBackend):
     """Apple GPU through PyTorch MPS: the shared-prefix packing (prefix trie, SOAM) and token-budget batching of
     GraphBackend, run as plain forwards (MPS has no CUDA graphs). Rows are padded on the right to the longest packed
     row of the chunk."""
 
     def __init__(self, model_dir, dtype="bfloat16", shared=True, device="mps"):
-        self._shape_config()  # BASAL_LENS / BATCHES / TOKEN_BUDGET set the batching here too (no graphs, no warm-up)
         EagerBackend.__init__(self, model_dir, dtype, device)
         self.dev = torch.device(device)
         self.shared = shared
