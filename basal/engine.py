@@ -108,8 +108,25 @@ class GraphBackend(EagerBackend):
     LENS = [128, 192, 256, 320, 384, 448, 512, 640, 768, 896, 1024, 1280, 1536, 1792, 2048, 2304, 2560, 3072]
     BATCHES = [1, 2, 4, 8, 16, 32]
     TOKEN_BUDGET = 12288  # max batch x bucket length per forward
+    WARMUP = 3  # forwards per shape before its graph is captured
+
+    def _shape_config(self):
+        """Environment overrides of the captured shapes. Start-up runs WARMUP + 1 forwards of every shape, which is
+        seconds on an H100 but minutes on a compute-bound iGPU (Radeon 8060S: 81 shapes, ~11 PFLOP, ~15 min), where
+        large batches add no throughput anyway: BASAL_TOKEN_BUDGET=4096 BASAL_WARMUP=1 starts in about 2 minutes."""
+        import os
+
+        def ints(name, default):
+            v = os.environ.get(name)
+            return sorted(int(x) for x in v.split(",")) if v else default
+        self.LENS, self.BATCHES = ints("BASAL_LENS", self.LENS), ints("BASAL_BATCHES", self.BATCHES)
+        self.TOKEN_BUDGET = int(os.environ.get("BASAL_TOKEN_BUDGET", self.TOKEN_BUDGET))
+        self.WARMUP = int(os.environ.get("BASAL_WARMUP", self.WARMUP))
+        if self.WARMUP < 1:
+            raise ValueError("BASAL_WARMUP must be at least 1 (lazy initialisation must not happen during capture)")
 
     def __init__(self, model_dir, dtype="bfloat16", quant=None, compile=False, shared=True, warm=True):
+        self._shape_config()
         torch.backends.cuda.enable_cudnn_sdp(False)  # before capture: a captured graph keeps its attention kernel
         self.tok = AutoTokenizer.from_pretrained(model_dir)
         self.tok.pad_token = self.tok.pad_token or self.tok.eos_token
@@ -164,7 +181,7 @@ class GraphBackend(EagerBackend):
     def _capture(self, key, fn, *static):
         st = torch.cuda.Stream(); st.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(st):
-            for _ in range(3):
+            for _ in range(self.WARMUP):
                 fn(*static)
         torch.cuda.current_stream().wait_stream(st)
         g = torch.cuda.CUDAGraph()
@@ -443,7 +460,7 @@ class ExitGraphBackend(GraphBackend):
             return h, cos, sin
         st = torch.cuda.Stream(); st.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(st):
-            for _ in range(3):
+            for _ in range(self.WARMUP):
                 h, cos, sin = emb()
                 for f in self.segs:
                     h = f(h, mask, pos, cos, sin)
@@ -778,12 +795,14 @@ class GGUFBackend(GraphBackend):
     GraphBackend: the state once, every question and option order after it) becomes llama.cpp sequences: every readout
     has its own sequence and every token belongs to the sequences of all readouts below its block, so a shared prefix
     is computed once and each readout sees its own prompt only. All rows of a chunk go through one llama_decode
-    (unified KV cache, cleared per chunk)."""
+    (unified KV cache, cleared per chunk). The fixed start of every prompt (chat template, system prompt, state label;
+    one per language) is decoded once at start-up into sequences of its own and copied into the readout sequences of
+    every row that begins with it (the cells are shared, not recomputed): about 55-65 tokens less per request."""
 
     N_CTX = 16384  # KV cells per chunk: room for a single long prompt
     N_SEQ = 64     # readouts (sequences) per chunk
 
-    def __init__(self, model_dir, gguf, n_gpu_layers=-1):
+    def __init__(self, model_dir, gguf, n_gpu_layers=-1, prefixes=None):
         import logging
 
         import llama_cpp as C
@@ -822,12 +841,31 @@ class GGUFBackend(GraphBackend):
         cp = C.llama_context_default_params()
         cp.n_ctx = cp.n_batch = self.N_CTX
         cp.n_ubatch = 512
-        cp.n_seq_max = self.N_SEQ
+        if prefixes is None:  # a tokenizer without a chat template (tests) has no fixed prompt start
+            from .prompt import fixed_prefixes
+            prefixes = fixed_prefixes(self.tok) if hasattr(self.tok, "apply_chat_template") else []
+        self.prefixes = [list(x) for x in prefixes if len(x) > 0]
+        self.n_read = self.N_SEQ  # readout sequences are 0..n_read-1, the cached prefixes follow
+        self.n_cells = self.N_CTX - sum(map(len, self.prefixes))  # KV cells left for the rows of a chunk
+        cp.n_seq_max = self.n_read + len(self.prefixes)
         cp.kv_unified = True  # sequences share the cells of their common prefix
         self.ctx = C.llama_init_from_model(self.cmodel, cp)
         if not self.ctx:
             raise ValueError("llama.cpp could not create a context")
         self.batch = C.llama_batch_init(self.N_CTX, 0, self.N_SEQ)  # a prefix token belongs to every readout below it
+        self.mem = C.llama_get_memory(self.ctx)
+        self._used = 0  # readout sequences of the last chunk (removed before the next one)
+        if self.prefixes:
+            b, n = self.batch, 0
+            for j, pre in enumerate(self.prefixes):
+                for i, tok in enumerate(pre):
+                    b.token[n], b.pos[n], b.logits[n], b.n_seq_id[n] = tok, i, 0, 1
+                    b.seq_id[n][0] = self.n_read + j
+                    n += 1
+            b.logits[n - 1] = 1
+            b.n_tokens = n
+            if C.llama_decode(self.ctx, b) != 0:
+                raise RuntimeError("llama_decode failed (fixed prompt prefixes)")
 
     def __del__(self):
         C = getattr(self, "C", None)
@@ -841,23 +879,36 @@ class GGUFBackend(GraphBackend):
             C.llama_model_free(self.cmodel)
 
     def _oversize(self, pack, n):
-        return len(pack[0]) > self.N_CTX or n > self.N_SEQ
+        return len(pack[0]) > self.n_cells or n > self.N_SEQ
 
     def _decode_chunks(self, units):
-        """Units sorted by length, cut into chunks of at most N_CTX tokens and N_SEQ readouts."""
+        """Units sorted by length, cut into chunks of at most n_cells tokens and N_SEQ readouts."""
         out, cur, n_tok, n_seq = [], [], 0, 0
         for k in sorted(range(len(units)), key=lambda k: len(units[k][0][0])):
             t, r = len(units[k][0][0]), len(units[k][1])
-            if t > self.N_CTX:
-                raise ValueError(f"prompt too long for the GGUF backend: {t} tokens (max {self.N_CTX})")
-            if cur and (n_tok + t > self.N_CTX or n_seq + r > self.N_SEQ):
+            if t > self.n_cells:
+                raise ValueError(f"prompt too long for the GGUF backend: {t} tokens (max {self.n_cells})")
+            if cur and (n_tok + t > self.n_cells or n_seq + r > self.N_SEQ):
                 out.append(cur); cur, n_tok, n_seq = [], 0, 0
             cur.append(k); n_tok += t; n_seq += r
         return out + ([cur] if cur else [])
 
+    def _cached(self, pack):
+        """(length, sequence) of the cached prefix that starts this packed row, or (0, None). The prefix must lie in
+        the root block of a single-root trie, so that every readout of the row continues it."""
+        t, pos, seg, last, parent = pack
+        if parent.count(-1) == 1:
+            for j, pre in enumerate(self.prefixes):
+                P = len(pre)
+                if len(t) > P and seg[P - 1] == 0 and min(last) >= P and t[:P] == pre:
+                    return P, self.n_read + j
+        return 0, None
+
     def _decode(self, packs, idx):
         """One llama_decode for the packed rows idx -> readout logits [n_readouts, n_vocab] (float32)."""
         C, b = self.C, self.batch
+        for q in range(self._used):  # the readouts of the last chunk; the cached prefixes stay
+            C.llama_memory_seq_rm(self.mem, q, -1, -1)
         n, base, reads = 0, 0, []
         for k in idx:
             t, pos, seg, last, parent = packs[k]
@@ -866,18 +917,22 @@ class GGUFBackend(GraphBackend):
                 blk = seg[i]
                 while blk >= 0:
                     below[blk].append(base + r); blk = parent[blk]
-            for tok, p, s in zip(t, pos, seg):
+            P, src = self._cached(packs[k])
+            for r in range(len(last) if P else 0):  # the prefix cells join every readout of the row
+                C.llama_memory_seq_cp(self.mem, src, base + r, 0, P)
+            start = n - P  # batch index of token i is start + i
+            for tok, p, s in zip(t[P:], pos[P:], seg[P:]):
                 b.token[n], b.pos[n], b.logits[n] = tok, p, 0
                 b.n_seq_id[n] = len(below[s])
                 for j, q in enumerate(below[s]):
                     b.seq_id[n][j] = q
                 n += 1
             for i in last:
-                b.logits[n - len(t) + i] = 1
-                reads.append(n - len(t) + i)
+                b.logits[start + i] = 1
+                reads.append(start + i)
             base += len(last)
         b.n_tokens = n
-        C.llama_memory_clear(C.llama_get_memory(self.ctx), False)
+        self._used = base
         if C.llama_decode(self.ctx, b) != 0:
             raise RuntimeError("llama_decode failed")
         return np.stack([np.ctypeslib.as_array(C.llama_get_logits_ith(self.ctx, r), shape=(self.n_vocab,))

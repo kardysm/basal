@@ -35,6 +35,19 @@ def render(tok, state, question, options, lang=None):
     return text + PREFILL
 
 
+def fixed_prefixes(tok):
+    """Token ids that start every prompt of one language whatever the request (chat template, system prompt, the state
+    label): the common prefix of prompts over states that begin with different characters, so that a state's first
+    token never merges into it. An engine can compute these once and reuse them for every request."""
+    import os
+    out = []
+    for lang in TEMPLATES:
+        toks = [tok(render(tok, s, "?", ["x", "y"], lang), add_special_tokens=False).input_ids
+                for s in ("A", "z", "1", " x", "{", "\"", "-", "Ż", "\n")]
+        out.append(list(os.path.commonprefix(toks)))
+    return out
+
+
 def letter_ids(tok, prompt, k):
     """Token id of each option letter at the answer position; None if a letter is not a single token there."""
     base = tok(prompt, add_special_tokens=False).input_ids

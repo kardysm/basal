@@ -7,6 +7,9 @@ without a separate Ollama or `llama-server`. Only the weights come from the GGUF
 exactly those of the other backends. The packed rows of a request (the state once, then every question and option
 order: [SOAM](SOAM.md)) become llama.cpp *sequences*: every readout has its own sequence, every token belongs to the
 sequences of all readouts below it, and all rows of a batch go through one `llama_decode`.
+The fixed start of every prompt (chat template, system prompt and state label: 53 tokens in Polish, 66 in English) is
+decoded once at start-up into sequences of its own; every row that begins with it shares those cells instead of
+computing them again (on the Radeon 8060S: 143 → 119 ms for one question, 7.8 → 10.1 decisions/s).
 
 This mode was contributed by Paweł Kiszczak ([#4](https://github.com/rkinas/basal/pull/4)) for basal-1.0 and extended to
 the nested prefixes of SOAM in basal 1.5.
@@ -41,6 +44,9 @@ matches the GGUF file. In this mode `--model` is downloaded without its weights.
 # llama-cpp-python builds with Metal on macOS arm64; on Linux the default build runs on the CPU. For CUDA, build it
 # first, without uv's cache (a cached CPU build would be reused silently; checked on an RTX 4090: --mode gguf on the GPU):
 #   CMAKE_ARGS="-DGGML_CUDA=on" uv pip install --no-cache llama-cpp-python --no-binary llama-cpp-python
+# For AMD GPUs on Linux build it with Vulkan (needs glslc, vulkan-headers, vulkan-loader-devel and SPIRV-Headers;
+# measured on Strix Halo: HARDWARE.md#amd-strix-halo):
+#   CMAKE_ARGS="-DGGML_VULKAN=on" uv pip install --no-cache llama-cpp-python --no-binary llama-cpp-python
 uv pip install "basal[gguf] @ https://github.com/rkinas/basal/archive/refs/tags/v1.5.0.tar.gz"
 basal-bench --model ./basal-1.5-4.5B-GGUF --modes gguf@basal-1.5-4.5B-GGUF/basal-1.5-4.5B-Q8_0.gguf \
             gguf@basal-1.5-4.5B-GGUF/basal-1.5-4.5B-Q4_K_M.gguf

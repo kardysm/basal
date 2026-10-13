@@ -341,6 +341,42 @@ cool-down; *TV*: mean / max total-variation distance to fp32, *changed*: decisio
 Figures: `python docs/figures/make_figures.py` (matplotlib) from the measurements in `docs/figures/apple_engines.json`.
 
 
+## AMD Strix Halo
+
+One Ryzen AI Max+ PRO 395 (Radeon 8060S, gfx1151, 128 GB unified memory; Fedora 44, PyTorch 2.12 + ROCm 7.2),
+basal-1.5 (4.5B), served by `basal-serve` and measured over HTTP on the bundled examples: the 44 single questions, the
+five `complex.jsonl` requests, all their 14 questions over one state, and one ~2,400-token state with 1 and with 5
+questions. p50 per request after a GPU cool-down; *dec/s*: single questions with 32 concurrent clients. In every row
+the top option equals that of bf16 `fast-nocompile` on all 78 readouts (mean |Δp| 0.003–0.006).
+
+| engine | 1 question | 5 complex | 14 questions | long state: 1 q / 5 q | dec/s | start-up | GPU memory |
+|---|---|---|---|---|---|---|---|
+| **`gguf` Q8_0** in process (llama-cpp-python 0.3.36, Vulkan, Mesa 26.2) | **119 ms** | **314 ms** | **1.27 s** | **1.36 / 1.82 s** | **10.1** | 1 s | 6.3 GiB |
+| `fast-nocompile` bf16, tuned (below) | 155 ms | 342 ms | 1.48 s | 1.47 / 2.22 s | 6.9 | 76 s | 14.5 GiB |
+| `llamacpp` Q8_0, `llama-server` ROCm 7.2.4 (`-fa on -ub 2048`) | 166 ms | 475 ms | 2.15 s | 1.49 / 2.30 s | 6.1 | 5 s | – |
+| `llamacpp` Q8_0, `llama-server` Vulkan (Mesa 25.3) | 256 ms | 710 ms | 3.61 s | 1.90 / 3.15 s | 4.3 | 5 s | 5.3 GiB |
+| `fast-nocompile` bf16, rocBLAS, math attention | 250 ms | 496 ms | 3.69 s | 3.69 / 10.1 s | 4.7 | 93 s ¹ | 17.5 GiB ¹ |
+
+¹ with `BASAL_TOKEN_BUDGET=4096 BASAL_WARMUP=1`; with the defaults `fast-nocompile` starts in 942 s and holds 31 GiB.
+
+- **Compute-bound.** A token costs about 9.2 GFLOP; one question is a packed row of about 240 tokens. Quantisation saves
+  memory, not time: an F16 GGUF prefills slower than Q8_0 (ROCm 1,259 vs 1,575 tokens/s at 384 tokens).
+- **`gguf` is the fastest route**: the whole request goes into one `llama_decode` (no request per prompt as with
+  `llama-server`, no padding to captured shapes as with the CUDA-graph path) and the fixed prompt start is cached.
+  Build llama-cpp-python with Vulkan ([GGUF.md](GGUF.md#serve)); the host's newer Mesa matters: `llama-server` in a
+  Mesa 25.3 container prefills 1,336 tokens/s at 2,048 tokens, the in-process build on Mesa 26.2 about 1,700.
+- **PyTorch on gfx1151** needs three settings to be competitive:
+  `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` (otherwise attention with the block mask falls back to the math path,
+  small fp32 GEMMs: a 2,560-token forward takes 3.63 instead of 1.55 s); TunableOp with rocBLAS solutions
+  (`PYTORCH_TUNABLEOP_ENABLED=1 PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED=0`: the hipBLASLt solutions fail inside HIP
+  graph capture), tuned once in a process that exits normally (the results file is written at exit; about 4 minutes)
+  and served with `PYTORCH_TUNABLEOP_TUNING=0` (rocBLAS defaults reach 13–16 TFLOPS on these GEMMs, tuned 20–21); and
+  `BASAL_TOKEN_BUDGET=4096 BASAL_WARMUP=1` with `BASAL_LENS` extended to 8192 (`…,3072,3584,4096,5120,6144,8192`) so
+  that a long state with several questions stays one packed row (5 questions over 2,400 tokens: 3.7 → 2.2 s).
+- `llama-server`: ROCm prefills 22–27% faster than Vulkan on Mesa 25.3 (1,575 vs 1,286 tokens/s at 384 tokens;
+  `-fa on -ub 2048`: 1,699 vs 1,336 at 2,048). Keep `-np 1`: with several slots the option orders of one question run
+  in different slots and each computes the state again.
+
 ## Notes per platform
 
 - **DGX Spark (GB10, aarch64, CUDA 13).** In the README install steps use the CUDA 13 build of PyTorch

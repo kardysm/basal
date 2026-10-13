@@ -134,3 +134,26 @@ def test_readouts_beyond_n_seq_are_split(backend):
     finally:
         del backend.N_SEQ  # back to the class value
     assert np.allclose(full, split, atol=5e-3)
+
+
+@pytest.fixture(scope="module")
+def cached(model):
+    mp = pytest.MonkeyPatch()
+    gguf_path, model_dir = model
+    mp.setattr("basal.engine.AutoTokenizer.from_pretrained", lambda _: Tok())
+    yield GGUFBackend(model_dir, gguf_path, n_gpu_layers=0,
+                      prefixes=[Tok()("a shared state").input_ids, Tok()("other start").input_ids])
+    mp.undo()
+
+
+def test_cached_prefix_equals_full_decode(backend, cached):
+    """The fixed prompt starts, decoded once at start-up and shared by every row that begins with one of them, give
+    the readouts of a full decode; rows with another start are decoded in full. The second round reuses the prefixes
+    after the first chunk's readout sequences were removed."""
+    state = "a shared state of a request, long enough to matter: "
+    prompts = [state + q + o for q in ("q1? ", "question two? ") for o in (" A. x B. y C. z", " A. z B. y C. x")]
+    groups = [(prompts, [IDS] * 4), group("other start; question?"), group("no cached prefix here")]
+    assert [cached._cached(cached._pack(cached.encode(g[0])))[0] for g in groups] == [14, 11, 0]
+    for _ in range(2):
+        for a, b in zip(cached.run_shared(groups), backend.run_shared(groups)):
+            assert np.allclose(a, b, atol=5e-3)
