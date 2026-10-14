@@ -48,6 +48,7 @@ MODES = {
     "mlx-q8": ("mlx", "q8", False),         # "mlx" with 8-bit weights made at load time (less memory, not faster)
     "mps": ("mps", None, False),            # Apple Silicon: PyTorch MPS + shared prefix, no graphs
     "gguf": ("gguf", None, False),          # llama.cpp in process on a GGUF file (--gguf; Metal, CUDA or CPU)
+    "strix": ("strix", None, False),       # AMD Strix Halo: Triton attention / FFN kernels, one sequence per chunk
     "ollama": ("ollama", None, False),      # Ollama with the GGUF exports (1.5); --ollama-url, --ollama-model
     "llamacpp": ("llamacpp", None, False),  # llama.cpp server with the GGUF exports (1.5); --llamacpp-url
 }
@@ -251,6 +252,9 @@ class Server:
             self.backend = MPSBackend(md, a.dtype, shared=a.orders == 2)
         elif kind == "gguf":
             self.backend = GGUFBackend(md, a.gguf)
+        elif kind == "strix":
+            from .strix import StrixHaloFastBackend
+            self.backend = StrixHaloFastBackend(md, a.dtype)
         elif kind == "ollama":
             self.backend = OllamaBackend(md, a.ollama_url, a.ollama_model, parallel=a.http_parallel)
         elif kind == "llamacpp":

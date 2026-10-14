@@ -537,6 +537,7 @@ for f in choice noul score complex; do basal-run --input basal/examples/$f.jsonl
 | `mlx-q8` | `mlx` with 8-bit weights made from bf16 at load time (about half the memory, not faster) | Apple Silicon |
 | `mps` | the PyTorch engine on the Mac's GPU: SOAM packing + token-budget batching, no CUDA graphs; evidence spans | Apple Silicon |
 | `gguf` | a GGUF file in process through llama.cpp (`--gguf <file>`, extra `basal[gguf]`); SOAM as llama.cpp sequences | Apple Silicon (Metal), CUDA, CPU |
+| `strix` | PyTorch + Triton kernels written for gfx1151: flash attention over the packed prefix trie, gate / up + SwiGLU fused, matmuls with the bias and residual add in the epilogue, all rows of a batch in one sequence (bf16; [benchmarks](docs/benchmarks/STRIX_HALO.md)) | AMD Strix Halo (ROCm + Triton); measured only there |
 | `ollama` | the basal server in front of Ollama (GGUF ports; `--ollama-model`, `--ollama-url`) | anything Ollama runs on |
 | `llamacpp` | the basal server in front of `llama-server` (GGUF ports; `--llamacpp-url`) | anything llama.cpp runs on |
 
