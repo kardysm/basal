@@ -539,6 +539,7 @@ for f in choice noul score complex; do basal-run --input basal/examples/$f.jsonl
 | `gguf` | a GGUF file in process through llama.cpp (`--gguf <file>`, extra `basal[gguf]`); SOAM as llama.cpp sequences | Apple Silicon (Metal), CUDA, CPU |
 | `gguf-strix` | `gguf` + the fixed prompt start decoded once and shared by every request (opt-in; [GGUF.md](docs/GGUF.md)) | AMD Strix Halo (llama-cpp-python built with Vulkan); measured only there |
 | `fast-strix`, `fast-nocompile-strix` | `fast` / `fast-nocompile` with the captured shapes and warm-up measured on AMD Strix Halo (lengths up to 8,192, one warm-up forward; `BASAL_LENS` / `BATCHES` / `TOKEN_BUDGET` / `WARMUP` override them; [HARDWARE.md](docs/HARDWARE.md#amd-strix-halo)) | AMD Strix Halo (ROCm); measured only there |
+| `strix` | PyTorch + Triton kernels written for gfx1151: flash attention over the packed prefix trie, gate / up + SwiGLU fused, matmuls with the bias and residual add in the epilogue, all rows of a batch in one sequence (bf16; [benchmarks](docs/benchmarks/STRIX_HALO.md#--mode-strix-bottlenecks-and-triton-kernels-for-gfx1151)) | AMD Strix Halo (ROCm + Triton); measured only there |
 | `ollama` | the basal server in front of Ollama (GGUF ports; `--ollama-model`, `--ollama-url`) | anything Ollama runs on |
 | `llamacpp` | the basal server in front of `llama-server` (GGUF ports; `--llamacpp-url`) | anything llama.cpp runs on |
 

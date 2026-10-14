@@ -361,9 +361,15 @@ the top option equals that of bf16 `fast-nocompile` on all 78 readouts (mean |Δ
 ¹ with 4,096 tokens per forward and one warm-up forward (`BASAL_TOKEN_BUDGET=4096 BASAL_WARMUP=1` on
 `fast-nocompile-strix`); `fast-nocompile` itself starts in 942 s and holds 31 GiB.
 
+- **`--mode strix` is the fastest engine on the request matrix**: PyTorch + Triton kernels written for this GPU
+  (flash attention over the packed prefix trie, gate / up + SwiGLU fused, matmuls with the bias and the residual
+  add in the epilogue), 1.1–1.75× faster than `gguf` (S, 1 question 178 → 159 ms; ≈2,000-token state 1.28 →
+  0.74 s; ≈6,000 tokens 4.16 → 2.73 s; 32 clients 7.7 → 10.9 decisions/s), the same decision as the fp32
+  reference on 144 of 144. It needs Triton and 10 GiB (bf16 weights); one short question at a time stays faster
+  with `gguf` (141 vs 159 ms). Where the time goes and why: [benchmarks/STRIX_HALO.md](benchmarks/STRIX_HALO.md#--mode-strix-bottlenecks-and-triton-kernels-for-gfx1151).
 - **Compute-bound.** A token costs about 9.2 GFLOP; one question is a packed row of about 240 tokens. Quantisation saves
   memory, not time: an F16 GGUF prefills slower than Q8_0 (ROCm 1,259 vs 1,575 tokens/s at 384 tokens).
-- **In-process llama.cpp is the fastest route**: with `gguf` the whole request goes into one `llama_decode` (no request
+- **In-process llama.cpp is the fastest GGUF route**: with `gguf` the whole request goes into one `llama_decode` (no request
   per prompt as with `llama-server`, no padding to captured shapes as with the CUDA-graph path); `gguf-strix` also
   caches the fixed prompt start (opt-in, [GGUF.md](GGUF.md)).
   Build llama-cpp-python with Vulkan ([GGUF.md](GGUF.md#serve)); the host's newer Mesa matters: `llama-server` in a

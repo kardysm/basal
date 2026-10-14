@@ -63,6 +63,9 @@ def build(mode, md, vllm_model=None, gguf=None, ollama_model=None, ollama_url="h
         return ExitGraphBackend(md, "bfloat16", quant, compile=comp)
     if kind == "graph-strix":
         return StrixHaloGraphBackend(md, "bfloat16", quant, compile=comp, shared=True)
+    if kind == "strix":
+        from .strix import StrixHaloFastBackend
+        return StrixHaloFastBackend(md, "bfloat16")
     return GraphBackend(md, "bfloat16", quant, compile=comp, shared=True)
 
 
@@ -215,7 +218,7 @@ def main():
                          "(--modes eager-fp32 mps mlx for fp32 agreement if memory allows). Modes: eager-fp32, eager, "
                          "fast, fast-nocompile, fp8, nvfp4, vllm, sglang, fast-exit@off|0.999|0.995|0.99|0.98; Apple "
                          "Silicon: mlx, mlx-q8, mps; GGUF: gguf, gguf@<file.gguf>, gguf-strix, gguf-strix@<file.gguf>, "
-                         "ollama, llamacpp; AMD Strix Halo: fast-strix, fast-nocompile-strix, gguf-strix")
+                         "ollama, llamacpp; AMD Strix Halo: strix, fast-strix, fast-nocompile-strix, gguf-strix")
     ap.add_argument("--questions", nargs="+", default=DEFAULT_QUESTIONS,
                     help="JSONL file(s) with simple items (default: the bundled examples, 44 items)")
     ap.add_argument("--n", type=int, default=500)

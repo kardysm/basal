@@ -52,6 +52,7 @@ MODES = {
     "gguf-strix": ("gguf-strix", None, False),  # "gguf" + cached prompt start, measured on AMD Strix Halo (Vulkan)
     "fast-strix": ("graph-strix", None, True),  # "fast" with the shapes and warm-up measured on AMD Strix Halo (ROCm)
     "fast-nocompile-strix": ("graph-strix", None, False),  # the same without torch.compile
+    "strix": ("strix", None, False),       # AMD Strix Halo: Triton attention / FFN kernels, one sequence per chunk
     "ollama": ("ollama", None, False),      # Ollama with the GGUF exports (1.5); --ollama-url, --ollama-model
     "llamacpp": ("llamacpp", None, False),  # llama.cpp server with the GGUF exports (1.5); --llamacpp-url
 }
@@ -257,6 +258,9 @@ class Server:
             self.backend = GGUFBackend(md, a.gguf)
         elif kind == "gguf-strix":
             self.backend = StrixHaloGGUFBackend(md, a.gguf)
+        elif kind == "strix":
+            from .strix import StrixHaloFastBackend
+            self.backend = StrixHaloFastBackend(md, a.dtype)
         elif kind == "graph-strix":
             self.backend = StrixHaloGraphBackend(md, a.dtype, quant, compile=comp, shared=a.orders == 2)
         elif kind == "ollama":

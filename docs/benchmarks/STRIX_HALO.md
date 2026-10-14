@@ -4,6 +4,8 @@
 `basal-serve --mode llamacpp`, and the graph modes with upstream defaults. **POST** is what it serves now:
 `basal-serve --mode gguf-strix`: llama.cpp in process (Vulkan, Mesa 26.2) with the cached prompt start of this branch.
 `gguf-strix` is a mode of its own, chosen explicitly; `--mode gguf` and every other mode behave as on `main`.
+`--mode strix` ([below](#--mode-strix-bottlenecks-and-triton-kernels-for-gfx1151)) is a PyTorch + Triton engine written
+for this GPU after a profile of where `--mode gguf` spends its time; it is compared with `--mode gguf`.
 
 Machine: AMD Ryzen AI Max+ PRO 395, Radeon 8060S (gfx1151, 40 CUs), 128 GB unified memory; Fedora 44, kernel 7.2.8.
 Model: basal-1.5 (4.5B); `Q8_0` GGUF for the llama.cpp engines, bf16 for PyTorch. Software: PyTorch 2.12.0 + ROCm 7.2,
@@ -57,6 +59,75 @@ this branch with AOTriton attention and TunableOp, see below):
 ¹ latencies measured with 4,096 tokens per forward and one warm-up forward (same kernels as the defaults, shorter
 start-up).
 
+## `--mode strix`: bottlenecks, and Triton kernels for gfx1151
+
+### Where `--mode gguf` spends its time
+
+Every request is at least 98.5% GPU decode (server, tokenization and packing take 2–34 ms, at most 0.5%), and the GPU
+reaches 16–19 useful TFLOPS at every request size. GPU time by operation, from llama.cpp's Vulkan performance logger
+(`GGML_VK_PERF_LOGGER=1`), one decode per request:
+
+| operation | S, 1 q (176 ms) | L, 1 q (1.27 s) | XL, 1 q (4.17 s) | XL, 20 q (6.69 s) | speed |
+|---|---|---|---|---|---|
+| FFN matmuls (gate / up, down) | 69% | 60% | 51% | 47% | 21–25 TFLOPS |
+| flash attention | 2.5% | 10% | 23% | 28.5% | ~11 TFLOPS on long rows |
+| element-wise: bias and residual adds, SwiGLU, norms, rotary | 16% | 18% | 15.5% | 14.5% | memory-bound, fp32 |
+| attention projections | 12.5% | 12.4% | 10.4% | 9.7% | q / o 18, k / v 8–9 TFLOPS |
+
+- The model has biases on every linear layer (`attention_bias`, `mlp_bias`); llama.cpp adds each one in a separate fp32
+  pass, about 535 adds per 512-token batch and ~9% of the time.
+- Ceilings measured on this GPU: ~35–40 TFLOPS for a bf16 / fp16 matmul (rocBLAS, hipBLASLt and Triton alike;
+  theoretical 54–59); causal flash attention from AOTriton ~10 TFLOPS at 6k tokens, the same as llama.cpp's.
+- Not bottlenecks: the CPU and the server, weight bandwidth (even a 314-token row is compute-bound), clock ramp-up (a
+  request after 1 s idle takes as long as one after another), llama.cpp's batch size (`n_ubatch` 2048: 7% faster).
+- An off-the-shelf PyTorch forward (bf16, hipBLASLt with the bias in the epilogue, AOTriton flash attention) takes
+  3.70 s at XL, 1.13× faster than `gguf`, with the same split.
+
+### What `--mode strix` changes (`basal/strix.py`)
+
+| | at 6,277 tokens unless noted | stock kernel |
+|---|---|---|
+| **attention**: Triton flash attention over the packed prefix trie, GQA-packed (the 8 query heads of a kv head share each key / value tile) | 20 TFLOPS | AOTriton causal 10; FlexAttention with the block mask of a 20-question row 28 ms / layer, this kernel 8 |
+| **FFN input**: gate and up projections, their biases and SwiGLU in one kernel (two accumulators, one load of the activations) | 32 TFLOPS | `F.linear` + silu × up: 17 |
+| **qkv, o, down**: Triton matmuls with the bias and the residual add in the epilogue, tile configs per row count | o 2.4 ms, down 35–40 TFLOPS; qkv 0.13 ms at 314 tokens | `F.linear` + add: o 3.7 ms; qkv 0.17 ms |
+| RMSNorm, rotary (written head-major for the attention kernel) | ~1% of the forward | – |
+
+- The block mask of a packed row becomes an interval per key: depth-first packing puts every block's subtree in one
+  contiguous range, so key k is visible to query q iff k ≤ q < sub_end[k]. Key blocks no query of a block can see are
+  skipped, blocks every query sees run without a mask. Rows of several requests are separate trees of one sequence:
+  no padding, no captured shapes, no graphs, up to 16,384 tokens per forward.
+- The last layer computes attention, o and the FFN for the readout rows only.
+- Rounding follows the stock bf16 forward step by step (RMSNorm in fp32 then the weight in bf16, rotary as
+  round(q cos) + round(rot(q) sin), silu(gate) and its product with up rounded to bf16).
+- The server waits for the GPU by polling an event with 0.5 ms sleeps: ROCm's synchronize spins a CPU core at 100% for
+  the whole forward.
+
+### Results against `gguf` (request matrix over HTTP)
+
+| state | 1 question | 5 questions | 20 questions |
+|---|---|---|---|
+| S | 178 → **159 ms** (1.12×) | 573 → **348 ms** (1.65×) | 1.79 → **1.08 s** (1.66×) |
+| M | 439 → **289 ms** (1.52×) | 817 → **480 ms** (1.70×) | 2.12 → **1.25 s** (1.70×) |
+| L | 1.28 s → **736 ms** (1.74×) | 1.73 → **1.09 s** (1.59×) | 3.22 → **2.12 s** (1.52×) |
+| XL | 4.16 → **2.73 s** (1.52×) | 4.78 → **3.28 s** (1.46×) | 6.77 → **4.57 s** (1.48×) |
+
+- Throughput, single questions over short states: 1 client 6.9 → 6.1/s (0.88×), 8 clients 7.6 → 10.2/s, 32 clients
+  7.7 → 10.9/s (1.42×).
+- Answers: 144 of 144 decisions equal to the fp32 reference (mean |Δp| 0.0042, the closest of all engines), all 26
+  edge-case decisions, 187 of 188 equal to `gguf` (the one difference is a near-tie on which `strix` agrees with fp32).
+- Start-up 6–7 s (Triton compiles the kernels at the first start and caches them); GTT 10.0 GiB, against 5.8 GiB for
+  `gguf` (bf16 weights instead of Q8_0).
+
+### Why long states stay below 2×
+
+- The matmuls of the 6,277-token request are 58 TFLOP: at the ~35 TFLOPS this GPU sustains that is 1.65 s before any
+  attention.
+- Power: with `strix` the package runs at its limit (about 160 W for the first ~25 s of load, then about 140 W) and the
+  GPU clock drops from ~2.9 to 2.15–2.33 GHz; llama.cpp's slower kernels stay under it. A single XL forward on a cool
+  GPU takes 2.37 s (1.76×); in the matrix, after minutes of load, 2.73 s (1.52×).
+- One short question at a time stays faster with `gguf` (141 vs 159 ms): the bf16 weights are 9 GB per forward, the
+  Q8_0 file 5 GB.
+
 ## Method
 
 **Request matrix** (`bench_matrix.py`): four states built from the bundled examples, S / M / L / XL ≈ 100 / 570 / 2,000 /
@@ -83,6 +154,7 @@ then all at once (the server batches them).
 | `fast-nocompile-strix` | `--mode fast-nocompile-strix` (or `fast-strix`; or `--soam off`) with the environment below ³ |
 | **POST** `gguf-strix` | `--mode gguf-strix --gguf basal-1.5-4.5B-Q8_0.gguf`, llama-cpp-python built with `-DGGML_VULKAN=on` |
 | `gguf` | `--mode gguf --gguf basal-1.5-4.5B-Q8_0.gguf` (same build) ² |
+| `strix` | `--mode strix --model Remek/basal-1.5-4.5B` (bf16; PyTorch 2.12 + ROCm 7.2, Triton 3.7) |
 
 ² Measured as `--mode gguf` in the re-run (see above). The first run used the cache of `gguf-strix` turned off
 (`prefixes=[]`), which decodes the same tokens in the same `llama_decode` calls; the answers of the two are identical.
@@ -98,7 +170,7 @@ BASAL_TOKEN_BUDGET=4096 BASAL_WARMUP=1`, the shapes that are now the defaults of
 Reproduce: start an engine, then
 
 ```bash
-python docs/benchmarks/bench_matrix.py --url http://127.0.0.1:8000/v1/systemone --label gguf-strix
+python docs/benchmarks/bench_matrix.py --url http://127.0.0.1:8000/v1/systemone --label gguf-strix  # or strix, gguf, ...
 python docs/benchmarks/edge_check.py --url http://127.0.0.1:8000/v1/systemone --label gguf-strix
 python docs/benchmarks/report.py results/matrix results/edge > report.md
 ```
@@ -124,16 +196,25 @@ python docs/benchmarks/report.py results/matrix results/edge > report.md
 - `tests/test_graphs.py` also checks the `BASAL_*` validation (empty means default, `BASAL_BATCHES` must include 1,
   positive values only), that `fast` / `fast-nocompile` (all 81 default shapes) and `mps` ignore those variables, and
   that `basal-serve` / `basal-bench` pick the Strix Halo classes for the `-strix` modes only.
-- Full suite on this machine: 91 passed, 3 skipped (MLX / Apple only).
+- `tests/test_strix.py` (new): every Triton kernel of `--mode strix` against its stock counterpart (attention against
+  a dense masked softmax over packed rows of several requests, readout-only queries included; rotary bit-identical to
+  the Hugging Face rotary; projections for every row-count config and row chunk, with and without the residual; FFN
+  input and RMSNorm against the stock layer), the interval mask against the block mask it replaces, and the whole
+  backend on a tiny random Llama with biases against separate bf16 forwards of every prompt (1–8 questions over one
+  state, several requests in one sequence and the same request alone, several forwards per call with a request
+  bisected, determinism). The attention test caught rows of a later request turning into nan (a key block the row
+  cannot see before any it can).
+- Full suite on this machine: 109 passed, 3 skipped (MLX / Apple only).
 
 ## Results
 
 Generated by `report.py` from `results/` (raw answers and latencies of every run).
 
-- **POST is the fastest engine on 12 of the 20 request shapes.** The compiled graph mode (`--mode fast-strix`:
-  torch.compile plus HIP graphs, works on ROCm, 216 s start-up) is 1–14% ahead on 5 of them (M with 2–10 questions, L with 1 and 5).
-  `gguf` is level with POST on large requests (0.4–1.6% ahead on S-q20, L-q10 and L-q20), where the cached start
-  saves the same ~60 tokens out of thousands.
+- **`strix` is the fastest engine on all 20 request shapes**: 1.12–1.75× faster than `gguf`, 1.02–1.77× than
+  `gguf-strix` (POST), 1.27–2.71× than the compiled graph mode `fast-strix`. Without `strix`: POST is fastest on 12
+  shapes; `fast-strix` (torch.compile plus HIP graphs, works on ROCm, 216 s start-up) is 1–14% ahead on 5 of them
+  (M with 2–10 questions, L with 1 and 5); `gguf` is level with POST on large requests (0.4–1.6% ahead on S-q20,
+  L-q10 and L-q20), where the cached start saves the same ~60 tokens out of thousands.
 - **The cache pays off on small requests and under load**: one question over a short state 178 → 162 ms;
   7.7 → 10.0 decisions/s with 32 clients.
 - **Every decision that differs between engines is one of two near-ties**, in the fp32 reference as well:
@@ -149,7 +230,8 @@ Generated by `report.py` from `results/` (raw answers and latencies of every run
   steps (`BASAL_LENS`) would reduce the padding. `gguf` and `gguf-strix` have no shapes and compute exactly the packed tokens. With the upstream defaults
   rows over 3,072 tokens run eagerly with the math attention path (XL: 34–67 s per request).
 - **Throughput**: PRE stays at 3.8 decisions/s for any number of clients (one llama-server slot, one HTTP request per
-  prompt); POST batches concurrent requests into one `llama_decode` and reaches 10.0–10.1.
+  prompt); POST batches concurrent requests into one `llama_decode` and reaches 10.0–10.1; `strix` (all rows of a
+  batch in one sequence) 10.2–11.0 from 8 clients on, but 6.1 with one client (bf16 weights, 9 GB per forward).
 
 ### PRE → POST per request shape
 
@@ -187,6 +269,42 @@ PRE: llama-server (Vulkan, Mesa 25.3 container) + `basal-serve --mode llamacpp`,
 | 32 | 3.8/s · 8.39 s | **10.0/s** · 3.20 s | 2.64× |
 | 64 | 3.8/s · 16.69 s | **10.1/s** · 6.33 s | 2.64× |
 
+### gguf → strix per request shape
+
+`--mode gguf` (llama.cpp in process, Vulkan, Q8_0) against `--mode strix` (PyTorch + Triton kernels for gfx1151, bf16). p50 of 2 timed passes, unique states.
+
+| state | questions | prompt tokens | gguf | strix | speed-up |
+|---|---|---|---|---|---|
+| S | 1 | 480 | 178 ms | **159 ms** | 1.12× |
+| S | 2 | 928 | 242 ms | **194 ms** | 1.25× |
+| S | 5 | 3,640 | 573 ms | **348 ms** | 1.65× |
+| S | 10 | 6,496 | 1.13 s | **671 ms** | 1.68× |
+| S | 20 | 11,178 | 1.79 s | **1.08 s** | 1.66× |
+| M | 1 | 1,416 | 439 ms | **289 ms** | 1.52× |
+| M | 2 | 2,800 | 501 ms | **304 ms** | 1.65× |
+| M | 5 | 11,128 | 817 ms | **480 ms** | 1.70× |
+| M | 10 | 18,664 | 1.39 s | **797 ms** | 1.75× |
+| M | 20 | 32,706 | 2.12 s | **1.25 s** | 1.70× |
+| L | 1 | 4,296 | 1.28 s | **736 ms** | 1.74× |
+| L | 2 | 8,560 | 1.33 s | **766 ms** | 1.74× |
+| L | 5 | 34,168 | 1.73 s | **1.09 s** | 1.59× |
+| L | 10 | 56,104 | 2.38 s | **1.51 s** | 1.57× |
+| L | 20 | 98,946 | 3.22 s | **2.12 s** | 1.52× |
+| XL | 1 | 12,404 | 4.16 s | **2.73 s** | 1.52× |
+| XL | 2 | 24,776 | 4.25 s | **2.76 s** | 1.54× |
+| XL | 5 | 99,032 | 4.78 s | **3.28 s** | 1.46× |
+| XL | 10 | 161,508 | 5.65 s | **3.85 s** | 1.47× |
+| XL | 20 | 285,430 | 6.77 s | **4.57 s** | 1.48× |
+
+| clients (single questions) | gguf dec/s · p50 | strix dec/s · p50 | throughput |
+|---|---|---|---|
+| 1 | 6.9/s · 141 ms | **6.1/s** · 159 ms | 0.88× |
+| 4 | 7.4/s · 540 ms | **8.4/s** · 470 ms | 1.14× |
+| 8 | 7.6/s · 1.06 s | **10.2/s** · 787 ms | 1.35× |
+| 16 | 7.7/s · 2.07 s | **10.5/s** · 1.51 s | 1.37× |
+| 32 | 7.7/s · 4.12 s | **10.9/s** · 2.92 s | 1.42× |
+| 64 | 7.7/s · 8.33 s | **11.0/s** · 5.79 s | 1.44× |
+
 ### Start-up and memory
 
 | engine | start-up | GTT after start |
@@ -199,52 +317,53 @@ PRE: llama-server (Vulkan, Mesa 25.3 container) + `basal-serve --mode llamacpp`,
 | fast-strix | 216.2 s | 14.3 GiB |
 | gguf | 3.2 s | 5.8 GiB |
 | **POST** gguf-strix | 3.7 s | 5.8 GiB |
+| strix (Triton, bf16) | 6.1 s | 10.0 GiB |
 | eager fp32 (reference) | 5.6 s | 18.4 GiB |
 
 ### Latency per request, all engines (p50; bold: fastest)
 
-| state | q | branches | **PRE** llama-server Vulkan | llama-server ROCm | **PRE** fast-nocompile | fast-nocompile-strix, SOAM off | fast-nocompile-strix | fast-strix | gguf | **POST** gguf-strix |
-|---|---|---|---|---|---|---|---|---|---|---|
-| S | 1 | 1 | 342 ms | 208 ms | 309 ms | 227 ms | 224 ms | 202 ms | 178 ms | **162 ms** |
-| S | 2 | 2 | 488 ms | 330 ms | 362 ms | 336 ms | 281 ms | 248 ms | 242 ms | **221 ms** |
-| S | 5 | 8 | 1.52 s | 1.04 s | 1.30 s | 1.26 s | 749 ms | 679 ms | 573 ms | **530 ms** |
-| S | 10 | 13 | 2.96 s | 1.94 s | 3.08 s | 3.26 s | 1.30 s | 1.20 s | 1.13 s | **1.09 s** |
-| S | 20 | 23 | 5.25 s | 3.27 s | 5.28 s | 4.52 s | 2.20 s | 1.98 s | **1.79 s** | 1.80 s |
-| M | 1 | 1 | 729 ms | 496 ms | 786 ms | 489 ms | 491 ms | 416 ms | 439 ms | **408 ms** |
-| M | 2 | 2 | 882 ms | 622 ms | 792 ms | 921 ms | 488 ms | **417 ms** | 501 ms | 475 ms |
-| M | 5 | 8 | 1.93 s | 1.39 s | 1.66 s | 3.40 s | 866 ms | **797 ms** | 817 ms | 812 ms |
-| M | 10 | 13 | 3.44 s | 2.31 s | 3.62 s | 5.77 s | 1.49 s | **1.37 s** | 1.39 s | 1.39 s |
-| M | 20 | 23 | 5.68 s | 3.71 s | 7.33 s | 10.40 s | 3.01 s | 2.84 s | 2.12 s | **2.12 s** |
-| L | 1 | 1 | 1.87 s | 1.38 s | 3.09 s | 1.30 s | 1.30 s | **1.21 s** | 1.28 s | 1.30 s |
-| L | 2 | 2 | 2.03 s | 1.53 s | 3.68 s | 2.61 s | 1.47 s | 1.36 s | 1.33 s | **1.33 s** |
-| L | 5 | 8 | 3.18 s | 2.38 s | 4.96 s | 10.48 s | 1.86 s | **1.69 s** | 1.73 s | 1.74 s |
-| L | 10 | 13 | 4.79 s | 3.44 s | 19.44 s | 17.35 s | 3.04 s | 2.75 s | **2.38 s** | 2.40 s |
-| L | 20 | 23 | 7.22 s | 5.17 s | 24.44 s | 30.43 s | 4.76 s | 4.42 s | **3.22 s** | 3.27 s |
-| XL | 1 | 1 | 5.67 s | 4.90 s | 34.02 s | 6.76 s | 6.70 s | 6.62 s | 4.16 s | **4.15 s** |
-| XL | 2 | 2 | 5.85 s | 4.99 s | 67.15 s | 13.51 s | 6.73 s | 6.37 s | 4.25 s | **4.24 s** |
-| XL | 5 | 8 | 7.26 s | 6.19 s | – | 54.05 s | 6.75 s | 6.17 s | 4.78 s | **4.75 s** |
-| XL | 10 | 13 | 9.08 s | 7.66 s | – | 87.71 s | 6.78 s | 6.20 s | 5.65 s | **5.61 s** |
-| XL | 20 | 23 | 11.92 s | 9.81 s | – | 155.72 s | 13.57 s | 12.36 s | 6.77 s | **6.73 s** |
+| state | q | branches | **PRE** llama-server Vulkan | llama-server ROCm | **PRE** fast-nocompile | fast-nocompile-strix, SOAM off | fast-nocompile-strix | fast-strix | gguf | **POST** gguf-strix | strix (Triton, bf16) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| S | 1 | 1 | 342 ms | 208 ms | 309 ms | 227 ms | 224 ms | 202 ms | 178 ms | 162 ms | **159 ms** |
+| S | 2 | 2 | 488 ms | 330 ms | 362 ms | 336 ms | 281 ms | 248 ms | 242 ms | 221 ms | **194 ms** |
+| S | 5 | 8 | 1.52 s | 1.04 s | 1.30 s | 1.26 s | 749 ms | 679 ms | 573 ms | 530 ms | **348 ms** |
+| S | 10 | 13 | 2.96 s | 1.94 s | 3.08 s | 3.26 s | 1.30 s | 1.20 s | 1.13 s | 1.09 s | **671 ms** |
+| S | 20 | 23 | 5.25 s | 3.27 s | 5.28 s | 4.52 s | 2.20 s | 1.98 s | 1.79 s | 1.80 s | **1.08 s** |
+| M | 1 | 1 | 729 ms | 496 ms | 786 ms | 489 ms | 491 ms | 416 ms | 439 ms | 408 ms | **289 ms** |
+| M | 2 | 2 | 882 ms | 622 ms | 792 ms | 921 ms | 488 ms | 417 ms | 501 ms | 475 ms | **304 ms** |
+| M | 5 | 8 | 1.93 s | 1.39 s | 1.66 s | 3.40 s | 866 ms | 797 ms | 817 ms | 812 ms | **480 ms** |
+| M | 10 | 13 | 3.44 s | 2.31 s | 3.62 s | 5.77 s | 1.49 s | 1.37 s | 1.39 s | 1.39 s | **797 ms** |
+| M | 20 | 23 | 5.68 s | 3.71 s | 7.33 s | 10.40 s | 3.01 s | 2.84 s | 2.12 s | 2.12 s | **1.25 s** |
+| L | 1 | 1 | 1.87 s | 1.38 s | 3.09 s | 1.30 s | 1.30 s | 1.21 s | 1.28 s | 1.30 s | **736 ms** |
+| L | 2 | 2 | 2.03 s | 1.53 s | 3.68 s | 2.61 s | 1.47 s | 1.36 s | 1.33 s | 1.33 s | **766 ms** |
+| L | 5 | 8 | 3.18 s | 2.38 s | 4.96 s | 10.48 s | 1.86 s | 1.69 s | 1.73 s | 1.74 s | **1.09 s** |
+| L | 10 | 13 | 4.79 s | 3.44 s | 19.44 s | 17.35 s | 3.04 s | 2.75 s | 2.38 s | 2.40 s | **1.51 s** |
+| L | 20 | 23 | 7.22 s | 5.17 s | 24.44 s | 30.43 s | 4.76 s | 4.42 s | 3.22 s | 3.27 s | **2.12 s** |
+| XL | 1 | 1 | 5.67 s | 4.90 s | 34.02 s | 6.76 s | 6.70 s | 6.62 s | 4.16 s | 4.15 s | **2.73 s** |
+| XL | 2 | 2 | 5.85 s | 4.99 s | 67.15 s | 13.51 s | 6.73 s | 6.37 s | 4.25 s | 4.24 s | **2.76 s** |
+| XL | 5 | 8 | 7.26 s | 6.19 s | – | 54.05 s | 6.75 s | 6.17 s | 4.78 s | 4.75 s | **3.28 s** |
+| XL | 10 | 13 | 9.08 s | 7.66 s | – | 87.71 s | 6.78 s | 6.20 s | 5.65 s | 5.61 s | **3.85 s** |
+| XL | 20 | 23 | 11.92 s | 9.81 s | – | 155.72 s | 13.57 s | 12.36 s | 6.77 s | 6.73 s | **4.57 s** |
 
 ### Cost of one more question (1 → 20 questions, per added question)
 
-| state | **PRE** llama-server Vulkan | llama-server ROCm | **PRE** fast-nocompile | fast-nocompile-strix, SOAM off | fast-nocompile-strix | fast-strix | gguf | **POST** gguf-strix |
-|---|---|---|---|---|---|---|---|---|
-| S | 258 ms | 161 ms | 262 ms | 226 ms | 104 ms | 94 ms | 85 ms | 86 ms |
-| M | 261 ms | 169 ms | 344 ms | 522 ms | 133 ms | 128 ms | 88 ms | 90 ms |
-| L | 282 ms | 199 ms | 1.12 s | 1.53 s | 182 ms | 169 ms | 102 ms | 103 ms |
-| XL | 329 ms | 258 ms | – | 7.84 s | 362 ms | 302 ms | 137 ms | 136 ms |
+| state | **PRE** llama-server Vulkan | llama-server ROCm | **PRE** fast-nocompile | fast-nocompile-strix, SOAM off | fast-nocompile-strix | fast-strix | gguf | **POST** gguf-strix | strix (Triton, bf16) |
+|---|---|---|---|---|---|---|---|---|---|
+| S | 258 ms | 161 ms | 262 ms | 226 ms | 104 ms | 94 ms | 85 ms | 86 ms | 48 ms |
+| M | 261 ms | 169 ms | 344 ms | 522 ms | 133 ms | 128 ms | 88 ms | 90 ms | 50 ms |
+| L | 282 ms | 199 ms | 1.12 s | 1.53 s | 182 ms | 169 ms | 102 ms | 103 ms | 73 ms |
+| XL | 329 ms | 258 ms | – | 7.84 s | 362 ms | 302 ms | 137 ms | 136 ms | 97 ms |
 
 ### Concurrency (single questions over short states, unique per request)
 
-| clients | **PRE** llama-server Vulkan | llama-server ROCm | **PRE** fast-nocompile | fast-nocompile-strix, SOAM off | fast-nocompile-strix | fast-strix | gguf | **POST** gguf-strix |
-|---|---|---|---|---|---|---|---|---|
-| 1 | 3.8/s · 257 ms | 5.7/s · 175 ms | 3.8/s · 246 ms | 5.7/s · 153 ms | 5.7/s · 155 ms | 6.4/s · 139 ms | 6.9/s · 141 ms | 8.2/s · 119 ms |
-| 4 | 3.8/s · 1.01 s | 5.8/s · 697 ms | 3.8/s · 1.10 s | – | 4.8/s · 858 ms | 5.5/s · 759 ms | 7.4/s · 540 ms | 9.1/s · 442 ms |
-| 8 | 3.8/s · 2.08 s | 5.8/s · 1.39 s | 4.1/s · 1.95 s | 5.5/s · 1.46 s | 5.5/s · 1.45 s | 6.2/s · 1.29 s | 7.6/s · 1.06 s | 9.8/s · 821 ms |
-| 16 | 3.8/s · 4.16 s | 5.8/s · 2.75 s | 4.3/s · 3.70 s | – | 5.3/s · 2.89 s | 6.0/s · 2.53 s | 7.7/s · 2.07 s | 10.0/s · 1.59 s |
-| 32 | 3.8/s · 8.39 s | 5.7/s · 5.57 s | 4.6/s · 6.93 s | 6.8/s · 4.70 s | 6.8/s · 4.67 s | 7.7/s · 4.15 s | 7.7/s · 4.12 s | 10.0/s · 3.20 s |
-| 64 | 3.8/s · 16.69 s | 5.7/s · 11.28 s | 5.3/s · 12.06 s | – | 6.9/s · 8.99 s | 7.8/s · 7.96 s | 7.7/s · 8.33 s | 10.1/s · 6.33 s |
+| clients | **PRE** llama-server Vulkan | llama-server ROCm | **PRE** fast-nocompile | fast-nocompile-strix, SOAM off | fast-nocompile-strix | fast-strix | gguf | **POST** gguf-strix | strix (Triton, bf16) |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 3.8/s · 257 ms | 5.7/s · 175 ms | 3.8/s · 246 ms | 5.7/s · 153 ms | 5.7/s · 155 ms | 6.4/s · 139 ms | 6.9/s · 141 ms | 8.2/s · 119 ms | 6.1/s · 159 ms |
+| 4 | 3.8/s · 1.01 s | 5.8/s · 697 ms | 3.8/s · 1.10 s | – | 4.8/s · 858 ms | 5.5/s · 759 ms | 7.4/s · 540 ms | 9.1/s · 442 ms | 8.4/s · 470 ms |
+| 8 | 3.8/s · 2.08 s | 5.8/s · 1.39 s | 4.1/s · 1.95 s | 5.5/s · 1.46 s | 5.5/s · 1.45 s | 6.2/s · 1.29 s | 7.6/s · 1.06 s | 9.8/s · 821 ms | 10.2/s · 787 ms |
+| 16 | 3.8/s · 4.16 s | 5.8/s · 2.75 s | 4.3/s · 3.70 s | – | 5.3/s · 2.89 s | 6.0/s · 2.53 s | 7.7/s · 2.07 s | 10.0/s · 1.59 s | 10.5/s · 1.51 s |
+| 32 | 3.8/s · 8.39 s | 5.7/s · 5.57 s | 4.6/s · 6.93 s | 6.8/s · 4.70 s | 6.8/s · 4.67 s | 7.7/s · 4.15 s | 7.7/s · 4.12 s | 10.0/s · 3.20 s | 10.9/s · 2.92 s |
+| 64 | 3.8/s · 16.69 s | 5.7/s · 11.28 s | 5.3/s · 12.06 s | – | 6.9/s · 8.99 s | 7.8/s · 7.96 s | 7.7/s · 8.33 s | 10.1/s · 6.33 s | 11.0/s · 5.79 s |
 
 ### Agreement with the fp32 reference
 
@@ -260,6 +379,7 @@ Reference: `--mode eager --dtype float32 --soam off --max-batch 1` (every prompt
 | fast-strix | 143/144 | 0.0037 | 0.024 |
 | gguf | 143/144 | 0.0067 | 0.078 |
 | **POST** gguf-strix | 143/144 | 0.0066 | 0.066 |
+| strix (Triton, bf16) | 144/144 | 0.0042 | 0.028 |
 
 ### Engine against engine (whole matrix)
 
@@ -271,6 +391,8 @@ Reference: `--mode eager --dtype float32 --soam off --max-batch 1` (every prompt
 | fast-nocompile vs fast-nocompile-strix | 142/144 | 0.0044 | 0.035 |
 | PRE vs POST | 187/188 | 0.0061 | 0.067 |
 | fast-nocompile-strix (bf16) vs gguf-strix (Q8_0) | 186/188 | 0.0082 | 0.064 |
+| gguf (Q8_0) vs strix (bf16) | 187/188 | 0.0080 | 0.100 |
+| fast-nocompile-strix vs strix (both bf16) | 187/188 | 0.0045 | 0.034 |
 
 ### Edge cases
 
@@ -282,4 +404,5 @@ Reference: `--mode eager --dtype float32 --soam off --max-batch 1` (every prompt
 | fast-nocompile-strix | none | 26/26 | 0.0146 | 0.0e+00 | True | human | 26/26 | 0.014 |
 | gguf | none | 26/26 | 0.0183 | 0.0e+00 | True | human | 26/26 | 0.016 |
 | **POST** gguf-strix | none | 26/26 | 0.0158 | 0.0e+00 | True | human | 26/26 | 0.018 |
+| strix (Triton, bf16) | none | 26/26 | 0.0112 | 0.0e+00 | True | human | 26/26 | 0.009 |
 | eager fp32 (reference) | none | 26/26 | 0.0000 | 0.0e+00 | True | human | – | – |

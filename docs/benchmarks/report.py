@@ -12,11 +12,11 @@ from pathlib import Path
 
 D, E = Path(sys.argv[1]), Path(sys.argv[2]) if len(sys.argv) > 2 else None
 ORDER = ["pre-llamacpp-vulkan", "llamacpp-rocm", "pre-graph-default", "graph-nosoam", "graph-soam", "graph-compile",
-         "gguf", "gguf-strix", "ref-fp32"]
+         "gguf", "gguf-strix", "strix", "ref-fp32"]
 NAMES = {"pre-llamacpp-vulkan": "**PRE** llama-server Vulkan", "llamacpp-rocm": "llama-server ROCm",
          "pre-graph-default": "**PRE** fast-nocompile", "graph-nosoam": "fast-nocompile-strix, SOAM off",
          "graph-soam": "fast-nocompile-strix", "graph-compile": "fast-strix", "gguf": "gguf",
-         "gguf-strix": "**POST** gguf-strix", "ref-fp32": "eager fp32 (reference)"}
+         "gguf-strix": "**POST** gguf-strix", "strix": "strix (Triton, bf16)", "ref-fp32": "eager fp32 (reference)"}
 PRE, POST = "pre-llamacpp-vulkan", "gguf-strix"
 
 
@@ -95,6 +95,23 @@ if PRE in R and POST in R:
             print(f"| {c} | {a['dec_s']:.1f}/s · {ms(a['p50_ms'])} | **{b['dec_s']:.1f}/s** · {ms(b['p50_ms'])} | "
                   f"{b['dec_s'] / a['dec_s']:.2f}× |")
 
+if "gguf" in R and "strix" in R:
+    print("\n## gguf → strix per request shape\n")
+    print("`--mode gguf` (llama.cpp in process, Vulkan, Q8_0) against `--mode strix` (PyTorch + Triton kernels for "
+          "gfx1151, bf16). p50 of 2 timed passes, unique states.\n")
+    print("| state | questions | prompt tokens | gguf | strix | speed-up |\n|---|---|---|---|---|---|")
+    for c in cases:
+        st, q = c.split("-q")
+        a, b = lat("gguf", c), lat("strix", c)
+        if a and b:
+            print(f"| {st} | {q} | {R['strix']['cases'][c]['input_tokens']:,} | {ms(a)} | **{ms(b)}** | {a / b:.2f}× |")
+    print("\n| clients (single questions) | gguf dec/s · p50 | strix dec/s · p50 | throughput |\n|---|---|---|---|")
+    for c in sorted({int(k) for k in R["strix"]["conc"]}):
+        a, b = R["gguf"]["conc"].get(str(c)), R["strix"]["conc"].get(str(c))
+        if a and b:
+            print(f"| {c} | {a['dec_s']:.1f}/s · {ms(a['p50_ms'])} | **{b['dec_s']:.1f}/s** · {ms(b['p50_ms'])} | "
+                  f"{b['dec_s'] / a['dec_s']:.2f}× |")
+
 print("\n## Start-up and memory\n")
 print("| engine | start-up | GTT after start |\n|---|---|---|")
 for e in eng:
@@ -150,7 +167,9 @@ for a, b, what in (("graph-nosoam", "graph-soam", "fast-nocompile-strix: SOAM on
                    ("graph-soam", "graph-compile", "fast-nocompile-strix vs fast-strix"),
                    ("pre-graph-default", "graph-soam", "fast-nocompile vs fast-nocompile-strix"),
                    ("pre-llamacpp-vulkan", "gguf-strix", "PRE vs POST"),
-                   ("graph-soam", "gguf-strix", "fast-nocompile-strix (bf16) vs gguf-strix (Q8_0)")):
+                   ("graph-soam", "gguf-strix", "fast-nocompile-strix (bf16) vs gguf-strix (Q8_0)"),
+                   ("gguf", "strix", "gguf (Q8_0) vs strix (bf16)"),
+                   ("graph-soam", "strix", "fast-nocompile-strix vs strix (both bf16)")):
     if a in R and b in R:
         s, n, m, x = agree(case_pairs(R[a], R[b]))
         print(f"| {what} | {s}/{n} | {m:.4f} | {x:.3f} |")
