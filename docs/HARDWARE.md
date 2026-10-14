@@ -341,6 +341,29 @@ cool-down; *TV*: mean / max total-variation distance to fp32, *changed*: decisio
 Figures: `python docs/figures/make_figures.py` (matplotlib) from the measurements in `docs/figures/apple_engines.json`.
 
 
+## AMD Strix Halo
+
+One Ryzen AI Max+ PRO 395 (Radeon 8060S, gfx1151, 128 GB unified memory; Fedora 44, PyTorch 2.12 + ROCm 7.2),
+basal-1.5 (4.5B). On this iGPU a decision is compute-bound prefill (~9.2 GFLOP per token), and the stock kernels reach
+only about half of what the GPU sustains. `--mode strix` is a forward written for it (Triton kernels: flash attention
+over the packed prefix trie, gate / up + SwiGLU fused, matmuls with the bias and the residual add in the epilogue).
+Request matrix over HTTP, p50 (details, profile and method: [benchmarks/STRIX_HALO.md](benchmarks/STRIX_HALO.md)):
+
+| request | `gguf` (Q8_0, llama.cpp Vulkan) | **`strix`** (bf16) | `fast-nocompile` as shipped |
+|---|---|---|---|
+| ≈100-token state, 1 question | 178 ms | **159 ms** | 309 ms |
+| ≈100-token state, 20 questions | 1.79 s | **1.08 s** | 5.28 s |
+| ≈2,000-token state, 1 question | 1.28 s | **736 ms** | 3.09 s |
+| ≈6,000-token state, 1 question | 4.16 s | **2.73 s** | 34.0 s |
+| single questions, 32 clients | 7.7/s | **10.9/s** | 4.6/s |
+| start-up / GPU memory | 3 s / 5.8 GiB | 6 s / 10.0 GiB | 888 s / 32 GiB |
+
+- `strix` agrees with the fp32 reference on 144 of 144 decisions (`gguf` 143). One short question at a time is faster
+  with `gguf` (141 vs 159 ms): the bf16 weights are 9 GB per forward, the Q8_0 file 5 GB.
+- Long states gain less (1.5× at 6,000 tokens): the matmuls hit the ~35–40 TFLOPS this GPU sustains, and the package
+  runs at its power limit (~160 W, then ~140 W) with the GPU at 2.15–2.33 GHz.
+- For `gguf` here, build llama-cpp-python with Vulkan (`CMAKE_ARGS="-DGGML_VULKAN=on"`); the host's Mesa matters.
+
 ## Notes per platform
 
 - **DGX Spark (GB10, aarch64, CUDA 13).** In the README install steps use the CUDA 13 build of PyTorch
