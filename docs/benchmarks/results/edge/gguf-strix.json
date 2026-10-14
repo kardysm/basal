@@ -30,7 +30,7 @@
     "output_tokens": 0,
     "questions": 2,
     "branches": 2,
-    "latency_ms": 193.57
+    "latency_ms": 198.13
    }
   },
   "ten-options": {
@@ -59,7 +59,7 @@
     "output_tokens": 0,
     "questions": 1,
     "branches": 1,
-    "latency_ms": 182.95
+    "latency_ms": 189.01
    }
   },
   "duplicates": {
@@ -101,7 +101,7 @@
     "output_tokens": 0,
     "questions": 3,
     "branches": 3,
-    "latency_ms": 124.02
+    "latency_ms": 131.65
    }
   },
   "json-state": {
@@ -131,7 +131,7 @@
     "output_tokens": 0,
     "questions": 2,
     "branches": 2,
-    "latency_ms": 144.83
+    "latency_ms": 149.83
    }
   },
   "facts-auto": {
@@ -153,7 +153,7 @@
     "output_tokens": 0,
     "questions": 1,
     "branches": 1,
-    "latency_ms": 199.33
+    "latency_ms": 206.73
    }
   },
   "long-options": {
@@ -176,7 +176,7 @@
     "output_tokens": 0,
     "questions": 1,
     "branches": 1,
-    "latency_ms": 198.42
+    "latency_ms": 202.03
    }
   },
   "score-5": {
@@ -207,7 +207,7 @@
     "output_tokens": 0,
     "questions": 1,
     "branches": 1,
-    "latency_ms": 124.07
+    "latency_ms": 129.4
    }
   },
   "multi-8": {
@@ -238,7 +238,7 @@
     "output_tokens": 0,
     "questions": 1,
     "branches": 8,
-    "latency_ms": 479.28
+    "latency_ms": 489.47
    }
   },
   "act-matrix": {
@@ -266,7 +266,7 @@
     "output_tokens": 0,
     "questions": 1,
     "branches": 1,
-    "latency_ms": 118.34
+    "latency_ms": 127.28
    }
   },
   "en-only": {
@@ -311,7 +311,7 @@
     "output_tokens": 0,
     "questions": 3,
     "branches": 3,
-    "latency_ms": 233.03
+    "latency_ms": 253.35
    }
   },
   "tiny-state": {
@@ -332,7 +332,7 @@
     "output_tokens": 0,
     "questions": 1,
     "branches": 1,
-    "latency_ms": 88.82
+    "latency_ms": 88.77
    }
   },
   "keys-show-hide": {
@@ -364,7 +364,7 @@
     "output_tokens": 0,
     "questions": 2,
     "branches": 2,
-    "latency_ms": 183.12
+    "latency_ms": 204.67
    }
   }
  },
@@ -398,7 +398,7 @@
     "output_tokens": 0,
     "questions": 2,
     "branches": 2,
-    "latency_ms": 194.11
+    "latency_ms": 214.65
    }
   },
   "ten-options": {
@@ -427,7 +427,7 @@
     "output_tokens": 0,
     "questions": 1,
     "branches": 1,
-    "latency_ms": 2076.14
+    "latency_ms": 2123.78
    }
   },
   "duplicates": {
@@ -469,7 +469,7 @@
     "output_tokens": 0,
     "questions": 3,
     "branches": 3,
-    "latency_ms": 2076.21
+    "latency_ms": 2123.51
    }
   },
   "json-state": {
@@ -499,7 +499,7 @@
     "output_tokens": 0,
     "questions": 2,
     "branches": 2,
-    "latency_ms": 2075.9
+    "latency_ms": 2122.65
    }
   },
   "facts-auto": {
@@ -521,7 +521,7 @@
     "output_tokens": 0,
     "questions": 1,
     "branches": 1,
-    "latency_ms": 2075.67
+    "latency_ms": 2122.18
    }
   },
   "long-options": {
@@ -544,7 +544,7 @@
     "output_tokens": 0,
     "questions": 1,
     "branches": 1,
-    "latency_ms": 2075.11
+    "latency_ms": 2121.46
    }
   },
   "score-5": {
@@ -575,7 +575,7 @@
     "output_tokens": 0,
     "questions": 1,
     "branches": 1,
-    "latency_ms": 2074.86
+    "latency_ms": 2121.09
    }
   },
   "multi-8": {
@@ -606,7 +606,7 @@
     "output_tokens": 0,
     "questions": 1,
     "branches": 8,
-    "latency_ms": 2074.77
+    "latency_ms": 2119.96
    }
   },
   "act-matrix": {
@@ -634,7 +634,7 @@
     "output_tokens": 0,
     "questions": 1,
     "branches": 1,
-    "latency_ms": 2073.95
+    "latency_ms": 2119.11
    }
   },
   "en-only": {
@@ -679,7 +679,7 @@
     "output_tokens": 0,
     "questions": 3,
     "branches": 3,
-    "latency_ms": 2073.81
+    "latency_ms": 2118.91
    }
   },
   "tiny-state": {
@@ -700,7 +700,7 @@
     "output_tokens": 0,
     "questions": 1,
     "branches": 1,
-    "latency_ms": 2073.52
+    "latency_ms": 2118.46
    }
   },
   "keys-show-hide": {
@@ -732,7 +732,7 @@
     "output_tokens": 0,
     "questions": 2,
     "branches": 2,
-    "latency_ms": 2073.38
+    "latency_ms": 2118.18
    }
   }
  },
