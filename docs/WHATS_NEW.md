@@ -1,3 +1,24 @@
+# What is new in basal 2.1
+
+**Engine v2.1.0: task types (experimental)**
+- Four task types on the same API, for the basal models you already serve (no new model): **`classify`** (labels with
+  a rubric each), **`verify`** (is each statement supported, contradicted or not stated by the state), **`compress`**
+  (the sentences, lines or paragraphs needed for a question, as shorter text for another model) and **`extract`** (a
+  JSON schema filled with values taken exactly from the document, with character offsets).
+- Each task is expanded into the decision types over the shared state, so it costs about as much as the decisions it
+  asks: no text is generated, and `extract` values are always exact text of the document.
+- Measured on public sets the models were not trained on, with basal-omni-1.0-max: see
+  [TASKS.md](TASKS.md#results). Experimental: the API may change, and the `automated` flag of a task answer needs
+  thresholds fitted for that task.
+- Every other request takes the same code path as in v2.0.0 (on basal-omni-1.0-max, 23,276 of 23,278 served-check
+  answers were the same; the two others were near-ties).
+
+**New models (Hugging Face, Sat 17 Oct, 09:00 CEST)**
+- **basal-omni-1.0-ultra** (31B, Gemma 4 31B; text and images): Werdykt 0.879, the highest of the basal models; and
+  **basal-omni-1.0-ultra-FP8** for `--mode vllm` (text only).
+- **basal-omni-1.1-max** (*experimental*): basal-omni-1.0-max with extra training on the task formats, better on the
+  tasks and slightly behind 1.0-max on general decisions; 1.0-max stays the default ([TASKS.md](TASKS.md#results)).
+
 # What is new in basal-2.0
 
 

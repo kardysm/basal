@@ -126,6 +126,10 @@ answer, with character offsets and a probability. It needs a model that ships `e
 basal-2.0 models do not ship one, and the server refuses evidence requests for them. See
 [FEATURES.md](FEATURES.md#evidence-spans).
 
+**Task types** (*experimental*, 2.1): `classify`, `verify`, `compress` and `extract` (a JSON schema) are accepted as
+question types next to the others in the same request. They are expanded into `choice` / `noul` / `multi` decisions over
+the shared state and answered in the shapes described in [TASKS.md](TASKS.md).
+
 **Facts**: `"facts": "auto"` appends a block of computed facts to a Polish state: the weekday of every date and
 whether it is a Saturday or a statutory day off, gaps between dates, date + stated durations, net/gross amounts for
 a stated VAT rate, euro × a stated exchange rate, budget remainders, quantity × price and list totals, and

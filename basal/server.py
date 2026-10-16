@@ -4,7 +4,8 @@
                         "instructions": "...", "criteria": {...} | [...], "option_keys": "show"|"hide" (optional),
                         "evidence": true (optional; models with evidence_head.pt: supporting spans of the state)}},
                         "early_exit": "off"|"0.99"|... (optional), "facts": "off"|"auto" (optional)}
-  POST /v1/basal       same as /v1/systemone
+  POST /v1/basal       same as /v1/systemone; also the experimental task types classify, verify, compress, extract
+                       (basal/tasks.py)
   GET  /v1/models
   GET  /health
 
@@ -42,6 +43,7 @@ from .engine import (ATTN, EagerBackend, ExitGraphBackend, GGUFBackend, GraphBac
                      MPSBackend, OllamaBackend, SGLangBackend, VLLMBackend, resolve, set_fp8_fast_accum)
 from .evidence import Evidence
 from .facts import inject as inject_facts
+from . import tasks
 from .prompt import FORMATS, MAX_OPTIONS, lang_of, letter_ids, max_options, media_messages, model_format, render
 from .sets import label_set_id
 from .sets import select as select_set
@@ -52,7 +54,7 @@ from .tools import answer as tool_answer
 from .tools import parse as parse_tools
 from .tools import set_answer as tool_set_answer
 
-RELEASE_DATE = "2026-10-14"  # the engine's release date (GET /v1/models), not the served model's
+RELEASE_DATE = "2026-10-17"  # the engine's release date (GET /v1/models), not the served model's
 
 MODES = {
     # mode: (backend, quantisation, compile)
@@ -976,6 +978,9 @@ class Server:
 
     async def decide(self, body):
         t0 = time.perf_counter()
+        orig, plans = body, None
+        if any(tasks.is_task(q) for q in body["questions"].values()):  # classify / verify / compress / extract
+            body, plans = tasks.expand(body, self.max_options)
         pol = body.get("early_exit")
         if pol is not None:
             pol = str(pol)
@@ -1020,7 +1025,17 @@ class Server:
                     o2 = await self.ask(second, pol, cut, lane)
                 for j, b2, o in zip(redo, second, o2):
                     branches[j][2].extend(b2[2]); outs[j] = outs[j] + o
-        return await self.assemble(body, qs, branches, outs, m, n_tok, n_media, longest, second, truncation, lane, t0)
+        out = await self.assemble(body, qs, branches, outs, m, n_tok, n_media, longest, second, truncation, lane, t0)
+        if plans:  # the task answers from their decision answers; extract's spans need a second round of decisions
+            r2, a2 = tasks.second_round(out, orig, plans, self.max_options), None
+            if r2 is not None:
+                out2 = await self.decide(r2)
+                a2 = out2["answers"]
+                for k in ("input_tokens", "branches"):
+                    out["usage"][k] = out["usage"].get(k, 0) + out2["usage"].get(k, 0)
+            out = tasks.finish(out, orig, plans, self.cal, a2)
+            out["usage"]["latency_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+        return out
 
     def media_of(self, body, pol):
         """The request's media decoded (basal/media.py), or None without media."""

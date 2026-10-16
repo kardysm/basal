@@ -1,4 +1,4 @@
-# basal 2.0
+# basal 2.1
 
 [![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-basal--2.0%20models-yellow)](https://huggingface.co/collections/Remek/basal-20-6acd1712a8e443c86cd576fc)
 [![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-basal--omni--1.0%20models-yellow)](https://huggingface.co/collections/Remek/basal-omni-10-6acea28e8b5baed2db475c1f)
@@ -24,12 +24,29 @@ answers, and triage with a confidence threshold that sends uncertain cases to a 
 
 ## Contents
 
-- [What is new in basal-2.0](#what-is-new-in-basal-20)
+- [What is new in basal 2.1](#what-is-new-in-basal-21) · [What is new in basal-2.0](#what-is-new-in-basal-20)
 - [Models](#models) · [Results](#results)
 - [Quick start](#quick-start) · [API](#api)
 - [Images and audio: basal-omni](#images-and-audio-basal-omni-experimental) · [MCP for agents](#mcp-basal-as-a-tool-for-agents)
 - [Documentation](#documentation): install paths, serving, API reference, results, formats, hardware
 - [Limitations](#limitations) · [Previous releases](#previous-releases) · [Citation](#citation) · [License](#license)
+
+## What is new in basal 2.1
+
+- **Task types** (*experimental*), on the same API and the models you already serve: **`classify`** (labels with a
+  rubric each), **`verify`** (is each statement supported, contradicted or not stated), **`compress`** (the parts of a
+  document a question needs, as shorter text for another model) and **`extract`** (a JSON schema filled with values
+  copied exactly from the document, with character offsets). No text is generated: each task is expanded into
+  decisions with calibrated probabilities. [docs/TASKS.md](docs/TASKS.md); every question type on one page:
+  [docs/QUESTION_TYPES.md](docs/QUESTION_TYPES.md).
+- Every other request takes the same code path as in v2.0.0: on basal-omni-1.0-max, 23,276 of 23,278 served-check
+  answers were the same (the two others were near-ties).
+- **New models on Sat 17 Oct, 09:00 CEST** (the links work from then): **basal-omni-1.0-ultra** (31B, Werdykt 0.879)
+  with an FP8 port, and **basal-omni-1.1-max**, an experimental task model (basal-omni-1.0-max with extra training on
+  the task formats; 1.0-max stays the default). See [Models](#models).
+
+Full list: [docs/WHATS_NEW.md](docs/WHATS_NEW.md) and the
+[release notes](https://github.com/rkinas/basal/releases/tag/v2.1.0).
 
 ## What is new in basal-2.0
 
@@ -61,14 +78,17 @@ Full list: [docs/WHATS_NEW.md](docs/WHATS_NEW.md) and the [release notes](https:
   port is checked against its bf16 model; its card has the numbers. Files in detail:
   [docs/INSTALL.md](docs/INSTALL.md#what-the-model-repositories-contain).
 
-**basal-omni-1.0** (experimental; text, images and audio; built on Google Gemma 4):
+**basal-omni** (experimental; text, images and audio; built on Google Gemma 4):
 
 | model | params | use | Hugging Face |
 |---|---|---|---|
 | **basal-omni-1.0-mini** | 4B (Gemma 4 E4B) | decisions about text, images and audio; about 16 GB of GPU memory | [`Remek/basal-omni-1.0-mini`](https://huggingface.co/Remek/basal-omni-1.0-mini) |
-| **basal-omni-1.0-max** | 12B | highest Werdykt score of the basal models; text, images and audio; about 24 GB of GPU memory | [`Remek/basal-omni-1.0-max`](https://huggingface.co/Remek/basal-omni-1.0-max) |
+| **basal-omni-1.0-max** | 12B | the default 12B model (Werdykt 0.823); text, images and audio; about 24 GB of GPU memory | [`Remek/basal-omni-1.0-max`](https://huggingface.co/Remek/basal-omni-1.0-max) |
+| **basal-omni-1.1-max** | 12B | *experimental task model*: better on `classify`, `verify`, `compress` and `extract`, slightly behind 1.0-max on general decisions (Werdykt 0.821) | [`Remek/basal-omni-1.1-max`](https://huggingface.co/Remek/basal-omni-1.1-max) (from Sat 17 Oct, 09:00 CEST) |
+| **basal-omni-1.0-ultra** | 31B (Gemma 4 31B) | highest Werdykt score of the basal models (0.879); text and images (no audio); 59 GB of bf16 weights | [`Remek/basal-omni-1.0-ultra`](https://huggingface.co/Remek/basal-omni-1.0-ultra) · [`-FP8`](https://huggingface.co/Remek/basal-omni-1.0-ultra-FP8) (from Sat 17 Oct, 09:00 CEST) |
 
 - bf16 weights, served by `basal-serve --mode eager` on an NVIDIA GPU (`--media on` for images and audio).
+  `basal-omni-1.0-ultra-FP8` (33 GB) is served by `--mode vllm`, text only.
 - All models are fine-tuned from Apache-2.0 base models (Bielik v3 for basal-2.0, Gemma 4 for basal-omni; see
   [NOTICE](NOTICE)) and released under Apache-2.0.
 
@@ -101,7 +121,7 @@ NVIDIA GPU, with [uv](https://docs.astral.sh/uv/) in a fresh environment:
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-env && source ~/basal-env/bin/activate
 uv pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
-uv pip install "basal[fp8] @ https://github.com/rkinas/basal/archive/refs/tags/v2.0.0.tar.gz"
+uv pip install "basal[fp8] @ https://github.com/rkinas/basal/archive/refs/tags/v2.1.0.tar.gz"
 basal-serve --model Remek/basal-2.0-4.5B --mode fast --template-prefix off --port 8000
 ```
 
@@ -114,7 +134,7 @@ Apple Silicon:
 
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-mlx && source ~/basal-mlx/bin/activate
-uv pip install "basal[mlx] @ https://github.com/rkinas/basal/archive/refs/tags/v2.0.0.tar.gz"
+uv pip install "basal[mlx] @ https://github.com/rkinas/basal/archive/refs/tags/v2.1.0.tar.gz"
 basal-serve --model Remek/basal-2.0-4.5B-MLX-8bit --mode mlx --port 8000
 ```
 
@@ -180,7 +200,7 @@ The basal-omni models answer the same questions, and with `--media on` a request
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-env && source ~/basal-env/bin/activate
 uv pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
-uv pip install "basal[media] @ https://github.com/rkinas/basal/archive/refs/tags/v2.0.0.tar.gz"
+uv pip install "basal[media] @ https://github.com/rkinas/basal/archive/refs/tags/v2.1.0.tar.gz"
 basal-serve --model Remek/basal-omni-1.0-mini --mode eager --media on --port 8000   # or Remek/basal-omni-1.0-max
 ```
 
@@ -196,7 +216,7 @@ calibration, so validate them on your own media. Request format and limits:
 `decide_many`; `basal-mcp` is a stdio bridge for hosts that start local processes.
 
 ```bash
-uv pip install "basal[fp8,mcp] @ https://github.com/rkinas/basal/archive/refs/tags/v2.0.0.tar.gz"
+uv pip install "basal[fp8,mcp] @ https://github.com/rkinas/basal/archive/refs/tags/v2.1.0.tar.gz"
 basal-serve --model Remek/basal-2.0-4.5B --mode fast --template-prefix off --host 127.0.0.1 --port 8000 --mcp on
 claude mcp add --transport http basal http://127.0.0.1:8000/mcp     # Claude Code; other hosts take the same URL
 ```
@@ -214,6 +234,8 @@ No authentication, like the HTTP API: bind `--host 127.0.0.1` or put a gateway i
 | [RESULTS](docs/RESULTS.md) | results against basal-1.5: Werdykt, other benchmarks, speed |
 | [MCP](docs/MCP.md) · [THINKING](docs/THINKING.md) · [OMNI](docs/OMNI.md) | MCP server and bridge; the experimental thinking mode; basal-omni on the engine |
 | [FEATURES](docs/FEATURES.md) · [CALIBRATION](docs/CALIBRATION.md) | `multi`, `act`, `tool` and evidence in detail; calibrating on your own data |
+| [QUESTION_TYPES](docs/QUESTION_TYPES.md) | all question types on one page: what each asks and answers, with an example |
+| [TASKS](docs/TASKS.md) | *experimental*: `classify`, `verify`, `compress`, `extract` (JSON schema) on the same API |
 | [FORMATS](docs/FORMATS.md) · [FORMAT2](docs/FORMAT2.md) · [SOAM](docs/SOAM.md) | prompt formats, option orders and calibration files; the runtime contract; shared-state packing |
 | [HARDWARE](docs/HARDWARE.md) · [PORTS](docs/PORTS.md) · [GGUF](docs/GGUF.md) · [QUANTIZATION](docs/QUANTIZATION.md) | which mode on which GPU; MLX and GGUF ports; FP8 and other low precision |
 | [WHATS_NEW](docs/WHATS_NEW.md) · [basal-1.0 report](docs/basal-1.pdf) | the full list of changes in 2.0; the basal-1.0 technical report |
@@ -238,7 +260,9 @@ No authentication, like the HTTP API: bind `--host 127.0.0.1` or put a gateway i
   independent yes/no question.
 - basal-omni is experimental: trained on text decisions only, with images and audio read zero-shot by Gemma 4's
   encoders and answered with the text calibration (`"calibration": "text"`); validate it on your own media. It runs
-  in `eager` mode only, without the ports and the thinking mode of basal-2.0.
+  in `eager` mode (ultra's FP8 port: `vllm` mode, text only), without the thinking mode of basal-2.0.
+- The task types of 2.1 are experimental: their API may change in a minor release, and `automated` needs thresholds
+  certified for the task (only basal-omni-1.1-max ships one, `classify` at 5%).
 - Decisions with serious consequences for people should be reviewed by a person.
 
 ## Previous releases
