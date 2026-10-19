@@ -454,6 +454,12 @@ Request matrix over HTTP, p50 (details, profile and method: [benchmarks/STRIX_HA
   136 → 144 ms for one question over a ≈100-token state, 1.27 s → **714 ms** at ≈2,000 tokens, 4.16 → **2.41 s** at
   ≈6,000 tokens (5.25 → **2.90 s** with 20 questions), 11.5 → **19.0/s** with 32 clients. Both agree with fp32 on 142 of
   144 decisions; the other two are one question that fp32 puts at 0.502 / 0.498.
+- **bf16 flip rate on a public sample** (basal-2.0, engine 2.2.0; the test split of
+  [LocalLLaMA/typed-decisions](https://huggingface.co/datasets/LocalLLaMA/typed-decisions): 400 cases of five questions,
+  2,000 decisions; reference `--mode eager` in bf16 with every prompt alone): `strix` gives the reference's answer on
+  1,980 (0.990), `--mode eager` with its default packing on 1,982 (0.991) and `gguf` on 1,954 (0.977). Every `strix` flip
+  is at a reference top-2 margin of at most 0.046; none of the 1,545 decisions with a margin of 0.2 or more changes.
+  Accuracy 0.651 against 0.652 ([details](benchmarks/STRIX_HALO.md#parity-against-bf16-eager-2000-public-decisions)).
 
 ## Google TPU (experimental, community-maintained)
 
