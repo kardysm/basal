@@ -1,0 +1,1201 @@
+{
+ "cases": 400,
+ "decisions": 2000,
+ "reference": "eager.jsonl",
+ "reference_failed": [],
+ "reference_accuracy": 0.6515,
+ "reference_ece": 0.0372,
+ "reference_margin_ge_0.2": 1545,
+ "engines": {
+  "eager-packed.jsonl": {
+   "failed": [],
+   "compared": 2000,
+   "same": 1982,
+   "agreement": 0.991,
+   "mean_abs_dp": 0.004,
+   "max_abs_dp": 0.0857,
+   "accuracy": 0.649,
+   "ece": 0.0414,
+   "flips_at_reference_margin_ge_0.2": 0,
+   "agreement_at_reference_margin_ge_0.2": 1.0,
+   "max_reference_margin_of_a_flip": 0.0398,
+   "by_type": {
+    "choice": {
+     "decisions": 600,
+     "same": 594
+    },
+    "noul": {
+     "decisions": 600,
+     "same": 597
+    },
+    "score": {
+     "decisions": 800,
+     "same": 791
+    }
+   },
+   "flips": [
+    {
+     "case": "agent_trace_observability_000003",
+     "question": "risk",
+     "type": "score",
+     "reference": "0",
+     "engine": "1",
+     "reference_margin": 0.0038,
+     "engine_margin": 0.0209,
+     "gold": "1"
+    },
+    {
+     "case": "agent_trace_observability_000043",
+     "question": "risk",
+     "type": "score",
+     "reference": "2",
+     "engine": "1",
+     "reference_margin": 0.0029,
+     "engine_margin": 0.0286,
+     "gold": "2"
+    },
+    {
+     "case": "agent_trace_observability_000054",
+     "question": "needs_review",
+     "type": "noul",
+     "reference": "false",
+     "engine": "true",
+     "reference_margin": 0.0204,
+     "engine_margin": 0.0411,
+     "gold": "false"
+    },
+    {
+     "case": "agent_trace_observability_000076",
+     "question": "outcome",
+     "type": "choice",
+     "reference": "success",
+     "engine": "partial",
+     "reference_margin": 0.0194,
+     "engine_margin": 0.0106,
+     "gold": "partial"
+    },
+    {
+     "case": "customer_service_000016",
+     "question": "action",
+     "type": "choice",
+     "reference": "answer_directly",
+     "engine": "escalate_to_human",
+     "reference_margin": 0.0251,
+     "engine_margin": 0.0251,
+     "gold": "answer_directly"
+    },
+    {
+     "case": "customer_service_000056",
+     "question": "action",
+     "type": "choice",
+     "reference": "escalate_to_human",
+     "engine": "answer_directly",
+     "reference_margin": 0.0398,
+     "engine_margin": 0.1051,
+     "gold": "answer_directly"
+    },
+    {
+     "case": "customer_service_000069",
+     "question": "urgency",
+     "type": "score",
+     "reference": "2",
+     "engine": "1",
+     "reference_margin": 0.0017,
+     "engine_margin": 0.0041,
+     "gold": "2"
+    },
+    {
+     "case": "customer_service_000070",
+     "question": "action",
+     "type": "choice",
+     "reference": "request_information",
+     "engine": "escalate_to_human",
+     "reference_margin": 0.0072,
+     "engine_margin": 0.007,
+     "gold": "request_information"
+    },
+    {
+     "case": "customer_service_000094",
+     "question": "action",
+     "type": "choice",
+     "reference": "escalate_to_human",
+     "engine": "request_information",
+     "reference_margin": 0.0223,
+     "engine_margin": 0.0027,
+     "gold": "request_information"
+    },
+    {
+     "case": "invoice_processing_000003",
+     "question": "discrepancy_severity",
+     "type": "score",
+     "reference": "2",
+     "engine": "0",
+     "reference_margin": 0.0095,
+     "engine_margin": 0.0023,
+     "gold": "2"
+    },
+    {
+     "case": "invoice_processing_000004",
+     "question": "discrepancy_severity",
+     "type": "score",
+     "reference": "0",
+     "engine": "2",
+     "reference_margin": 0.023,
+     "engine_margin": 0.0234,
+     "gold": "3"
+    },
+    {
+     "case": "invoice_processing_000019",
+     "question": "urgency",
+     "type": "score",
+     "reference": "2",
+     "engine": "1",
+     "reference_margin": 0.0027,
+     "engine_margin": 0.0055,
+     "gold": "2"
+    },
+    {
+     "case": "invoice_processing_000061",
+     "question": "disposition",
+     "type": "choice",
+     "reference": "manual_review",
+     "engine": "hold",
+     "reference_margin": 0.0079,
+     "engine_margin": 0.0346,
+     "gold": "manual_review"
+    },
+    {
+     "case": "security_incidents_000018",
+     "question": "severity",
+     "type": "score",
+     "reference": "1",
+     "engine": "2",
+     "reference_margin": 0.0008,
+     "engine_margin": 0.0042,
+     "gold": "2"
+    },
+    {
+     "case": "security_incidents_000021",
+     "question": "urgency",
+     "type": "score",
+     "reference": "3",
+     "engine": "1",
+     "reference_margin": 0.0097,
+     "engine_margin": 0.01,
+     "gold": "3"
+    },
+    {
+     "case": "security_incidents_000045",
+     "question": "severity",
+     "type": "score",
+     "reference": "2",
+     "engine": "1",
+     "reference_margin": 0.0064,
+     "engine_margin": 0.0001,
+     "gold": "2"
+    },
+    {
+     "case": "security_incidents_000091",
+     "question": "true_positive",
+     "type": "noul",
+     "reference": "false",
+     "engine": "true",
+     "reference_margin": 0.0015,
+     "engine_margin": 0.0235,
+     "gold": "true"
+    },
+    {
+     "case": "security_incidents_000092",
+     "question": "true_positive",
+     "type": "noul",
+     "reference": "true",
+     "engine": "false",
+     "reference_margin": 0.0109,
+     "engine_margin": 0.033,
+     "gold": "true"
+    }
+   ],
+   "latency_ms_p50": 2404.0550000000003
+  },
+  "strix.jsonl": {
+   "failed": [],
+   "compared": 2000,
+   "same": 1980,
+   "agreement": 0.99,
+   "mean_abs_dp": 0.00404,
+   "max_abs_dp": 0.0832,
+   "accuracy": 0.6505,
+   "ece": 0.0441,
+   "flips_at_reference_margin_ge_0.2": 0,
+   "agreement_at_reference_margin_ge_0.2": 1.0,
+   "max_reference_margin_of_a_flip": 0.0461,
+   "by_type": {
+    "choice": {
+     "decisions": 600,
+     "same": 593
+    },
+    "noul": {
+     "decisions": 600,
+     "same": 598
+    },
+    "score": {
+     "decisions": 800,
+     "same": 789
+    }
+   },
+   "flips": [
+    {
+     "case": "agent_trace_observability_000000",
+     "question": "risk",
+     "type": "score",
+     "reference": "0",
+     "engine": "1",
+     "reference_margin": 0.0354,
+     "engine_margin": 0.0216,
+     "gold": "1"
+    },
+    {
+     "case": "agent_trace_observability_000003",
+     "question": "risk",
+     "type": "score",
+     "reference": "0",
+     "engine": "1",
+     "reference_margin": 0.0038,
+     "engine_margin": 0.0212,
+     "gold": "1"
+    },
+    {
+     "case": "agent_trace_observability_000026",
+     "question": "outcome",
+     "type": "choice",
+     "reference": "partial",
+     "engine": "failure",
+     "reference_margin": 0.0097,
+     "engine_margin": 0.0029,
+     "gold": "harmful"
+    },
+    {
+     "case": "agent_trace_observability_000033",
+     "question": "urgency",
+     "type": "score",
+     "reference": "1",
+     "engine": "2",
+     "reference_margin": 0.0121,
+     "engine_margin": 0.0167,
+     "gold": "3"
+    },
+    {
+     "case": "agent_trace_observability_000043",
+     "question": "risk",
+     "type": "score",
+     "reference": "2",
+     "engine": "1",
+     "reference_margin": 0.0029,
+     "engine_margin": 0.0237,
+     "gold": "2"
+    },
+    {
+     "case": "agent_trace_observability_000052",
+     "question": "action",
+     "type": "choice",
+     "reference": "observe",
+     "engine": "continue",
+     "reference_margin": 0.0461,
+     "engine_margin": 0.028,
+     "gold": "observe"
+    },
+    {
+     "case": "customer_service_000004",
+     "question": "urgency",
+     "type": "score",
+     "reference": "1",
+     "engine": "0",
+     "reference_margin": 0.0016,
+     "engine_margin": 0.0042,
+     "gold": "1"
+    },
+    {
+     "case": "customer_service_000016",
+     "question": "action",
+     "type": "choice",
+     "reference": "answer_directly",
+     "engine": "escalate_to_human",
+     "reference_margin": 0.0251,
+     "engine_margin": 0.0141,
+     "gold": "answer_directly"
+    },
+    {
+     "case": "customer_service_000056",
+     "question": "action",
+     "type": "choice",
+     "reference": "escalate_to_human",
+     "engine": "answer_directly",
+     "reference_margin": 0.0398,
+     "engine_margin": 0.0899,
+     "gold": "answer_directly"
+    },
+    {
+     "case": "customer_service_000091",
+     "question": "urgency",
+     "type": "score",
+     "reference": "1",
+     "engine": "3",
+     "reference_margin": 0.0461,
+     "engine_margin": 0.0111,
+     "gold": "2"
+    },
+    {
+     "case": "invoice_processing_000004",
+     "question": "discrepancy_severity",
+     "type": "score",
+     "reference": "0",
+     "engine": "2",
+     "reference_margin": 0.023,
+     "engine_margin": 0.0586,
+     "gold": "3"
+    },
+    {
+     "case": "invoice_processing_000056",
+     "question": "disposition",
+     "type": "choice",
+     "reference": "approve",
+     "engine": "hold",
+     "reference_margin": 0.0293,
+     "engine_margin": 0.0173,
+     "gold": "manual_review"
+    },
+    {
+     "case": "invoice_processing_000061",
+     "question": "disposition",
+     "type": "choice",
+     "reference": "manual_review",
+     "engine": "hold",
+     "reference_margin": 0.0079,
+     "engine_margin": 0.0336,
+     "gold": "manual_review"
+    },
+    {
+     "case": "invoice_processing_000075",
+     "question": "urgency",
+     "type": "score",
+     "reference": "1",
+     "engine": "2",
+     "reference_margin": 0.019,
+     "engine_margin": 0.0066,
+     "gold": "1"
+    },
+    {
+     "case": "invoice_processing_000084",
+     "question": "discrepancy_severity",
+     "type": "score",
+     "reference": "2",
+     "engine": "3",
+     "reference_margin": 0.0111,
+     "engine_margin": 0.0396,
+     "gold": "3"
+    },
+    {
+     "case": "security_incidents_000021",
+     "question": "urgency",
+     "type": "score",
+     "reference": "3",
+     "engine": "1",
+     "reference_margin": 0.0097,
+     "engine_margin": 0.0024,
+     "gold": "3"
+    },
+    {
+     "case": "security_incidents_000022",
+     "question": "disposition",
+     "type": "choice",
+     "reference": "contain",
+     "engine": "investigate",
+     "reference_margin": 0.0067,
+     "engine_margin": 0.026,
+     "gold": "investigate"
+    },
+    {
+     "case": "security_incidents_000068",
+     "question": "severity",
+     "type": "score",
+     "reference": "2",
+     "engine": "1",
+     "reference_margin": 0.0112,
+     "engine_margin": 0.0037,
+     "gold": "3"
+    },
+    {
+     "case": "security_incidents_000091",
+     "question": "true_positive",
+     "type": "noul",
+     "reference": "false",
+     "engine": "true",
+     "reference_margin": 0.0015,
+     "engine_margin": 0.0356,
+     "gold": "true"
+    },
+    {
+     "case": "security_incidents_000092",
+     "question": "true_positive",
+     "type": "noul",
+     "reference": "true",
+     "engine": "false",
+     "reference_margin": 0.0109,
+     "engine_margin": 0.0429,
+     "gold": "true"
+    }
+   ],
+   "latency_ms_p50": 331.15
+  },
+  "strix-c8.jsonl": {
+   "failed": [],
+   "compared": 2000,
+   "same": 1977,
+   "agreement": 0.9885,
+   "mean_abs_dp": 0.004,
+   "max_abs_dp": 0.1149,
+   "accuracy": 0.6505,
+   "ece": 0.0393,
+   "flips_at_reference_margin_ge_0.2": 0,
+   "agreement_at_reference_margin_ge_0.2": 1.0,
+   "max_reference_margin_of_a_flip": 0.0461,
+   "by_type": {
+    "choice": {
+     "decisions": 600,
+     "same": 591
+    },
+    "noul": {
+     "decisions": 600,
+     "same": 596
+    },
+    "score": {
+     "decisions": 800,
+     "same": 790
+    }
+   },
+   "flips": [
+    {
+     "case": "agent_trace_observability_000003",
+     "question": "risk",
+     "type": "score",
+     "reference": "0",
+     "engine": "1",
+     "reference_margin": 0.0038,
+     "engine_margin": 0.0131,
+     "gold": "1"
+    },
+    {
+     "case": "agent_trace_observability_000026",
+     "question": "outcome",
+     "type": "choice",
+     "reference": "partial",
+     "engine": "failure",
+     "reference_margin": 0.0097,
+     "engine_margin": 0.0092,
+     "gold": "harmful"
+    },
+    {
+     "case": "agent_trace_observability_000043",
+     "question": "risk",
+     "type": "score",
+     "reference": "2",
+     "engine": "1",
+     "reference_margin": 0.0029,
+     "engine_margin": 0.0237,
+     "gold": "2"
+    },
+    {
+     "case": "agent_trace_observability_000044",
+     "question": "needs_review",
+     "type": "noul",
+     "reference": "true",
+     "engine": "false",
+     "reference_margin": 0.036,
+     "engine_margin": 0.0078,
+     "gold": "true"
+    },
+    {
+     "case": "agent_trace_observability_000054",
+     "question": "needs_review",
+     "type": "noul",
+     "reference": "false",
+     "engine": "true",
+     "reference_margin": 0.0204,
+     "engine_margin": 0.0652,
+     "gold": "false"
+    },
+    {
+     "case": "customer_service_000004",
+     "question": "urgency",
+     "type": "score",
+     "reference": "1",
+     "engine": "0",
+     "reference_margin": 0.0016,
+     "engine_margin": 0.0042,
+     "gold": "1"
+    },
+    {
+     "case": "customer_service_000016",
+     "question": "action",
+     "type": "choice",
+     "reference": "answer_directly",
+     "engine": "escalate_to_human",
+     "reference_margin": 0.0251,
+     "engine_margin": 0.0141,
+     "gold": "answer_directly"
+    },
+    {
+     "case": "customer_service_000056",
+     "question": "action",
+     "type": "choice",
+     "reference": "escalate_to_human",
+     "engine": "answer_directly",
+     "reference_margin": 0.0398,
+     "engine_margin": 0.0576,
+     "gold": "answer_directly"
+    },
+    {
+     "case": "customer_service_000085",
+     "question": "urgency",
+     "type": "score",
+     "reference": "2",
+     "engine": "3",
+     "reference_margin": 0.0055,
+     "engine_margin": 0.0018,
+     "gold": "3"
+    },
+    {
+     "case": "customer_service_000091",
+     "question": "urgency",
+     "type": "score",
+     "reference": "1",
+     "engine": "3",
+     "reference_margin": 0.0461,
+     "engine_margin": 0.0111,
+     "gold": "2"
+    },
+    {
+     "case": "customer_service_000094",
+     "question": "action",
+     "type": "choice",
+     "reference": "escalate_to_human",
+     "engine": "request_information",
+     "reference_margin": 0.0223,
+     "engine_margin": 0.0051,
+     "gold": "request_information"
+    },
+    {
+     "case": "invoice_processing_000035",
+     "question": "disposition",
+     "type": "choice",
+     "reference": "manual_review",
+     "engine": "hold",
+     "reference_margin": 0.0054,
+     "engine_margin": 0.001,
+     "gold": "manual_review"
+    },
+    {
+     "case": "invoice_processing_000056",
+     "question": "disposition",
+     "type": "choice",
+     "reference": "approve",
+     "engine": "hold",
+     "reference_margin": 0.0293,
+     "engine_margin": 0.0445,
+     "gold": "manual_review"
+    },
+    {
+     "case": "invoice_processing_000061",
+     "question": "disposition",
+     "type": "choice",
+     "reference": "manual_review",
+     "engine": "hold",
+     "reference_margin": 0.0079,
+     "engine_margin": 0.0302,
+     "gold": "manual_review"
+    },
+    {
+     "case": "invoice_processing_000084",
+     "question": "discrepancy_severity",
+     "type": "score",
+     "reference": "2",
+     "engine": "3",
+     "reference_margin": 0.0111,
+     "engine_margin": 0.0181,
+     "gold": "3"
+    },
+    {
+     "case": "security_incidents_000021",
+     "question": "urgency",
+     "type": "score",
+     "reference": "3",
+     "engine": "1",
+     "reference_margin": 0.0097,
+     "engine_margin": 0.0045,
+     "gold": "3"
+    },
+    {
+     "case": "security_incidents_000022",
+     "question": "disposition",
+     "type": "choice",
+     "reference": "contain",
+     "engine": "investigate",
+     "reference_margin": 0.0067,
+     "engine_margin": 0.026,
+     "gold": "investigate"
+    },
+    {
+     "case": "security_incidents_000024",
+     "question": "disposition",
+     "type": "choice",
+     "reference": "contain",
+     "engine": "investigate",
+     "reference_margin": 0.0144,
+     "engine_margin": 0.0027,
+     "gold": "investigate"
+    },
+    {
+     "case": "security_incidents_000045",
+     "question": "severity",
+     "type": "score",
+     "reference": "2",
+     "engine": "1",
+     "reference_margin": 0.0064,
+     "engine_margin": 0.0018,
+     "gold": "2"
+    },
+    {
+     "case": "security_incidents_000068",
+     "question": "severity",
+     "type": "score",
+     "reference": "2",
+     "engine": "1",
+     "reference_margin": 0.0112,
+     "engine_margin": 0.0105,
+     "gold": "3"
+    },
+    {
+     "case": "security_incidents_000070",
+     "question": "severity",
+     "type": "score",
+     "reference": "1",
+     "engine": "3",
+     "reference_margin": 0.0051,
+     "engine_margin": 0.0091,
+     "gold": "2"
+    },
+    {
+     "case": "security_incidents_000091",
+     "question": "true_positive",
+     "type": "noul",
+     "reference": "false",
+     "engine": "true",
+     "reference_margin": 0.0015,
+     "engine_margin": 0.0155,
+     "gold": "true"
+    },
+    {
+     "case": "security_incidents_000092",
+     "question": "true_positive",
+     "type": "noul",
+     "reference": "true",
+     "engine": "false",
+     "reference_margin": 0.0109,
+     "engine_margin": 0.0421,
+     "gold": "true"
+    }
+   ],
+   "latency_ms_p50": 2578.415
+  },
+  "gguf.jsonl": {
+   "failed": [],
+   "compared": 2000,
+   "same": 1954,
+   "agreement": 0.977,
+   "mean_abs_dp": 0.00815,
+   "max_abs_dp": 0.1451,
+   "accuracy": 0.65,
+   "ece": 0.04,
+   "flips_at_reference_margin_ge_0.2": 0,
+   "agreement_at_reference_margin_ge_0.2": 1.0,
+   "max_reference_margin_of_a_flip": 0.1874,
+   "by_type": {
+    "choice": {
+     "decisions": 600,
+     "same": 580
+    },
+    "noul": {
+     "decisions": 600,
+     "same": 596
+    },
+    "score": {
+     "decisions": 800,
+     "same": 778
+    }
+   },
+   "flips": [
+    {
+     "case": "agent_trace_observability_000003",
+     "question": "risk",
+     "type": "score",
+     "reference": "0",
+     "engine": "1",
+     "reference_margin": 0.0038,
+     "engine_margin": 0.0498,
+     "gold": "1"
+    },
+    {
+     "case": "agent_trace_observability_000014",
+     "question": "risk",
+     "type": "score",
+     "reference": "1",
+     "engine": "0",
+     "reference_margin": 0.0358,
+     "engine_margin": 0.035,
+     "gold": "1"
+    },
+    {
+     "case": "agent_trace_observability_000033",
+     "question": "urgency",
+     "type": "score",
+     "reference": "1",
+     "engine": "2",
+     "reference_margin": 0.0121,
+     "engine_margin": 0.0421,
+     "gold": "3"
+    },
+    {
+     "case": "agent_trace_observability_000037",
+     "question": "outcome",
+     "type": "choice",
+     "reference": "partial",
+     "engine": "harmful",
+     "reference_margin": 0.0176,
+     "engine_margin": 0.0204,
+     "gold": "harmful"
+    },
+    {
+     "case": "agent_trace_observability_000043",
+     "question": "risk",
+     "type": "score",
+     "reference": "2",
+     "engine": "1",
+     "reference_margin": 0.0029,
+     "engine_margin": 0.0661,
+     "gold": "2"
+    },
+    {
+     "case": "agent_trace_observability_000044",
+     "question": "needs_review",
+     "type": "noul",
+     "reference": "true",
+     "engine": "false",
+     "reference_margin": 0.036,
+     "engine_margin": 0.0521,
+     "gold": "true"
+    },
+    {
+     "case": "agent_trace_observability_000073",
+     "question": "needs_review",
+     "type": "noul",
+     "reference": "false",
+     "engine": "true",
+     "reference_margin": 0.037,
+     "engine_margin": 0.007,
+     "gold": "true"
+    },
+    {
+     "case": "agent_trace_observability_000095",
+     "question": "risk",
+     "type": "score",
+     "reference": "1",
+     "engine": "0",
+     "reference_margin": 0.0123,
+     "engine_margin": 0.0155,
+     "gold": "1"
+    },
+    {
+     "case": "customer_service_000006",
+     "question": "urgency",
+     "type": "score",
+     "reference": "2",
+     "engine": "1",
+     "reference_margin": 0.0249,
+     "engine_margin": 0.0069,
+     "gold": "2"
+    },
+    {
+     "case": "customer_service_000025",
+     "question": "action",
+     "type": "choice",
+     "reference": "request_information",
+     "engine": "escalate_to_human",
+     "reference_margin": 0.1079,
+     "engine_margin": 0.0192,
+     "gold": "escalate_to_human"
+    },
+    {
+     "case": "customer_service_000033",
+     "question": "action",
+     "type": "choice",
+     "reference": "request_information",
+     "engine": "escalate_to_human",
+     "reference_margin": 0.0396,
+     "engine_margin": 0.0202,
+     "gold": "answer_directly"
+    },
+    {
+     "case": "customer_service_000056",
+     "question": "action",
+     "type": "choice",
+     "reference": "escalate_to_human",
+     "engine": "answer_directly",
+     "reference_margin": 0.0398,
+     "engine_margin": 0.0648,
+     "gold": "answer_directly"
+    },
+    {
+     "case": "customer_service_000059",
+     "question": "category",
+     "type": "choice",
+     "reference": "refund",
+     "engine": "delivery",
+     "reference_margin": 0.0217,
+     "engine_margin": 0.0077,
+     "gold": "delivery"
+    },
+    {
+     "case": "customer_service_000069",
+     "question": "urgency",
+     "type": "score",
+     "reference": "2",
+     "engine": "1",
+     "reference_margin": 0.0017,
+     "engine_margin": 0.0036,
+     "gold": "2"
+    },
+    {
+     "case": "customer_service_000079",
+     "question": "churn_risk",
+     "type": "score",
+     "reference": "2",
+     "engine": "3",
+     "reference_margin": 0.0332,
+     "engine_margin": 0.0096,
+     "gold": "2"
+    },
+    {
+     "case": "customer_service_000085",
+     "question": "urgency",
+     "type": "score",
+     "reference": "2",
+     "engine": "3",
+     "reference_margin": 0.0055,
+     "engine_margin": 0.0169,
+     "gold": "3"
+    },
+    {
+     "case": "invoice_processing_000000",
+     "question": "discrepancy_severity",
+     "type": "score",
+     "reference": "0",
+     "engine": "2",
+     "reference_margin": 0.12,
+     "engine_margin": 0.0059,
+     "gold": "2"
+    },
+    {
+     "case": "invoice_processing_000002",
+     "question": "urgency",
+     "type": "score",
+     "reference": "2",
+     "engine": "1",
+     "reference_margin": 0.0137,
+     "engine_margin": 0.0124,
+     "gold": "2"
+    },
+    {
+     "case": "invoice_processing_000003",
+     "question": "discrepancy_severity",
+     "type": "score",
+     "reference": "2",
+     "engine": "0",
+     "reference_margin": 0.0095,
+     "engine_margin": 0.1532,
+     "gold": "2"
+    },
+    {
+     "case": "invoice_processing_000003",
+     "question": "matches_order",
+     "type": "noul",
+     "reference": "false",
+     "engine": "true",
+     "reference_margin": 0.1805,
+     "engine_margin": 0.0196,
+     "gold": "false"
+    },
+    {
+     "case": "invoice_processing_000013",
+     "question": "urgency",
+     "type": "score",
+     "reference": "2",
+     "engine": "1",
+     "reference_margin": 0.0036,
+     "engine_margin": 0.0034,
+     "gold": "1"
+    },
+    {
+     "case": "invoice_processing_000019",
+     "question": "urgency",
+     "type": "score",
+     "reference": "2",
+     "engine": "1",
+     "reference_margin": 0.0027,
+     "engine_margin": 0.014,
+     "gold": "2"
+    },
+    {
+     "case": "invoice_processing_000035",
+     "question": "disposition",
+     "type": "choice",
+     "reference": "manual_review",
+     "engine": "hold",
+     "reference_margin": 0.0054,
+     "engine_margin": 0.1043,
+     "gold": "manual_review"
+    },
+    {
+     "case": "invoice_processing_000036",
+     "question": "disposition",
+     "type": "choice",
+     "reference": "manual_review",
+     "engine": "hold",
+     "reference_margin": 0.1558,
+     "engine_margin": 0.0693,
+     "gold": "approve"
+    },
+    {
+     "case": "invoice_processing_000037",
+     "question": "urgency",
+     "type": "score",
+     "reference": "2",
+     "engine": "3",
+     "reference_margin": 0.0198,
+     "engine_margin": 0.0003,
+     "gold": "2"
+    },
+    {
+     "case": "invoice_processing_000048",
+     "question": "disposition",
+     "type": "choice",
+     "reference": "manual_review",
+     "engine": "hold",
+     "reference_margin": 0.0892,
+     "engine_margin": 0.1801,
+     "gold": "manual_review"
+    },
+    {
+     "case": "invoice_processing_000049",
+     "question": "disposition",
+     "type": "choice",
+     "reference": "manual_review",
+     "engine": "hold",
+     "reference_margin": 0.1874,
+     "engine_margin": 0.0438,
+     "gold": "approve"
+    },
+    {
+     "case": "invoice_processing_000049",
+     "question": "urgency",
+     "type": "score",
+     "reference": "2",
+     "engine": "3",
+     "reference_margin": 0.0362,
+     "engine_margin": 0.0014,
+     "gold": "3"
+    },
+    {
+     "case": "invoice_processing_000056",
+     "question": "disposition",
+     "type": "choice",
+     "reference": "approve",
+     "engine": "hold",
+     "reference_margin": 0.0293,
+     "engine_margin": 0.2493,
+     "gold": "manual_review"
+    },
+    {
+     "case": "invoice_processing_000060",
+     "question": "disposition",
+     "type": "choice",
+     "reference": "approve",
+     "engine": "hold",
+     "reference_margin": 0.0478,
+     "engine_margin": 0.0555,
+     "gold": "manual_review"
+    },
+    {
+     "case": "invoice_processing_000061",
+     "question": "disposition",
+     "type": "choice",
+     "reference": "manual_review",
+     "engine": "hold",
+     "reference_margin": 0.0079,
+     "engine_margin": 0.0534,
+     "gold": "manual_review"
+    },
+    {
+     "case": "invoice_processing_000084",
+     "question": "discrepancy_severity",
+     "type": "score",
+     "reference": "2",
+     "engine": "3",
+     "reference_margin": 0.0111,
+     "engine_margin": 0.0329,
+     "gold": "3"
+    },
+    {
+     "case": "invoice_processing_000096",
+     "question": "disposition",
+     "type": "choice",
+     "reference": "manual_review",
+     "engine": "hold",
+     "reference_margin": 0.0283,
+     "engine_margin": 0.1431,
+     "gold": "approve"
+    },
+    {
+     "case": "security_incidents_000006",
+     "question": "disposition",
+     "type": "choice",
+     "reference": "contain",
+     "engine": "investigate",
+     "reference_margin": 0.0717,
+     "engine_margin": 0.0388,
+     "gold": "contain"
+    },
+    {
+     "case": "security_incidents_000021",
+     "question": "urgency",
+     "type": "score",
+     "reference": "3",
+     "engine": "1",
+     "reference_margin": 0.0097,
+     "engine_margin": 0.0334,
+     "gold": "3"
+    },
+    {
+     "case": "security_incidents_000022",
+     "question": "disposition",
+     "type": "choice",
+     "reference": "contain",
+     "engine": "investigate",
+     "reference_margin": 0.0067,
+     "engine_margin": 0.09,
+     "gold": "investigate"
+    },
+    {
+     "case": "security_incidents_000024",
+     "question": "disposition",
+     "type": "choice",
+     "reference": "contain",
+     "engine": "investigate",
+     "reference_margin": 0.0144,
+     "engine_margin": 0.0267,
+     "gold": "investigate"
+    },
+    {
+     "case": "security_incidents_000036",
+     "question": "disposition",
+     "type": "choice",
+     "reference": "contain",
+     "engine": "investigate",
+     "reference_margin": 0.0568,
+     "engine_margin": 0.0397,
+     "gold": "investigate"
+    },
+    {
+     "case": "security_incidents_000049",
+     "question": "disposition",
+     "type": "choice",
+     "reference": "contain",
+     "engine": "investigate",
+     "reference_margin": 0.06,
+     "engine_margin": 0.052,
+     "gold": "investigate"
+    },
+    {
+     "case": "security_incidents_000055",
+     "question": "severity",
+     "type": "score",
+     "reference": "1",
+     "engine": "3",
+     "reference_margin": 0.0181,
+     "engine_margin": 0.0012,
+     "gold": "1"
+    },
+    {
+     "case": "security_incidents_000055",
+     "question": "urgency",
+     "type": "score",
+     "reference": "2",
+     "engine": "3",
+     "reference_margin": 0.0063,
+     "engine_margin": 0.0106,
+     "gold": "1"
+    },
+    {
+     "case": "security_incidents_000075",
+     "question": "urgency",
+     "type": "score",
+     "reference": "3",
+     "engine": "2",
+     "reference_margin": 0.0417,
+     "engine_margin": 0.0016,
+     "gold": "3"
+    },
+    {
+     "case": "security_incidents_000082",
+     "question": "disposition",
+     "type": "choice",
+     "reference": "contain",
+     "engine": "investigate",
+     "reference_margin": 0.0763,
+     "engine_margin": 0.0055,
+     "gold": "investigate"
+    },
+    {
+     "case": "security_incidents_000084",
+     "question": "urgency",
+     "type": "score",
+     "reference": "3",
+     "engine": "1",
+     "reference_margin": 0.0363,
+     "engine_margin": 0.0156,
+     "gold": "2"
+    },
+    {
+     "case": "security_incidents_000092",
+     "question": "disposition",
+     "type": "choice",
+     "reference": "contain",
+     "engine": "investigate",
+     "reference_margin": 0.0769,
+     "engine_margin": 0.0222,
+     "gold": "investigate"
+    },
+    {
+     "case": "security_incidents_000092",
+     "question": "true_positive",
+     "type": "noul",
+     "reference": "true",
+     "engine": "false",
+     "reference_margin": 0.0109,
+     "engine_margin": 0.0815,
+     "gold": "true"
+    }
+   ],
+   "latency_ms_p50": 562.015
+  }
+ }
+}
