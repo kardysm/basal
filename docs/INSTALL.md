@@ -62,7 +62,7 @@ missing):
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-env && source ~/basal-env/bin/activate
 uv pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
-uv pip install "basal[fp8] @ https://github.com/rkinas/basal/archive/refs/tags/v2.1.0.tar.gz"
+uv pip install "basal[fp8] @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"
 basal-serve --model Remek/basal-2.0-4.5B --mode fast --template-prefix off --port 8000
 ```
 
@@ -147,13 +147,13 @@ ties, and accuracy moved by −0.8 to +1.4 points against them on a development 
 ```bash
 # vLLM brings its own torch: a separate environment. vLLM 0.31 brings torch built for CUDA 13.0: NVIDIA driver >= 580
 uv venv --python 3.12 --allow-existing ~/basal-vllm && source ~/basal-vllm/bin/activate
-uv pip install "basal[vllm] @ https://github.com/rkinas/basal/archive/refs/tags/v2.1.0.tar.gz"
+uv pip install "basal[vllm] @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"
 basal-serve --model Remek/basal-2.0-4.5B --mode vllm --port 8000          # --max-len 32768 for long documents
 
 # SGLang (own environment; its kernels need a CUDA 12.9+ toolkit; it also brings torch for CUDA 13.0: driver >= 580)
 uv venv --python 3.12 --allow-existing ~/basal-sglang && source ~/basal-sglang/bin/activate
 uv pip install --prerelease=allow "sglang[srt]==0.5.21"
-uv pip install --no-deps "basal @ https://github.com/rkinas/basal/archive/refs/tags/v2.1.0.tar.gz"
+uv pip install --no-deps "basal @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"
 uv pip install starlette uvicorn httpx accelerate safetensors   # if missing
 basal-serve --model Remek/basal-2.0-4.5B --mode sglang --port 8000
 ```
@@ -168,7 +168,7 @@ basal-1.5 ([QUANTIZATION.md](QUANTIZATION.md)).
 
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-mlx && source ~/basal-mlx/bin/activate
-uv pip install "basal[mlx] @ https://github.com/rkinas/basal/archive/refs/tags/v2.1.0.tar.gz"
+uv pip install "basal[mlx] @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"
 basal-serve --model Remek/basal-2.0-4.5B-MLX-8bit --mode mlx --port 8000
 ```
 
@@ -185,7 +185,7 @@ log-probabilities of the option codes of one generated token. Ollama 0.12.11 or 
 
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-env && source ~/basal-env/bin/activate
-uv pip install "basal @ https://github.com/rkinas/basal/archive/refs/tags/v2.1.0.tar.gz"   # also installs the hf CLI
+uv pip install "basal @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"   # also installs the hf CLI
 hf download Remek/basal-2.0-4.5B-GGUF --local-dir basal-2.0-4.5B-GGUF
 cd basal-2.0-4.5B-GGUF && ollama create basal-2.0-4.5b:q8_0 -f Modelfile.Q8_0 && cd ..
 basal-serve --model ./basal-2.0-4.5B-GGUF --mode ollama --ollama-model basal-2.0-4.5b:q8_0 --port 8000
@@ -204,19 +204,45 @@ Without a separate server, `--mode gguf` loads the file in process through llama
 CUDA build it first, see [GGUF.md](GGUF.md)):
 
 ```bash
-uv pip install "basal[gguf] @ https://github.com/rkinas/basal/archive/refs/tags/v2.1.0.tar.gz"
+uv pip install "basal[gguf] @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"
 basal-serve --model ./basal-2.0-4.5B-GGUF --mode gguf --gguf basal-2.0-4.5B-GGUF/basal-2.0-4.5B-Q8_0.gguf --port 8000
 ```
 
-`--mode gguf` uses `CALIBRATION.json` (the bf16 fit); add `--calibration basal-2.0-4.5B-GGUF/CALIBRATION.llamacpp.json`
-to use the llama.cpp fit. Context: Ollama mode reads at most 4,096 tokens per prompt (basal sends `num_ctx` 4096, which
+`--mode gguf` loads `CALIBRATION.gguf.json` when the folder ships one; the basal-2.0 `-GGUF` folders do not, so it uses
+`CALIBRATION.json` (the bf16 fit); add `--calibration basal-2.0-4.5B-GGUF/CALIBRATION.llamacpp.json` to use the
+llama.cpp fit. Context: Ollama mode reads at most 4,096 tokens per prompt (basal sends `num_ctx` 4096, which
 overrides the Modelfile) and llama.cpp mode reads `llama-server -c`; longer states are cut in the middle
 (`usage.truncated`). For long documents use `llama-server -c 32768` or `--mode gguf`.
 
 Quantisations: `Q8_0` (recommended) and `Q5_K_M` (smaller). Requests of one state are sent one after another, so the
 prompt cache of Ollama / llama.cpp computes the state once; `--http-parallel N` (with `OLLAMA_NUM_PARALLEL` /
 `llama-server -np`) serves concurrent clients. GGUF is the slow path for batches: it is for desktops and laptops, not
-servers. Details: [PORTS.md](PORTS.md), [GGUF.md](GGUF.md).
+servers. Details: [PORTS.md](PORTS.md), [GGUF.md](GGUF.md). Other GGUF files with the same tokenizer fix (other
+quantisations, basal-1.0): `basal-export-gguf` ([GGUF.md](GGUF.md#convert-yourself)).
+
+### Google TPU (experimental, community-maintained)
+
+`--mode tpu` runs the bf16 weights in JAX / XLA on one TPU chip (measured on a v5e-1, the Colab TPU runtime), with
+the same SOAM packing, option codes, calibration and API as the basal engine. basal-2.0-mini and basal-2.0 (4.5B) fit
+one 16 GB v5e chip; basal-2.0-max (11B) does not. Install a CPU build of torch (the tokenizer and the chat template
+use transformers), then the `tpu` extra (JAX and libtpu from PyPI; Python 3.12 or newer):
+
+```bash
+uv venv --python 3.12 --allow-existing ~/basal-tpu && source ~/basal-tpu/bin/activate
+uv pip install "torch>=2.11" --index-url https://download.pytorch.org/whl/cpu
+uv pip install "basal[tpu] @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"   # 2.2.0: the first release with --mode tpu
+basal-serve --model Remek/basal-2.0-4.5B --port 8000   # --mode tpu is the default on a TPU VM
+```
+
+- The server compiles one XLA program per shape before it accepts requests (3–5 minutes; cached in
+  `~/.cache/basal/jax`, or `$JAX_COMPILATION_CACHE_DIR`, for the next start).
+- `--max-len` (default 4,096 tokens) is the longest prompt; longer states are cut or refused (`--context-overflow`).
+  Above 3,072 tokens the attention runs in blocks, so long documents fit (basal-2.0 up to its 32k context).
+- On a Colab TPU runtime, install into the system Python as above and remove the torch add-ons Colab ships for its own
+  older torch (`pip uninstall torchvision torchaudio torchcodec torch-xla`): transformers fails to import next to them.
+  [`notebooks/tpu.ipynb`](../notebooks/tpu.ipynb) does all of this and runs the examples and benchmarks.
+- Not on TPU: evidence spans (they need the PyTorch model), `--media`, early exit and quantisation.
+  Measurements: [HARDWARE.md](HARDWARE.md#google-tpu-experimental-community-maintained).
 
 ### CPU
 
@@ -230,7 +256,7 @@ Install the `media` extra (pillow, soundfile, scipy, torchvision) and serve a ba
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-env && source ~/basal-env/bin/activate
 uv pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
-uv pip install "basal[media] @ https://github.com/rkinas/basal/archive/refs/tags/v2.1.0.tar.gz"
+uv pip install "basal[media] @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"
 basal-serve --model Remek/basal-omni-1.0-mini --mode eager --media on --port 8000   # or Remek/basal-omni-1.0-max
 ```
 

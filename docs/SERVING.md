@@ -1,6 +1,7 @@
 # Serving, batch inference and benchmarks
 
-Flags of `basal-serve`, inference on a JSONL file with `basal-run`, and benchmarking a GPU.
+Flags of `basal-serve`, inference on a JSONL file with `basal-run`, a look inside one decision with `basal-viz`, and
+benchmarking a GPU.
 
 ## Serving modes
 
@@ -20,12 +21,16 @@ Flags of `basal-serve`, inference on a JSONL file with `basal-run`, and benchmar
 | `mlx-q8` | `mlx` with 8-bit weights made from bf16 at load time (about half the memory, not faster) | Apple Silicon |
 | `mps` | the PyTorch engine on the Mac's GPU: SOAM packing + token-budget batching, no CUDA graphs | Apple Silicon |
 | `gguf` | a GGUF file in process through llama.cpp (`--gguf <file>`, extra `basal[gguf]`) | Apple Silicon (Metal), CUDA, CPU |
+| `strix` *(experimental, community-maintained)* | basal-1.5 / basal-2.0 (Llama architecture): PyTorch + Triton kernels written for gfx1151: flash attention over the packed prefix trie, gate / up + SwiGLU fused, matmuls with the bias and residual add in the epilogue, all rows of a batch in one sequence (bf16; [HARDWARE.md](HARDWARE.md#amd-strix-halo-experimental-community-maintained), [benchmarks](benchmarks/STRIX_HALO.md)) | AMD Strix Halo (ROCm + Triton); measured only there |
 | `ollama` | the basal server in front of Ollama (GGUF ports; `--ollama-model`, `--ollama-url`) | anything Ollama runs on |
 | `llamacpp` | the basal server in front of `llama-server` (GGUF ports; `--llamacpp-url`) | anything llama.cpp runs on |
+| `tpu` *(experimental, community-maintained)* | JAX / XLA on one TPU chip: SOAM packing, one compiled program per shape, `--max-len` (extra `basal[tpu]`, [install](INSTALL.md#google-tpu-experimental-community-maintained)) | Google TPU (v5e measured) |
 
-- Without `--mode`: `fast` on CUDA, `mlx` on Apple Silicon (`mps` without `basal[mlx]`), `eager` otherwise.
+- Without `--mode`: `fast` on CUDA, `mlx` on Apple Silicon (`mps` without `basal[mlx]`), `tpu` on a TPU VM with
+  `basal[tpu]`, `eager` otherwise.
 - `--calibration file.json` overrides the calibration file (default: `CALIBRATION.<mode>.json` when the model ships
-  one for that engine, else `CALIBRATION.json`; `--mode gguf` uses `CALIBRATION.json`; with `--orders 2`,
+  one for that engine, else `CALIBRATION.json`; `--mode gguf` loads `CALIBRATION.gguf.json` when the model ships one,
+  else `CALIBRATION.json`; with `--orders 2`,
   `CALIBRATION.o2.json` when shipped). A file applies its thresholds only to the option orders it was fitted with. `basal-calibrate` fits one on your labelled requests
   ([CALIBRATION.md](CALIBRATION.md)). A missing file is refused at start-up.
 - **Option orders** (`--orders 1 | 2 | auto`): `1` asks the order given (the default for prompt-format-2 models such as
@@ -120,6 +125,25 @@ Ready-to-run examples (Polish and English) in `basal/examples/` of the repositor
 ```bash
 for f in choice noul score complex; do basal-run --input $EX/$f.jsonl --output answers_$f.jsonl; done
 ```
+
+## See how a decision is made
+
+`basal-viz` (contributed by [@lukaspoloki](https://github.com/lukaspoloki), [#2](https://github.com/rkinas/basal/pull/2))
+opens a local web page that runs the model and shows every step of a decision: the prompt of each option order the
+server asks (prompt format and option codes from the model's `basal.json`; one order by default for basal-2.0), the
+shared-prefix packing when there are two orders, the code probabilities after every layer ("logit lens"), the code
+readout, the calibration and the decision against the thresholds the calibration file certifies. The same request is
+answered by the server in the same process, and the page shows the difference (0 for a single question; a request with
+several questions shares its state in one packed row, which moves bf16 probabilities by a few thousandths). The bundled
+examples are in a drop-down, with the expected answer where the file has one.
+
+```bash
+basal-viz --model Remek/basal-2.0-mini --port 8080     # then open http://127.0.0.1:8080
+```
+
+It runs `--mode mps` on Apple Silicon and `--mode eager` elsewhere (`--device`, `--orders 1|2`, `--calibration` as for
+`basal-serve`), and only the Llama-architecture models (basal-1.0, basal-1.5, basal-2.0; not basal-omni). It is meant
+for exploring, not serving: every question runs one extra forward per option order to record all layers.
 
 ## Benchmark your GPU
 

@@ -14,7 +14,9 @@ This product includes models fine-tuned from the following works, licensed under
   basal-omni-1.0-max   <- google/gemma-4-12B-it  (https://huggingface.co/google/gemma-4-12B-it)
   basal-omni-1.0-mini  <- google/gemma-4-E4B-it  (https://huggingface.co/google/gemma-4-E4B-it)
 
-The inference engine in this repository is original work licensed under the Apache License, Version 2.0.
+The inference engine in this repository is original work licensed under the Apache License, Version 2.0. It
+includes contributions by Paweł Kiszczak, Piotr Durlej, Kuba Sołtys, Michał Kardyś and @lukaspoloki (README.md,
+Contributors).
 
 Training data attribution (basal-1.0 models):
   English decision items in the training data were converted from the public corpus

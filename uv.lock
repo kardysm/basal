@@ -325,7 +325,7 @@ wheels = [
 
 [[package]]
 name = "basal"
-version = "2.0.0"
+version = "2.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "accelerate" },
@@ -344,6 +344,9 @@ fp8 = [
 ]
 gguf = [
     { name = "llama-cpp-python" },
+]
+gguf-export = [
+    { name = "gguf" },
 ]
 mcp = [
     { name = "mcp" },
@@ -370,6 +373,9 @@ test = [
     { name = "mlx-lm", marker = "python_full_version >= '3.11' and platform_machine == 'arm64' and sys_platform == 'darwin'" },
     { name = "pytest" },
 ]
+tpu = [
+    { name = "jax", extra = ["tpu"], marker = "python_full_version >= '3.12' and sys_platform == 'linux'" },
+]
 vllm = [
     { name = "vllm" },
 ]
@@ -377,10 +383,12 @@ vllm = [
 [package.metadata]
 requires-dist = [
     { name = "accelerate", specifier = ">=1.10" },
+    { name = "gguf", marker = "extra == 'gguf-export'", specifier = ">=0.19" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "huggingface-hub", specifier = ">=0.34" },
+    { name = "jax", extras = ["tpu"], marker = "python_full_version >= '3.12' and sys_platform == 'linux' and extra == 'tpu'", specifier = "==0.11.1" },
     { name = "jsonschema", marker = "extra == 'test'" },
-    { name = "llama-cpp-python", marker = "extra == 'gguf'", specifier = ">=0.3.35" },
+    { name = "llama-cpp-python", marker = "extra == 'gguf'", specifier = ">=0.3.36" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=2.3,<3" },
     { name = "mcp", marker = "extra == 'test'", specifier = ">=2.3,<3" },
     { name = "mlx", marker = "python_full_version >= '3.11' and platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'mlx'", specifier = ">=0.32" },
@@ -401,7 +409,7 @@ requires-dist = [
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.35" },
     { name = "vllm", marker = "extra == 'vllm'", specifier = ">=0.11" },
 ]
-provides-extras = ["fp8", "nvfp4", "vllm", "mlx", "media", "gguf", "mcp", "test"]
+provides-extras = ["fp8", "nvfp4", "vllm", "mlx", "media", "gguf", "gguf-export", "mcp", "tpu", "test"]
 
 [[package]]
 name = "blake3"
@@ -1617,6 +1625,23 @@ wheels = [
 ]
 
 [[package]]
+name = "gguf"
+version = "0.19.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11' and python_full_version < '3.13'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
+    { name = "pyyaml" },
+    { name = "requests" },
+    { name = "tqdm" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/48/ae/17f1308ae45cd7b08ebb521747d5b23f4efc4d172038a4e228dd5106c3ff/gguf-0.19.0.tar.gz", hash = "sha256:dbadcd6cc7ccd44256f2229fe7c2dff5e8aa5cf0612ab987fd2b1a57e428923f", size = 111220, upload-time = "2026-05-06T13:04:03.667Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b3/bb/d71d6da82763528c2c2ed6b59a9d6142c6595545a4c448e2085d155e88c2/gguf-0.19.0-py3-none-any.whl", hash = "sha256:70bcd10edfe697fb2dad6e40af2234b9d8ece9a41a99761405121ebda1c3c1cd", size = 118475, upload-time = "2026-05-06T13:04:02.588Z" },
+]
+
+[[package]]
 name = "googleapis-common-protos"
 version = "1.75.4"
 source = { registry = "https://pypi.org/simple" }
@@ -2039,6 +2064,55 @@ wheels = [
 ]
 
 [[package]]
+name = "jax"
+version = "0.11.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "jaxlib", marker = "python_full_version >= '3.12' and sys_platform != 'darwin'" },
+    { name = "ml-dtypes", marker = "python_full_version >= '3.12' and sys_platform != 'darwin'" },
+    { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.12.*' and sys_platform != 'darwin'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' and sys_platform != 'darwin'" },
+    { name = "opt-einsum", marker = "python_full_version >= '3.12' and sys_platform != 'darwin'" },
+    { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12' and sys_platform != 'darwin'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/90/aa/c3b6ac3863a490661e255d2356802b54d57b533460fa221d30743d81a6c1/jax-0.11.1.tar.gz", hash = "sha256:43e0d45b1dac002eca04c2de73298395225dd0d4651e3f573a540eaa18abfd80", size = 2864119, upload-time = "2026-08-17T20:31:29.938Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8f/f4/5f9a286e1eeca9faa8b83885edccf63ab2f1b22e17f6a5ea66ac86b1afe4/jax-0.11.1-py3-none-any.whl", hash = "sha256:72ed60bf85a0b53d0f5b5cd61e37a8b25f369f6f88481feb98ab489894861a82", size = 3302513, upload-time = "2026-08-17T20:29:00.294Z" },
+]
+
+[package.optional-dependencies]
+tpu = [
+    { name = "jaxlib", marker = "python_full_version >= '3.12' and sys_platform != 'darwin'" },
+    { name = "libtpu", marker = "python_full_version >= '3.12' and sys_platform != 'darwin'" },
+    { name = "requests", marker = "python_full_version >= '3.12' and sys_platform != 'darwin'" },
+]
+
+[[package]]
+name = "jaxlib"
+version = "0.11.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "ml-dtypes", marker = "python_full_version >= '3.12' and sys_platform != 'darwin'" },
+    { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.12.*' and sys_platform != 'darwin'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' and sys_platform != 'darwin'" },
+    { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12' and sys_platform != 'darwin'" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/77/d9/26613efbc0e219ef16b6069c38378a9b360f85926573e1995c391e48d73e/jaxlib-0.11.1-cp312-cp312-manylinux_2_27_aarch64.whl", hash = "sha256:47bab3a7da8a818f9e7ddecd4ed815429caa2840eda9e968bb6d33b9d8c52067", size = 82772925, upload-time = "2026-08-17T20:30:11.388Z" },
+    { url = "https://files.pythonhosted.org/packages/05/41/07c259ea10a5eeb100a66222507e2ce3a01474fa8f13c250bf1a3559a5bb/jaxlib-0.11.1-cp312-cp312-manylinux_2_27_x86_64.whl", hash = "sha256:c3dcec3bb33ebf5c76dc33f962c796652c077edb246464fa32cb1d8fcb6087e6", size = 87903454, upload-time = "2026-08-17T20:30:14.889Z" },
+    { url = "https://files.pythonhosted.org/packages/a8/3c/5b0ce63c880d4f9cef492f04e11be7a60bdd3f529311839652b928e8b320/jaxlib-0.11.1-cp313-cp313-manylinux_2_27_aarch64.whl", hash = "sha256:3a679a49b8d329b6e431f3aeb666467c6efac750e3b2ee90d0e74efe7959e643", size = 82774089, upload-time = "2026-08-17T20:30:25.232Z" },
+    { url = "https://files.pythonhosted.org/packages/f5/28/ef1371618e784880e68c2ab5277d5ccbaf518a2a5ec9ec05ef90a9ee7d1b/jaxlib-0.11.1-cp313-cp313-manylinux_2_27_x86_64.whl", hash = "sha256:7ebe86a7b891fcda83e7f634a677d285681a7b80b3ec9ed435536078a8371acf", size = 87901562, upload-time = "2026-08-17T20:30:28.873Z" },
+    { url = "https://files.pythonhosted.org/packages/35/7f/263b873ed570567880e3ec2acb13eb5cf184972b5b79d883dbccc7d58c4a/jaxlib-0.11.1-cp314-cp314-manylinux_2_27_aarch64.whl", hash = "sha256:226616df027f1348da77764753c6c1e2f4d45b5551b67bcfdcafcf9cadf2e280", size = 82773791, upload-time = "2026-08-17T20:30:38.783Z" },
+    { url = "https://files.pythonhosted.org/packages/f7/a2/07dba61656a7fd3b0db734834158e9abcc56372592d9326cf39a72c36762/jaxlib-0.11.1-cp314-cp314-manylinux_2_27_x86_64.whl", hash = "sha256:739ead792ddb854cb3ca5decfe00aab08a731131ab2cbeed9b74f4545c92fd01", size = 87903999, upload-time = "2026-08-17T20:30:42.645Z" },
+    { url = "https://files.pythonhosted.org/packages/60/83/0eb0b2b7d9a32a742e351bf8f94663b3759408c579bd8964628fe9e0bcbe/jaxlib-0.11.1-cp314-cp314t-manylinux_2_27_aarch64.whl", hash = "sha256:f9fc4eccfb882eab746ac75862e82833eab1a72d864dcb20bdc83cdf295d81bd", size = 82866887, upload-time = "2026-08-17T20:30:53.518Z" },
+    { url = "https://files.pythonhosted.org/packages/d5/c6/d2e03edf89d577241aaa70a82a21a7e2474a113af4f7e5b2bccd65f72a2e/jaxlib-0.11.1-cp314-cp314t-manylinux_2_27_x86_64.whl", hash = "sha256:12803e2d6ca821d9f59aeb31ceaa6e49403aaeefbb62e3cba90e1ebcbe244209", size = 87999113, upload-time = "2026-08-17T20:30:57.474Z" },
+    { url = "https://files.pythonhosted.org/packages/d9/da/d73f62bc74692640e0d140db8964fa98a403686eb22c8d0810776e3a2e9e/jaxlib-0.11.1-cp315-cp315-manylinux_2_27_aarch64.whl", hash = "sha256:93c945387919ae27e1475b86802f72ec9f511f65ec74677b33ba47f895e51f9c", size = 82774506, upload-time = "2026-08-17T20:31:03.949Z" },
+    { url = "https://files.pythonhosted.org/packages/d9/c4/44e62769133051f37e12e33cf41e50c24c229c9378624c076edf53f8dd73/jaxlib-0.11.1-cp315-cp315-manylinux_2_27_x86_64.whl", hash = "sha256:b953f341c67d28f202b8af6dfaf9908281e2129ad9bc100454a9fdd2dae0b6f2", size = 87904049, upload-time = "2026-08-17T20:31:12.41Z" },
+    { url = "https://files.pythonhosted.org/packages/97/5b/819e20e911ba4eae21f96ec808a97605383d519d605276914a2b0fb8ef2a/jaxlib-0.11.1-cp315-cp315t-manylinux_2_27_aarch64.whl", hash = "sha256:3bce7f70714ed7e1967b9725e67c0aa3e111ca7e0dc7434c5d7d1e2047a8de26", size = 82868605, upload-time = "2026-08-17T20:31:23.805Z" },
+    { url = "https://files.pythonhosted.org/packages/8c/e7/9593d22d398b66dae5fab17f961ed16ce7acfe11425276a6d2a0200d97ff/jaxlib-0.11.1-cp315-cp315t-manylinux_2_27_x86_64.whl", hash = "sha256:a3064a14d47f03b777454667bc8bf0a7c2d506714fe108adacf734f63cd7a5ae", size = 87998599, upload-time = "2026-08-17T20:31:27.376Z" },
+]
+
+[[package]]
 name = "jinja2"
 version = "3.1.6"
 source = { registry = "https://pypi.org/simple" }
@@ -2220,6 +2294,20 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/af/60/bc7622aefb2aee1c0b4ba23c1446d3e30225c8770b38d7aedbfb65ca9d5a/lark-1.2.2.tar.gz", hash = "sha256:ca807d0162cd16cef15a8feecb862d7319e7a09bdb13aef927968e45040fed80", size = 252132, upload-time = "2024-08-13T19:49:00.652Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/2d/00/d90b10b962b4277f5e64a78b6609968859ff86889f5b898c1a778c06ec00/lark-1.2.2-py3-none-any.whl", hash = "sha256:c2276486b02f0f1b90be155f2c8ba4a8e194d42775786db622faccd652d8e80c", size = 111036, upload-time = "2024-08-13T19:48:58.603Z" },
+]
+
+[[package]]
+name = "libtpu"
+version = "0.0.46.3"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a7/e7/aa07dd6e07f23d9663933612358d14b9ce5ad6e98711007dd45a968eb13c/libtpu-0.0.46.3-cp311-cp311-manylinux_2_31_x86_64.whl", hash = "sha256:9c2fbb80127efd721fe329c6a83e41bbe81c9e04c8d319ffb039e03f413aa846", size = 216540182, upload-time = "2026-10-15T23:43:26.842Z" },
+    { url = "https://files.pythonhosted.org/packages/12/77/e98f9e31e735b0f6bc73e6c8f676da523a062a5baabbc6f96b505f1d48e5/libtpu-0.0.46.3-cp312-cp312-manylinux_2_31_x86_64.whl", hash = "sha256:0d42cb5fb58fda7bf132fbe678c115fdb49c77fcf22b713bc2e24688c124eafb", size = 216540223, upload-time = "2026-10-15T23:42:56.256Z" },
+    { url = "https://files.pythonhosted.org/packages/91/11/bdae0fb12c46b0632b56d52af05d859d20c21240b64bfc0292f055c70c8a/libtpu-0.0.46.3-cp313-cp313-manylinux_2_31_x86_64.whl", hash = "sha256:351432a7b4f6288354d68bb1d7414eee03f6790e9527084f99b1551232809c66", size = 216540327, upload-time = "2026-10-15T23:43:06.412Z" },
+    { url = "https://files.pythonhosted.org/packages/9a/16/2e0240b0028e2f8f08871adce473a1650d2f7b2051bbaee2c1f910b762ae/libtpu-0.0.46.3-cp314-cp314-manylinux_2_31_x86_64.whl", hash = "sha256:095e4489fa3bad90a4c639c781994d11e171349c737de821d7f39ac4f30bab3d", size = 216540078, upload-time = "2026-10-15T23:43:37.123Z" },
+    { url = "https://files.pythonhosted.org/packages/1e/ba/09f2afea4080215aa8da94bdca5a4082df09b1618c1373366f5059fa1dca/libtpu-0.0.46.3-cp314-cp314t-manylinux_2_31_x86_64.whl", hash = "sha256:41bec8966cf41212507d14607dc024b829aa84b7bf19dc0e1354561f1afa6742", size = 216541039, upload-time = "2026-10-15T23:43:16.305Z" },
+    { url = "https://files.pythonhosted.org/packages/dc/1f/b675d5ace163399f9e7026528d7bbaf7f0379e5ab68d460a61ef3b2855b7/libtpu-0.0.46.3-cp315-cp315-manylinux_2_31_x86_64.whl", hash = "sha256:43a67f801929b76f9352f8ea0b358fc10395025748463a7bd71a2a06bb487b3b", size = 216540117, upload-time = "2026-10-15T23:42:35.101Z" },
+    { url = "https://files.pythonhosted.org/packages/03/5a/d5c3fdfa526547c50716d487f7b6701ce6950f51720472f6474c3fd8d4f2/libtpu-0.0.46.3-cp315-cp315t-manylinux_2_31_x86_64.whl", hash = "sha256:7b7dbd1903d11da6946f49cd822ec1888ba62c1aa13598c412349b81747147f9", size = 216541094, upload-time = "2026-10-15T23:42:45.972Z" },
 ]
 
 [[package]]
@@ -3892,6 +3980,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/24/02/10aeacc37a38a3a8fa16ff67bec1ae3bf882539f6f9efb0f70acf802ca2d/opentelemetry_semantic_conventions_ai-0.5.1.tar.gz", hash = "sha256:153906200d8c1d2f8e09bd78dbef526916023de85ac3dab35912bfafb69ff04c", size = 26533, upload-time = "2026-03-26T14:20:38.73Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/55/22/41fb05f1dc5fda2c468e05a41814c20859016c85117b66c8a257cae814f6/opentelemetry_semantic_conventions_ai-0.5.1-py3-none-any.whl", hash = "sha256:25aeb22bd261543b4898a73824026d96770e5351209c7d07a0b1314762b1f6e4", size = 11250, upload-time = "2026-03-26T14:20:37.108Z" },
+]
+
+[[package]]
+name = "opt-einsum"
+version = "3.4.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/8c/b9/2ac072041e899a52f20cf9510850ff58295003aa75525e58343591b0cbfb/opt_einsum-3.4.0.tar.gz", hash = "sha256:96ca72f1b886d148241348783498194c577fa30a8faac108586b14f1ba4473ac", size = 63004, upload-time = "2024-09-26T14:33:24.483Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/23/cd/066e86230ae37ed0be70aae89aabf03ca8d9f39c8aea0dec8029455b5540/opt_einsum-3.4.0-py3-none-any.whl", hash = "sha256:69bb92469f86a1565195ece4ac0323943e83477171b91d24c35afe028a90d7cd", size = 71932, upload-time = "2024-09-26T14:33:23.039Z" },
 ]
 
 [[package]]

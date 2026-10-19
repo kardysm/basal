@@ -1,4 +1,4 @@
-# basal 2.1
+# basal 2.2
 
 [![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-basal--2.0%20models-yellow)](https://huggingface.co/collections/Remek/basal-20-6acd1712a8e443c86cd576fc)
 [![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-basal--omni--1.0%20models-yellow)](https://huggingface.co/collections/Remek/basal-omni-10-6acea28e8b5baed2db475c1f)
@@ -24,12 +24,45 @@ answers, and triage with a confidence threshold that sends uncertain cases to a 
 
 ## Contents
 
-- [What is new in basal 2.1](#what-is-new-in-basal-21) · [What is new in basal-2.0](#what-is-new-in-basal-20)
+- [What is new in basal 2.2](#what-is-new-in-basal-22) · [What is new in basal 2.1](#what-is-new-in-basal-21) ·
+  [What is new in basal-2.0](#what-is-new-in-basal-20)
 - [Models](#models) · [Results](#results)
 - [Quick start](#quick-start) · [API](#api)
 - [Images and audio: basal-omni](#images-and-audio-basal-omni-experimental) · [MCP for agents](#mcp-basal-as-a-tool-for-agents)
 - [Documentation](#documentation): install paths, serving, API reference, results, formats, hardware
-- [Limitations](#limitations) · [Previous releases](#previous-releases) · [Citation](#citation) · [License](#license)
+- [Limitations](#limitations) · [Previous releases](#previous-releases) · [Citation](#citation) ·
+  [Contributors](#contributors) · [License](#license)
+
+## What is new in basal 2.2
+
+- **Calibrate the model on your own data**, for every basal and basal-omni model: label a few hundred of your own
+  requests, run `basal-calibrate`, and serve the file it writes. The probabilities, and the `max_error` thresholds that
+  decide what may be automated, are then certified on your data, not ours. A hosted decision API cannot be recalibrated
+  on your data; a basal model can. Measured on a domain the model never saw, the shipped file's "1% error" setting would
+  have been wrong 8% of the time; after calibration the calibration error fell about 3.2 times for choice questions,
+  2 times for scores and 30% for yes / no, and nothing was automated above its target
+  ([the example](docs/CALIBRATION.md#example-a-new-domain-measured)).
+  ```bash
+  basal-calibrate my_labelled.jsonl --model Remek/basal-omni-1.0-max --mode eager    # writes CALIBRATION.custom.json
+  basal-serve --model Remek/basal-omni-1.0-max --mode eager --calibration CALIBRATION.custom.json
+  ```
+- New in 2.2: the task types' `automated` flag (`classify`, `verify`, and now `extract`) is certified from your
+  labelled task questions; a few dozen labels already move the temperatures; the report shows how the shipped file
+  does on your data, as served; `--report-only`; a calibration file knows the model it was fitted on.
+  [docs/CALIBRATION.md](docs/CALIBRATION.md)
+- **basal-omni on llama.cpp, Ollama and Apple Silicon** (text only): `--mode gguf` runs a GGUF conversion of
+  basal-omni-1.0 through llama.cpp (Metal, CUDA or CPU) and `--mode mlx` / `mlx-q8` the bf16 weights through mlx-lm.
+  New model repositories for basal-omni-1.0-mini and -max: **`-GGUF`** (Q8_0 and Q6_K, with a calibration fitted on
+  Q8_0) and **`-FP8`** (`--mode vllm`); 8-bit **`-MLX`** ports (`--mode mlx`) of 1.0-mini, 1.0-max and 1.1-max.
+  [docs/OMNI.md](docs/OMNI.md#gguf-llamacpp-ollama-and-mlx-text)
+- **From the community:** `basal-export-gguf` writes or repairs GGUF files so that llama.cpp and Ollama tokenize like
+  the Hugging Face tokenizer (Piotr Durlej, #8); two experimental, community-maintained engines for basal-1.5 /
+  basal-2.0: `--mode tpu` on Google TPU (Kuba Sołtys, #15) and `--mode strix` on AMD Strix Halo (Michał Kardyś, #14);
+  `basal-viz`, a local page that shows every step of a decision (@lukaspoloki, #2,
+  [SERVING.md](docs/SERVING.md#see-how-a-decision-is-made)). [Contributors](#contributors)
+
+Full list: [docs/WHATS_NEW.md](docs/WHATS_NEW.md) and the
+[release notes](https://github.com/rkinas/basal/releases/tag/v2.2.0).
 
 ## What is new in basal 2.1
 
@@ -82,13 +115,16 @@ Full list: [docs/WHATS_NEW.md](docs/WHATS_NEW.md) and the [release notes](https:
 
 | model | params | use | Hugging Face |
 |---|---|---|---|
-| **basal-omni-1.0-mini** | 4B (Gemma 4 E4B) | decisions about text, images and audio; about 16 GB of GPU memory | [`Remek/basal-omni-1.0-mini`](https://huggingface.co/Remek/basal-omni-1.0-mini) |
-| **basal-omni-1.0-max** | 12B | the default 12B model (Werdykt 0.823); text, images and audio; about 24 GB of GPU memory | [`Remek/basal-omni-1.0-max`](https://huggingface.co/Remek/basal-omni-1.0-max) |
-| **basal-omni-1.1-max** | 12B | *experimental task model*: better on `classify`, `verify`, `compress` and `extract`, slightly behind 1.0-max on general decisions (Werdykt 0.821) | [`Remek/basal-omni-1.1-max`](https://huggingface.co/Remek/basal-omni-1.1-max) (from Sat 17 Oct, 09:00 CEST) |
-| **basal-omni-1.0-ultra** | 31B (Gemma 4 31B) | highest Werdykt score of the basal models (0.879); text and images (no audio); 59 GB of bf16 weights | [`Remek/basal-omni-1.0-ultra`](https://huggingface.co/Remek/basal-omni-1.0-ultra) · [`-FP8`](https://huggingface.co/Remek/basal-omni-1.0-ultra-FP8) (from Sat 17 Oct, 09:00 CEST) |
+| **basal-omni-1.0-mini** | 4B (Gemma 4 E4B) | decisions about text, images and audio; about 16 GB of GPU memory | [`Remek/basal-omni-1.0-mini`](https://huggingface.co/Remek/basal-omni-1.0-mini) · [`-FP8`](https://huggingface.co/Remek/basal-omni-1.0-mini-FP8) · [`-GGUF`](https://huggingface.co/Remek/basal-omni-1.0-mini-GGUF) · [`-MLX`](https://huggingface.co/Remek/basal-omni-1.0-mini-MLX) |
+| **basal-omni-1.0-max** | 12B | the default 12B model (Werdykt 0.823); text, images and audio; about 24 GB of GPU memory | [`Remek/basal-omni-1.0-max`](https://huggingface.co/Remek/basal-omni-1.0-max) · [`-FP8`](https://huggingface.co/Remek/basal-omni-1.0-max-FP8) · [`-GGUF`](https://huggingface.co/Remek/basal-omni-1.0-max-GGUF) · [`-MLX`](https://huggingface.co/Remek/basal-omni-1.0-max-MLX) |
+| **basal-omni-1.1-max** | 12B | *experimental task model*: better on `classify`, `verify`, `compress` and `extract`, slightly behind 1.0-max on general decisions (Werdykt 0.821) | [`Remek/basal-omni-1.1-max`](https://huggingface.co/Remek/basal-omni-1.1-max) · [`-MLX`](https://huggingface.co/Remek/basal-omni-1.1-max-MLX) |
+| **basal-omni-1.0-ultra** | 31B (Gemma 4 31B) | highest Werdykt score of the basal models (0.879); text and images (no audio); 59 GB of bf16 weights | [`Remek/basal-omni-1.0-ultra`](https://huggingface.co/Remek/basal-omni-1.0-ultra) · [`-FP8`](https://huggingface.co/Remek/basal-omni-1.0-ultra-FP8) |
 
 - bf16 weights, served by `basal-serve --mode eager` on an NVIDIA GPU (`--media on` for images and audio).
-  `basal-omni-1.0-ultra-FP8` (33 GB) is served by `--mode vllm`, text only.
+  The `-FP8` checkpoints (mini 12 GB, max 14 GB, ultra 33 GB) are served by `--mode vllm`, text only, each with its own
+  calibration (`CALIBRATION.vllm.json`). The `-GGUF` files (Q8_0 and Q6_K, mini and max) are served by `--mode gguf`
+  (llama.cpp, with `CALIBRATION.gguf.json`) or in front of Ollama, text only. The `-MLX` ports (8-bit; 1.0-mini, 1.0-max
+  and 1.1-max) are served by `--mode mlx` on Apple Silicon, text only, with `CALIBRATION.mlx.json`.
 - All models are fine-tuned from Apache-2.0 base models (Bielik v3 for basal-2.0, Gemma 4 for basal-omni; see
   [NOTICE](NOTICE)) and released under Apache-2.0.
 
@@ -121,7 +157,7 @@ NVIDIA GPU, with [uv](https://docs.astral.sh/uv/) in a fresh environment:
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-env && source ~/basal-env/bin/activate
 uv pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
-uv pip install "basal[fp8] @ https://github.com/rkinas/basal/archive/refs/tags/v2.1.0.tar.gz"
+uv pip install "basal[fp8] @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"
 basal-serve --model Remek/basal-2.0-4.5B --mode fast --template-prefix off --port 8000
 ```
 
@@ -134,7 +170,7 @@ Apple Silicon:
 
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-mlx && source ~/basal-mlx/bin/activate
-uv pip install "basal[mlx] @ https://github.com/rkinas/basal/archive/refs/tags/v2.1.0.tar.gz"
+uv pip install "basal[mlx] @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"
 basal-serve --model Remek/basal-2.0-4.5B-MLX-8bit --mode mlx --port 8000
 ```
 
@@ -200,7 +236,7 @@ The basal-omni models answer the same questions, and with `--media on` a request
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-env && source ~/basal-env/bin/activate
 uv pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
-uv pip install "basal[media] @ https://github.com/rkinas/basal/archive/refs/tags/v2.1.0.tar.gz"
+uv pip install "basal[media] @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"
 basal-serve --model Remek/basal-omni-1.0-mini --mode eager --media on --port 8000   # or Remek/basal-omni-1.0-max
 ```
 
@@ -216,7 +252,7 @@ calibration, so validate them on your own media. Request format and limits:
 `decide_many`; `basal-mcp` is a stdio bridge for hosts that start local processes.
 
 ```bash
-uv pip install "basal[fp8,mcp] @ https://github.com/rkinas/basal/archive/refs/tags/v2.1.0.tar.gz"
+uv pip install "basal[fp8,mcp] @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"
 basal-serve --model Remek/basal-2.0-4.5B --mode fast --template-prefix off --host 127.0.0.1 --port 8000 --mcp on
 claude mcp add --transport http basal http://127.0.0.1:8000/mcp     # Claude Code; other hosts take the same URL
 ```
@@ -312,6 +348,29 @@ basal-omni-1.0 (text, images and audio):
   url     = {https://huggingface.co/collections/Remek/basal-omni-10-6acea28e8b5baed2db475c1f}
 }
 ```
+
+## Contributors
+
+Thank you to the people whose work is in this repository, by pull request:
+
+- Paweł Kiszczak ([@pawelkiszczak](https://github.com/pawelkiszczak)): the Apple Silicon engines `--mode mlx` /
+  `mlx-q8` and `--mode mps`, the in-process GGUF engine `--mode gguf` (llama-cpp-python) and `--mode ollama`, and the
+  comparison of Apple Silicon engines and quantised formats (MLX, oMLX oQ, GGUF) with its figures in
+  [HARDWARE.md](docs/HARDWARE.md#apple-silicon) ([#4](https://github.com/rkinas/basal/pull/4)).
+- Piotr Durlej ([@pdurlej](https://github.com/pdurlej)): `basal-export-gguf`, which converts a basal model to GGUF, or
+  repairs an existing GGUF file, so that its tokenizer matches the Hugging Face one, as in the official `-GGUF` files
+  ([#8](https://github.com/rkinas/basal/pull/8)).
+- Kuba Sołtys ([@qooba](https://github.com/qooba)): the experimental Google TPU engine `--mode tpu` in JAX / XLA, with
+  its Colab notebook ([#15](https://github.com/rkinas/basal/pull/15)).
+- Michał Kardyś ([@kardysm](https://github.com/kardysm)): the experimental `--mode strix`, a basal-1.5 / basal-2.0
+  forward with Triton kernels for AMD Strix Halo, and its benchmarks
+  ([#14](https://github.com/rkinas/basal/pull/14)).
+- [@lukaspoloki](https://github.com/lukaspoloki): `basal-viz`, a local page that shows every step of a decision, from
+  the prompt to the per-layer readout, the calibration and the decision
+  ([#2](https://github.com/rkinas/basal/pull/2)).
+
+`--mode tpu` and `--mode strix` are community-maintained: their numbers in [HARDWARE.md](docs/HARDWARE.md) are the
+contributors' own measurements.
 
 ## License
 

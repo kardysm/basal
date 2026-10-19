@@ -1,5 +1,6 @@
 """`--mode strix`: a basal-1.5 / basal-2.0 forward written for AMD Strix Halo (Radeon 8060S, gfx1151, ROCm), with
-Triton kernels where the stock ones fall short on this GPU. Speeds at ~6k tokens:
+Triton kernels where the stock ones fall short on this GPU (docs/benchmarks/STRIX_HALO.md, "--mode strix"). Speeds at
+~6k tokens:
 
   attention   flash attention over the packed prefix trie, GQA-packed (the query heads of a kv head share each key /
               value tile). GraphBackend's block mask becomes an interval per key: depth-first packing puts every
@@ -214,7 +215,10 @@ class StrixHaloFastBackend(GraphBackend):
     def unsupported(cls, cfg):
         """What in a model config the kernels cannot run (empty: supported). Every tile config must divide its
         projection (the matmuls have no column or depth masks), tl.arange needs power-of-two extents (head size, query
-        heads per kv head, hidden size), and the rotary tables are computed once at start-up."""
+        heads per kv head, hidden size), and the rotary tables are computed once at start-up. The forward is Llama's
+        (basal-1.5, basal-2.0): other architectures (basal-omni is Gemma 4) are refused before their shapes are read."""
+        if getattr(cfg, "model_type", None) != "llama":
+            return [f"model type {getattr(cfg, 'model_type', None)} (Llama only: basal-1.5, basal-2.0)"]
         H, KV = cfg.num_attention_heads, cfg.num_key_value_heads
         D = getattr(cfg, "head_dim", None) or cfg.hidden_size // H
         hidden, inter = cfg.hidden_size, cfg.intermediate_size
@@ -254,11 +258,11 @@ class StrixHaloFastBackend(GraphBackend):
         self.shared = True
         self._wrows = {}
         cfg = self.model.config
+        if problems := self.unsupported(cfg):
+            raise ValueError("--mode strix cannot run this model: " + "; ".join(problems))
         self.H, self.KV = cfg.num_attention_heads, cfg.num_key_value_heads
         self.D = getattr(cfg, "head_dim", None) or cfg.hidden_size // self.H
         self.hidden, self.eps = cfg.hidden_size, cfg.rms_norm_eps
-        if problems := self.unsupported(cfg):
-            raise ValueError("--mode strix cannot run this model: " + "; ".join(problems))
         m = self.model.model
         self.layers = []
         for layer in m.layers:

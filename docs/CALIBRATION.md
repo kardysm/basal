@@ -33,6 +33,11 @@ answer `"calibration": "unvalidated"`. A format-2 model may ship an optional `CA
 
 - `--targets 0.01,0.05`: any `max_error` values.
 - `--min-per-type 50`.
+- `--min-blend 10`: a type (or option-count bucket) with fewer FIT decisions than `--min-per-type` but at least this
+  many gets its fitted temperature blended with the shipped one (below). `0` keeps the shipped one, as before 2.2.
+- `--report-only`: print the report on your labelled requests (accuracy, ECE, the thresholds, the share automated,
+  and how the compared file does on them) without writing a file. Use it to evaluate a model, or a calibration file
+  given with `--calibration`, on your own data.
 - `--out`.
 - `--calibration FILE`: the file to compare with. By default it is the one `basal-serve` would load.
 - `--no-calibration`.
@@ -42,7 +47,8 @@ answer `"calibration": "unvalidated"`. A format-2 model may ship an optional `CA
   written. Use it in CI.
 - `--min-family 30`: the CERT decisions of a type that a family needs for its own ECE.
 - `--min-per-set 30`: the FIT questions that a label set needs before its `fallback_threshold` is fitted.
-- `--save-rows FILE`: also write the uncalibrated probabilities of every decision.
+- `--save-rows FILE`: also write the uncalibrated probabilities of every decision (decision questions only: task
+  answers depend on the served temperatures, so their thresholds are fitted with the engine).
 - `--from-rows`: the input is such a file, and the fit runs again without a model, for example after a change of
   `--targets`, `--min-family` or `--reference`.
 
@@ -69,6 +75,15 @@ One `/v1/systemone` request per line; every question carries its correct answer 
 | `family` | optional, on the line or on a question: the task family of the leave-one-family-out ECE (one kind of decision: a routing question, a document check); default: the question name |
 | `id` | optional, used in messages |
 
+Task questions (`classify`, `verify`, `extract`, see [TASKS.md](TASKS.md)) carry `"gold"` too, and certify the
+`automated` flag of their answers ([below](#tasks-classify-verify-extract)):
+
+| task | `gold` |
+|---|---|
+| `classify` (one label) | a label key; `"none"` when the question has `"none": true` |
+| `verify` | `{claim key: verdict}`, or a list in the order of the claims; `supported` / `contradicted` / `not_stated` (`binary: true`: `supported` / `not_supported`, or `true` / `false`); `null` = not labelled |
+| `extract` | the field values, nested as in the schema; `null` = not stated in the document; a field left out is not labelled |
+
 Send the requests exactly as in production: the same `option_keys`, `facts` and language of the state. The simple
 items of `basal-run` and `basal-bench` (`{"state", "question", "options", "type", "gold": <index>}`) are accepted
 too. Every problem in the file is reported with its line before any model is loaded.
@@ -80,13 +95,19 @@ The shipped files were fitted with the same steps:
 1. The decisions are split by a hash of their group into FIT (70%) and CERT (30%).
 2. One temperature per type (`choice`, `noul`, `score`) minimises the negative log-likelihood of the served
    prediction (as the server answers: both option orders averaged, or one order) on FIT. A type with fewer than
-   `--min-per-type` FIT decisions keeps the shipped temperature, and the table says so.
+   `--min-per-type` FIT decisions but at least `--min-blend` (10) gets the fitted temperature blended with the shipped
+   one in log space, in proportion *n* / `--min-per-type` (20 FIT decisions of 50: 40% fitted, 60% shipped), so a few
+   dozen labels already move it and the full fit takes over smoothly at `--min-per-type`. With fewer it keeps the
+   shipped temperature. The table says which (`(blended)`, `(kept)`).
    For prompt-format-2 models (see [FORMATS.md](FORMATS.md)) `choice` also gets a temperature per option-count bucket
    (2–10, 11–26, 27–255 options), fitted the same way where FIT has at least `--min-per-type` decisions in the bucket;
    a bucket with fewer keeps the shipped bucket temperature, else the type temperature applies to it.
 3. For each target error *r*, the threshold is the lowest confidence whose accepted FIT decisions have a one-sided 95%
    Clopper–Pearson upper bound ≤ *r*, scanned from the most confident decision down (at least 50 accepted; equal
    confidences are accepted or refused together). The candidates are the observed confidences, never a fixed grid.
+   A looser target never keeps a stricter threshold than a tighter one: a confidence certified at 1% is certified at
+   5% too, so where the 5% scan stops above the 1% threshold (it can pass early on a few very confident decisions
+   and stop on an error just below them), the 5% threshold is the 1% one, marked `floored_from`.
    - It is certified per question type (`thresholds[r].per_type`). A temperature preserves the order of a type's
      yes/no confidences (and, up to ties, its other confidences), so a type's certified coverage does not depend on
      its temperature.
@@ -149,9 +170,69 @@ label set and fallback and no `fallback_threshold` of its own. An explicit value
 A label set with fewer than `--min-per-set` FIT questions is reported, not written. `multi` questions do not enter
 the temperatures: to calibrate the labels themselves, ask each one as a `noul` question with its gold.
 
+## Example: a new domain, measured
+
+basal-omni-1.0-mini (`--mode eager`, bf16, one option order) on
+[LocalLLaMA/typed-decisions](https://huggingface.co/datasets/LocalLLaMA/typed-decisions) (Apache-2.0: synthetic
+decisions over JSON records in four workflows, gold labels from a teacher model), a domain the model was not trained or
+calibrated on. Calibrated on the train split (3,958 labelled decisions in 800 requests, plus 596 `classify` and 1,600
+`verify` task decisions), measured on the CERT part of the test split (172 choice, 184 yes/no and 237 score decisions),
+engine 2.2, 16 Oct 2026:
+
+| on the test split | shipped `CALIBRATION.json` | fitted on the train split |
+|---|---|---|
+| ECE, choice / yes-no / score | 0.268 / 0.106 / 0.104 | **0.083 / 0.073 / 0.052** |
+| `max_error: 0.01`: automated, and its error | 12.6%, **8.0% wrong** | 0% (nothing certifiable) |
+| `max_error: 0.05`: automated, and its error | 54.3%, **21.4% wrong** | 3.7%, 0.0% wrong |
+| `verify` claims at `max_error: 0.01` | no task threshold | 54.8% automated, 0 wrong (bound 1.1%) |
+
+The shipped file's certificate holds on our calibration data, not on this domain: here its 1% setting would automate one
+decision in eight at 8% error. Fitted on the user's labels, the temperatures rise (choice 1.14 → 2.52, yes / no 1.21 →
+2.03, score 1.41 → 1.78: the model is overconfident on these records), the calibration error falls by type (choice 0.268
+→ 0.083, about 3.2 times; score 0.104 → 0.052, half; yes / no 0.106 → 0.073, about 30% lower), and the thresholds
+certify only what the model gets right here (accuracy 0.57 / 0.80 / 0.67, against noisy teacher labels): almost nothing
+is automated, which is the right answer for a model this inaccurate on this data. On `verify`, where it is 95% accurate,
+the 1% threshold fitted on the train split automates over half of the test claims (54.8%) with none wrong; the one-sided
+95% bound on its error is 1.1%. A hosted decision API offers no such step: its confidence is what it is on your data.
+
+## Tasks: classify, verify, extract
+
+A task answer reports `automated[max_error]` only with a threshold certified for that task (`task_thresholds` in the
+calibration file): the thresholds of the decision types do not hold on new label sets. `basal-calibrate` fits them
+from labelled task questions, one threshold per task and target, by the same bound as the decision types (step 3
+above): every `classify` answer, every `verify` claim and every `extract` field is one decision, split into FIT and
+CERT by group. The table:
+
+```
+task          n   FIT  CERT  accuracy   max_error  threshold  automated   error   bound   (automated share, error and bound on CERT)
+classify    ...
+```
+
+- The thresholds are certified on the task answers **as served with the new file's temperatures**, so task questions
+  need the engine in process (`--model`, `--mode`, ...; not `--url`). The task requests run after the decision fit,
+  with its temperatures.
+- A file with **task questions only** keeps the decision calibration of the file it compares with (temperatures,
+  thresholds, `multi`) and adds the task thresholds. It also keeps that file's thresholds of other tasks, which hold
+  because the temperatures are unchanged; the report then measures that file's task thresholds on your CERT decisions,
+  next to the fitted ones.
+- A file that refits the temperatures (decision questions in the input) leaves out the compared file's thresholds of
+  tasks without labelled questions, and warns: they were certified with other temperatures.
+- Not certified: `compress` (no `automated` flag), multi-label `classify` (it reports `set_confidence`), arrays of enum
+  values in `extract`. An `extract` number that does not parse reports `automated: false`.
+
+## Which model a file belongs to
+
+The probabilities, and so the temperatures and thresholds, belong to one model. `fitted_on` records the model as given
+to `basal-calibrate` and, for a Hugging Face model, its revision (commit). `basal-serve --calibration FILE` compares
+them with the served model: on another model, or another revision, it warns at start-up and reports
+`"calibration_warning"` in `GET /v1/models`; with `--strict-calibration` it refuses to start. A local copy of a model
+matches its Hugging Face name by the last part of the path (`/data/basal-omni-1.0-max` = `Remek/basal-omni-1.0-max`).
+The files that ship in a model's directory are not checked.
+
 ## How many items
 
-A few hundred labelled decisions usually certify the 5% target. The 1% target needs at least 299 accepted FIT
+For the **temperatures**, a few dozen labelled decisions of a type already help (`--min-blend`, above); 50 FIT
+decisions, about 72 labelled ones, fit it fully. For the **thresholds**, a few hundred labelled decisions usually certify the 5% target. The 1% target needs at least 299 accepted FIT
 decisions without an error (more with any error), so in practice about 1,000 items or more. With fewer, use the
 refitted temperatures and the 5% threshold, or route uncertain cases to a person. When no confidence meets a bound,
 the type's entry has `"confidence": null` and a `reason` for that target; `act` and `tool` questions of that type
@@ -165,8 +246,11 @@ decisions it warns that the bounds are loose.
 informational pooled `thresholds[<target>].confidence`) plus
 `temperature_source`, the FIT and CERT figures of each threshold, `engine` (the engine it was fitted on: `fast`,
 `fp8`, `vllm`, ...; serve it with that engine, or ship it as `CALIBRATION.<engine>.json`) and `fitted_on` (file,
-number of decisions and requests, FIT / CERT sizes, date, model, engine). It also has `gates` (`ece_lofo`,
-`automated_at`, `ece_reference`) and, from labelled `multi` questions, `multi`. For a prompt-format-2 model it is
+number of decisions and requests, FIT / CERT sizes, date, model and its revision, engine; with task questions the
+task decisions per task). It also has `gates` (`ece_lofo`, `automated_at`, `ece_reference`), from labelled `multi`
+questions `multi`, and from task questions `task_thresholds` (what basal-serve applies) and `task_gates` (their FIT
+and CERT figures). A file fitted on task questions only says where its decision calibration comes from in
+`decision_calibration`. For a prompt-format-2 model it is
 calibration file 2: `"prompt": 2` and `temperature_per_bucket` (the table then has one row per bucket under `choice`);
 basal-serve refuses a file fitted for another prompt format than the model's. The table printed at the end:
 
@@ -177,12 +261,22 @@ choice    ...
 max_error on CERT   shipped: threshold  coverage   error   fitted: threshold  coverage   error   bound
 0.01      ...
 0.05      ...
+(one threshold pooled over the types, informational: basal-serve applies each type's own, as in "automated on CERT" below)
 
 LOFO ECE on CERT    families    mean   floor   max (family)                pooled  reference
 choice    ...
 
-automated at   max_error 0.01: ...% of CERT decisions   max_error 0.05: ...% of CERT decisions
+automated on CERT   per-type thresholds   error   pooled (not applied)   compared file, as served
+max_error 0.01      ...
+max_error 0.05      ...
+
+task          n   FIT  CERT  accuracy   max_error  threshold  automated   error   bound
+classify  ...
 ```
+
+"compared file, as served" is the share of your CERT decisions the compared file (the shipped one by default, or
+`--calibration FILE`) automates at each target and their error, each type at the threshold basal-serve applies to it:
+how the file you would otherwise serve does on your data.
 
 *ECE* is the expected calibration error of the top answer (10 bins); *bound* is the one-sided 95% upper bound of the
 error on CERT.

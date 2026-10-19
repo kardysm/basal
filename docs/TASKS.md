@@ -41,7 +41,8 @@ same answer there reads `"automated": {"0.01": null, "0.05": true}`.)
   (`threshold`, `min`, `max`, `objective` apply).
 - `automated[max_error]`: the confidence is at or above a threshold certified **for this task** at that error rate, so
   the answer may be used without review; `null` when the calibration file has none (`"task_thresholds": {"classify":
-  {"0.01": 0.97}}`, fitted on your own labelled decisions). The thresholds of the decision types are not used: they do
+  {"0.01": 0.97}}`; `basal-calibrate` fits them from your labelled task questions, see
+  [CALIBRATION.md](CALIBRATION.md#tasks-classify-verify-extract)). The thresholds of the decision types are not used: they do
   not hold on new label sets (see [Results](#results)). `max_error` sets the rates (default 0.01 and 0.05).
 - `classify` is `choice` (one label, probabilities sum to 1) or `multi` (independent labels) with a classification
   wording; use those types directly for full control.
@@ -63,6 +64,7 @@ same answer there reads `"automated": {"0.01": null, "0.05": true}`.)
 ```
 
 - Each claim is a three-way decision over the shared state; `binary: true` asks only "supported or not".
+- `automated[max_error]` per claim, with a threshold certified for `verify` (as for `classify`).
 - Typical uses: check fields that another system (or `extract`) produced, check an LLM's answer or summary sentence by
   sentence against its source before it is used, check a document against stated facts.
 
@@ -105,7 +107,8 @@ same answer there reads `"automated": {"0.01": null, "0.05": true}`.)
           "payment_method": "transfer", "seller": {"name": "Med Energia Sp. z o.o.", "tax_id": "5251234567"}},
  "fields": {"invoice_number": {"value": "FV/309/02/2026", "text": "FV/309/02/2026", "start": 15, "end": 29,
                                "present_probability": 0.99, "line_probability": 0.99, "span_probability": 0.97,
-                               "confidence": 0.96, "source": "span", "calibration": "per decision"}, ...},
+                               "confidence": 0.96, "automated": {"0.01": null, "0.05": null}, "source": "span",
+                               "calibration": "per decision"}, ...},
  "experimental": true}
 ```
 
@@ -116,7 +119,11 @@ same answer there reads `"automated": {"0.01": null, "0.05": true}`.)
   (a `choice` over the line's candidate spans: the parts between separators, the part after a colon, and runs of
   words). A value is therefore always exact text of the document, with `start` / `end` character offsets. Numbers are
   parsed from the span (`1 234,56` and `1,234.56`). All fields of a request are answered in two packed rounds.
-- `confidence` of a text field = P(line) × P(span); each factor is a calibrated decision, the product is not certified.
+- `confidence` of a text field = P(line) × P(span); each factor is a calibrated decision.
+- `automated[max_error]` per field (2.2), with a threshold certified for `extract` (fitted on the fields of your
+  labelled extract questions, see [CALIBRATION.md](CALIBRATION.md#tasks-classify-verify-extract)); `null` without one
+  and for arrays of enum values; `false` for a number that does not parse. `max_error` sets the rates, as for
+  `classify`.
 - Not supported yet: arrays of strings or objects (line items), text fields from images (enum and boolean fields work
   with media).
 

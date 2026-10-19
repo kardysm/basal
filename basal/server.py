@@ -54,7 +54,7 @@ from .tools import answer as tool_answer
 from .tools import parse as parse_tools
 from .tools import set_answer as tool_set_answer
 
-RELEASE_DATE = "2026-10-17"  # the engine's release date (GET /v1/models), not the served model's
+RELEASE_DATE = "2026-10-19"  # the engine's release date (GET /v1/models), not the served model's
 
 MODES = {
     # mode: (backend, quantisation, compile)
@@ -73,11 +73,13 @@ MODES = {
     "strix": ("strix", None, False),       # AMD Strix Halo: Triton attention / FFN kernels, one sequence per chunk
     "ollama": ("ollama", None, False),      # Ollama with the GGUF exports (1.5); --ollama-url, --ollama-model
     "llamacpp": ("llamacpp", None, False),  # llama.cpp server with the GGUF exports (1.5); --llamacpp-url
+    "tpu": ("tpu", None, False),            # Google TPU (experimental, basal[tpu]): JAX / XLA, SOAM, one program per shape
 }
 
 
 def default_mode():
-    """fast on CUDA, mlx on Apple Silicon when mlx and mlx-lm are installed, mps otherwise there, else eager."""
+    """fast on CUDA, mlx on Apple Silicon when mlx and mlx-lm are installed, mps otherwise there, tpu on a TPU VM
+    with basal[tpu] installed, else eager."""
     if torch.cuda.is_available():
         return "fast"
     if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
@@ -87,6 +89,9 @@ def default_mode():
             return "mlx"
         except ImportError:
             return "mps"
+    from .tpu import tpu_available
+    if tpu_available():
+        return "tpu"
     return "eager"
 
 
@@ -331,10 +336,10 @@ def calibration_name(kind, quant):
     and the engines other than the basal bf16 path; None = CALIBRATION.json."""
     if kind in ("graph", "exit") and quant in ("fp8", "nvfp4"):
         return quant
-    return kind if kind in ("vllm", "sglang", "mlx", "ollama", "llamacpp") else None
+    return kind if kind in ("vllm", "sglang", "mlx", "gguf", "ollama", "llamacpp", "tpu") else None
 
 
-DETERMINISTIC_KINDS = ("graph", "exit", "eager", "mps", "mlx", "gguf", "strix")  # engines that run in this process
+DETERMINISTIC_KINDS = ("graph", "exit", "eager", "mps", "mlx", "gguf", "strix", "tpu")  # engines that run in this process
 
 
 def deterministic_setup(kind):
@@ -343,8 +348,8 @@ def deterministic_setup(kind):
     before the first cuBLAS call (the workspace setting is read when the handle is created)."""
     if kind not in DETERMINISTIC_KINDS:
         raise SystemExit("--deterministic needs an engine that runs in this process (fast, fast-nocompile, fast-exit, "
-                         "fp8, nvfp4, eager, mps, mlx, gguf, strix); vLLM, SGLang, Ollama and llama.cpp server batch "
-                         "requests their own way")
+                         "fp8, nvfp4, eager, mps, mlx, gguf, strix, tpu); vLLM, SGLang, Ollama and llama.cpp server "
+                         "batch requests their own way")
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     torch.use_deterministic_algorithms(True)
     torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark = True, False
@@ -470,10 +475,11 @@ def orders_for(orders, k):
     return 1
 
 
-def models_payload(name, mode, policies, temperatures=None, prompt_format=None, orders=None, media=()):
+def models_payload(name, mode, policies, temperatures=None, prompt_format=None, orders=None, media=(),
+                   calibration_warning=None):
     """GET /v1/models in the official ModelMetadataList shape, plus the serving mode, early-exit levels, the
     temperatures in use ({} = uncalibrated probabilities, what basal-calibrate needs from a running server), the
-    model's prompt format and the option orders served."""
+    model's prompt format, the option orders served and why the --calibration file may not belong to the model."""
     entry = {"name": name, "release_date": RELEASE_DATE,
              "description": "basal typed-decision model (choice / noul / score / act / multi / tool), Polish and "
                             "English",
@@ -484,6 +490,8 @@ def models_payload(name, mode, policies, temperatures=None, prompt_format=None, 
         entry["media"] = list(media)
     if orders is not None:
         entry["orders"] = orders
+    if calibration_warning:
+        entry["calibration_warning"] = calibration_warning
     return {"models": [entry]}
 
 
@@ -496,12 +504,36 @@ def calibration_orders(cal):
     return None if o is None else o if o == "auto" or str(o).startswith("2le") else int(o)
 
 
+def model_identity(name, md):
+    """(model, revision) of a served model: the repo id and commit of a Hugging Face cache snapshot, else the name as
+    given and no revision."""
+    p = Path(md) if md is not None else None
+    if p is not None and p.parent.name == "snapshots" and p.parent.parent.name.startswith("models--"):
+        return p.parent.parent.name[len("models--"):].replace("--", "/"), p.name
+    return str(name), None
+
+
+def calibration_mismatch(cal, name, md):
+    """Why a file written by basal-calibrate for another model, or for another revision of this one, does not belong
+    to the served model; None when it does or the file does not say (files that ship with a model)."""
+    fitted = cal.get("fitted_on")
+    if not isinstance(fitted, dict) or not fitted.get("model"):
+        return None
+    model, rev = model_identity(name, md)
+    key = lambda s: str(s).rstrip("/").split("/")[-1].lower()  # a repo id, a local copy or a served name
+    if key(fitted["model"]) != key(model):
+        return f"it was fitted on {fitted['model']}, the served model is {model}"
+    if fitted.get("revision") and rev and fitted["revision"] != rev:
+        return f"it was fitted on revision {fitted['revision'][:12]} of {model}, the served revision is {rev[:12]}"
+    return None
+
+
 def load_calibration(md, kind, path, quant, orders, off=False):
     """The calibration basal-serve applies -> (calibration dict, its file, None or why it is unvalidated). A file
     fitted on other option orders than the served ones gives wrong temperatures and thresholds: the file for the
     served orders, CALIBRATION[.<engine>].o<orders>.json, is used when the model ships one; otherwise the file is kept
-    for its temperatures without its thresholds and fitted fallback thresholds (max_error defers), and the answers
-    are marked unvalidated. An explicit --calibration file is not replaced."""
+    for its temperatures without its thresholds, fitted fallback thresholds and task thresholds (max_error defers,
+    tasks report automated: null), and the answers are marked unvalidated. An explicit --calibration file is not replaced."""
     cal = calibration_file(md, kind, path, quant)
     data = {} if off or not cal.exists() else json.loads(cal.read_text())
     fitted = calibration_orders(data)
@@ -512,7 +544,7 @@ def load_calibration(md, kind, path, quant, orders, off=False):
     if fitted is None or fitted == orders:
         return data, cal, None
     why = f"{cal.name} was fitted on {fitted} option order(s), served with {orders}"
-    return {k: v for k, v in data.items() if k not in ("thresholds", "multi")}, cal, why
+    return {k: v for k, v in data.items() if k not in ("thresholds", "multi", "task_thresholds")}, cal, why
 
 
 def calibration_file(md, kind, path=None, quant=None):
@@ -613,6 +645,9 @@ class Server:
             self.backend = OllamaBackend(md, a.ollama_url, a.ollama_model, parallel=a.http_parallel)
         elif kind == "llamacpp":
             self.backend = LlamaCppBackend(md, a.llamacpp_url, parallel=a.http_parallel)
+        elif kind == "tpu":
+            from .tpu import TPUBackend
+            self.backend = TPUBackend(md, a.dtype, shared=shared, max_len=a.max_len)
         else:
             self.backend = GraphBackend(md, a.dtype, quant, compile=comp, shared=shared, attn=attn,
                                         state_cache_gb=getattr(a, "state_cache_gb", 0),
@@ -631,6 +666,13 @@ class Server:
         self.cal, cal, self.cal_unvalidated = load_calibration(md, kind, a.calibration, quant, self.orders,
                                                                 a.no_calibration)
         check_calibration(self.cal, self.fmt, cal)
+        self.cal_mismatch = calibration_mismatch(self.cal, a.model, md) if a.calibration and not a.no_calibration \
+            else None  # a file of your own (--calibration); the files in the model directory belong to it
+        if self.cal_mismatch:
+            if getattr(a, "strict_calibration", False):
+                raise SystemExit(f"{cal}: {self.cal_mismatch} (--strict-calibration)")
+            print(f"basal: warning: {cal.name}: {self.cal_mismatch}; its thresholds were certified on that model "
+                  "(refit with basal-calibrate, or --strict-calibration to refuse such a file)", flush=True)
         if self.cal_unvalidated:
             print(f"basal: warning: {self.cal_unvalidated}; its answers are marked \"calibration\": \"unvalidated\" "
                   "and max_error defers (fit a file for these orders with basal-calibrate, or serve with the file's "
@@ -1182,7 +1224,8 @@ def add_engine_args(ap):
     ap.add_argument("--model", default="Remek/basal-1.5-4.5B", help="local directory or Hugging Face repo id")
     ap.add_argument("--revision", default=None)
     ap.add_argument("--mode", choices=list(MODES), default=None,
-                    help="default: fast on CUDA, mlx on Apple Silicon (mps without mlx / mlx-lm), eager otherwise")
+                    help="default: fast on CUDA, mlx on Apple Silicon (mps without mlx / mlx-lm), tpu on a TPU VM "
+                         "with basal[tpu], eager otherwise")
     ap.add_argument("--quant", choices=["fp8", "nvfp4", "q8"], default=None,
                     help="override the quantisation of the mode (fp8 / nvfp4: CUDA graph modes, q8: mlx)")
     ap.add_argument("--dtype", default="bfloat16")
@@ -1206,7 +1249,8 @@ def add_engine_args(ap):
                     help="on = the whole request (every question and option order) is one packed row over the state")
     ap.add_argument("--gpu-memory", dest="gpu_memory", type=float, default=0.6, help="vLLM memory fraction")
     ap.add_argument("--max-len", dest="max_len", type=int, default=4096,
-                    help="--mode vllm / sglang: context length in tokens (longer states are refused; raise it for long documents)")
+                    help="--mode vllm / sglang / tpu: context length in tokens (longer states are refused; raise it for "
+                         "long documents)")
     ap.add_argument("--gguf", default=None, help="--mode gguf: GGUF weights (a -GGUF file or one converted from --model)")
     ap.add_argument("--ollama-url", dest="ollama_url", default="http://127.0.0.1:11434", help="--mode ollama")
     ap.add_argument("--ollama-model", dest="ollama_model", default=None,
@@ -1292,6 +1336,9 @@ def parser():
     ap.add_argument("--calibration", default=None,
                     help="calibration file (default: <model>/CALIBRATION.<engine>.json if shipped, else "
                          "CALIBRATION.json; fit your own with basal-calibrate)")
+    ap.add_argument("--strict-calibration", dest="strict_calibration", action="store_true",
+                    help="refuse to start when the --calibration file was fitted on another model or revision "
+                         "(default: a warning)")
     ap.add_argument("--log-decisions", dest="log_decisions", default=None, help="append a propensity log (JSONL)")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
@@ -1339,7 +1386,8 @@ def main():
 
     async def models(_):
         return JSONResponse(models_payload(srv.name, a.mode, getattr(srv.backend, "policies", {}), srv.temps,
-                                           srv.fmt, srv.orders, getattr(srv.backend, "media_kinds", ())))
+                                           srv.fmt, srv.orders, getattr(srv.backend, "media_kinds", ()),
+                                           getattr(srv, "cal_mismatch", None)))
 
     async def health(_):
         return JSONResponse({"status": "ok"})

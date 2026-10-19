@@ -166,3 +166,54 @@ def test_mlx_code_logits_in_fp32(tmp_path):
         assert max(abs(a - b) for a, b in zip(g, ref)) < 1e-5
     z16 = np.array(be.model.lm_head(h).astype(mx.float32))
     assert np.abs(z16[0, [10, 11]] - W[[10, 11]] @ hf[0]).max() > 1e-3  # the bf16 head output is coarser
+
+
+def tiny_gemma4(path):
+    """A tiny random Gemma 4 decoder with the parts of basal-omni (Gemma 4 E4B): sliding-window and global layers
+    (wider global heads, partial "proportional" rotary), per-layer inputs, KV sharing of the last layers, tied head and
+    the final logit softcap; the head is scaled so that the softcap changes the code probabilities."""
+    from transformers import Gemma4ForCausalLM, Gemma4TextConfig
+    torch.manual_seed(0)
+    cfg = Gemma4TextConfig(vocab_size=64, hidden_size=64, intermediate_size=128, num_hidden_layers=6,
+                           num_attention_heads=4, num_key_value_heads=2, head_dim=16, global_head_dim=32,
+                           sliding_window=16, layer_types=["sliding_attention", "sliding_attention", "full_attention"] * 2,
+                           vocab_size_per_layer_input=64, hidden_size_per_layer_input=8, num_kv_shared_layers=2,
+                           final_logit_softcapping=30.0, max_position_embeddings=1024,
+                           rope_parameters={"full_attention": {"rope_type": "proportional", "partial_rotary_factor": 0.25,
+                                                               "rope_theta": 1000000.0},
+                                            "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0}})
+    m = Gemma4ForCausalLM(cfg).eval()
+    with torch.no_grad():
+        m.model.embed_tokens.weight.mul_(300.0)  # tied head: large code logits, which the softcap bends
+    m.save_pretrained(path)
+    return m
+
+
+def test_mlx_gemma4_equals_torch(tmp_path):
+    """Gemma 4 (basal-omni): the readout applies the final logit softcap, and a shared prefix longer than the sliding
+    window (120 tokens, window 16) keeps every position (mlx-lm's rotating cache would keep the last window only)."""
+    pytest.importorskip("mlx.core")
+    m = tiny_gemma4(tmp_path)
+    be = mlx_stub(tmp_path)
+    assert be.softcap == 30.0
+    ref = reference(m, TOKS, LIDS)
+    got = be.run_shared([(TOKS, LIDS)])[0]
+    for r, g in zip(ref, got):
+        assert max(abs(x - y) for x, y in zip(r, g)) < 2e-4
+    singles = [list(range(1, 40)), list(range(5, 64)) * 2, [9, 8, 7, 6, 5, 4, 3, 2]]
+    sl = [[10, 11], [12, 13, 14], [10, 15]]
+    for r, g in zip(reference(m, singles, sl), be.run(singles, sl)):
+        assert max(abs(x - y) for x, y in zip(r, g)) < 2e-4
+    be.softcap = None  # guard: without the softcap the probabilities differ
+    assert max(abs(x - y) for r, g in zip(ref, be.run_shared([(TOKS, LIDS)])[0]) for x, y in zip(r, g)) > 1e-2
+
+
+def test_gemma4_per_layer_config_override():
+    """transformers 5 writes Gemma 4's global head size in per_layer_config (basal-omni-1.0 config.json); mlx-lm
+    reads global_head_dim, for the decoder and inside the text_config of the multimodal wrapper."""
+    t = {"layer_types": ["sliding_attention", "full_attention"], "head_dim": 256,
+         "per_layer_config": {"01": {"head_dim": 512}}, "rope_parameters": {"full_attention": {}, "sliding_attention": {}}}
+    assert mlx_config_overrides(t) == {"global_head_dim": 512}
+    o = mlx_config_overrides({"model_type": "gemma4", "text_config": t})
+    assert o["text_config"]["global_head_dim"] == 512 and o["text_config"]["head_dim"] == 256
+    assert mlx_config_overrides({"text_config": {**t, "global_head_dim": 512}}) == {}

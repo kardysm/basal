@@ -134,3 +134,19 @@ def test_readouts_beyond_n_seq_are_split(backend):
     finally:
         del backend.N_SEQ  # back to the class value
     assert np.allclose(full, split, atol=5e-3)
+
+
+def test_multimodal_config_is_checked_on_its_text_config(model, tmp_path, monkeypatch):
+    """Gemma 4 (basal-omni): the decoder's layers, width and vocabulary are in config.json's text_config."""
+    gguf_path, _ = model
+    monkeypatch.setattr("basal.engine.AutoTokenizer.from_pretrained", lambda _: Tok())
+    for name, layers, ok in (("omni", L, True), ("omni-mismatched", L + 1, False)):
+        model_dir = tmp_path / name
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "gemma4", "text_config": {
+            "model_type": "gemma4_text", "num_hidden_layers": layers, "hidden_size": H, "vocab_size": V}}))
+        if ok:
+            assert GGUFBackend(model_dir, gguf_path, n_gpu_layers=0).n_vocab == V
+        else:
+            with pytest.raises(ValueError, match="num_hidden_layers"):
+                GGUFBackend(model_dir, gguf_path, n_gpu_layers=0)

@@ -255,6 +255,7 @@ def test_supported_shapes():
     (dict(hidden_size=3072), "hidden size 3072"),
     (dict(hidden_act="gelu"), "activation gelu"),
     (dict(rope_parameters={"rope_type": "dynamic", "rope_theta": 1e6, "factor": 2.0}), "RoPE type dynamic"),
+    (dict(model_type="gemma4_unified"), "model type gemma4_unified"),                       # basal-omni
 ])
 def test_unsupported_shapes_are_refused(kw, why):
     """Plain attributes: LlamaConfig itself refuses some of them (24 heads over a 2048 hidden size)."""

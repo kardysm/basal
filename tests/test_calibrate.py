@@ -165,7 +165,7 @@ def test_threshold_is_certified_and_keeps_ties_together():
 
 def test_no_certified_threshold_when_the_bound_cannot_be_met():
     rows = [{"p": [0.999, 0.001], "gold": 0, "prim": "noul", "group": f"g{i}"} for i in range(200)]
-    cal, _ = fit(rows, SHIPPED, [0.01, 0.05], min_per_type=1000)
+    cal, _ = fit(rows, SHIPPED, [0.01, 0.05], min_per_type=1000, min_blend=0)
     assert cal["temperature_per_prim"] == SHIPPED["temperature_per_prim"]
     assert cal["temperature_source"]["noul"].startswith("shipped") and "choice" in cal["temperature_source"]
     edge = fit(rows, SHIPPED, [0.05], min_per_type=10)[1]          # no errors: the NLL wants the lowest temperature

@@ -34,8 +34,10 @@ def test_bucket_temperatures_are_fitted_where_there_are_enough_decisions():
     assert cal["prompt"] == 2 and "version" not in cal
     b = cal["temperature_per_bucket"]["choice"]
     assert 1.2 < b["2-10"] < 1.9 and 2.0 < b["11-26"] < 3.1   # the true 1.5 and 2.5, each from its own bucket
-    assert b["27-255"] == 1.7                                  # 30 decisions: the shipped bucket temperature is kept
-    assert cal["temperature_source"]["choice 27-255"].startswith("shipped")
+    assert 1.7 < b["27-255"] < 3.0     # ~21 FIT decisions: the fit (true 3.0) blended with the shipped 1.7 by n / 50
+    assert cal["temperature_source"]["choice 27-255"].startswith("blended")
+    kept, _ = fit(data, shipped, [0.05], 50, fmt=2, min_blend=0)
+    assert kept["temperature_per_bucket"]["choice"]["27-255"] == 1.7     # --min-blend 0: the shipped one is kept
     assert 1.6 < cal["temperature_per_prim"]["noul"] < 2.5
     assert set(report["buckets"]) == {name for name, _, _ in BUCKETS}
     one, _ = fit(data, {}, [0.05], 50, fmt=1)  # format 1: the 1.5 file, no buckets

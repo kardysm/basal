@@ -419,6 +419,87 @@ cool-down; *TV*: mean / max total-variation distance to fp32, *changed*: decisio
 Figures: `python docs/figures/make_figures.py` (matplotlib) from the measurements in `docs/figures/apple_engines.json`.
 
 
+## AMD Strix Halo (experimental, community-maintained)
+
+`--mode strix` ([basal/strix.py](../basal/strix.py)) was contributed and is maintained by
+[@kardysm](https://github.com/kardysm) ([#14](https://github.com/rkinas/basal/pull/14)), not by the core team. It runs
+the Llama-architecture models basal-1.5 and basal-2.0 only, and was measured with the 4.5B ones. Shapes its kernels
+cannot run are refused at start-up with a message naming what does not fit: the mini models (hidden size 1,536, 6 query
+heads per kv head) and basal-omni (Gemma 4) are not supported; the 11B max models pass the checks but have not been
+measured. ROCm only, bf16, tile configs tuned on the Radeon 8060S. **Every number in this section was measured by
+@kardysm** on the machine below; we have not reproduced them. The benchmark scripts and raw results are in the author's
+fork, [kardysm/basal#3](https://github.com/kardysm/basal/pull/3).
+
+One Ryzen AI Max+ PRO 395 (Radeon 8060S, gfx1151, 128 GB unified memory; Fedora 44, PyTorch 2.12 + ROCm 7.2),
+basal-1.5 (4.5B). On this iGPU a decision is compute-bound prefill (~9.2 GFLOP per token), and the stock kernels reach
+only about half of what the GPU sustains. `--mode strix` is a forward written for it (Triton kernels: flash attention
+over the packed prefix trie, gate / up + SwiGLU fused, matmuls with the bias and the residual add in the epilogue).
+Request matrix over HTTP, p50 (details, profile and method: [benchmarks/STRIX_HALO.md](benchmarks/STRIX_HALO.md)):
+
+| request | `gguf` (Q8_0, llama.cpp Vulkan) | **`strix`** (bf16) | `fast-nocompile` as shipped |
+|---|---|---|---|
+| ≈100-token state, 1 question | 178 ms | **159 ms** | 309 ms |
+| ≈100-token state, 20 questions | 1.79 s | **1.08 s** | 5.28 s |
+| ≈2,000-token state, 1 question | 1.28 s | **736 ms** | 3.09 s |
+| ≈6,000-token state, 1 question | 4.16 s | **2.73 s** | 34.0 s |
+| single questions, 32 clients | 7.7/s | **10.9/s** | 4.6/s |
+| start-up / GPU memory | 3 s / 5.8 GiB | 6 s / 10.0 GiB | 888 s / 32 GiB |
+
+- `strix` agrees with the fp32 reference on 144 of 144 decisions (`gguf` 143). One short question at a time is faster
+  with `gguf` (141 vs 159 ms): the bf16 weights are 9 GB per forward, the Q8_0 file 5 GB.
+- Long states gain less (1.5× at 6,000 tokens): the matmuls hit the ~35–40 TFLOPS this GPU sustains, and the package
+  runs at its power limit (~160 W, then ~140 W) with the GPU at 2.15–2.33 GHz.
+- For `gguf` here, build llama-cpp-python with Vulkan (`CMAKE_ARGS="-DGGML_VULKAN=on"`); the host's Mesa matters.
+- **basal-2.0** (4.5B, same architecture; both servers up, requests interleaved, median of 5 rounds): `gguf` → `strix`
+  136 → 144 ms for one question over a ≈100-token state, 1.27 s → **714 ms** at ≈2,000 tokens, 4.16 → **2.41 s** at
+  ≈6,000 tokens (5.25 → **2.90 s** with 20 questions), 11.5 → **19.0/s** with 32 clients. Both agree with fp32 on 142 of
+  144 decisions; the other two are one question that fp32 puts at 0.502 / 0.498.
+
+## Google TPU (experimental, community-maintained)
+
+`--mode tpu` (extra `basal[tpu]`, [install](INSTALL.md#google-tpu-experimental-community-maintained)) runs the bf16
+weights in JAX / XLA on one TPU chip with the same SOAM packing, option codes and calibration as the basal engine.
+Contributed and maintained by [@qooba](https://github.com/qooba) ([#15](https://github.com/rkinas/basal/pull/15)), not
+by the core team. It runs the Llama-architecture models (basal-1.0, basal-1.5, basal-2.0) and refuses others at
+start-up (basal-omni, Gemma 4, is not supported). **Every number in this section was measured by @qooba** on a Colab
+TPU v5e-1 (`TPU v5 lite`, 16 GB HBM), JAX 0.11.1, with basal-2.0 and basal-2.0-mini; we have not reproduced them on a
+TPU of our own. basal-2.0-max (11B, 22 GB of bf16 weights) needs more HBM than one v5e chip has.
+
+`basal-bench` on the 44 bundled examples (the reference is `eager-fp32`, transformers on the VM's CPU; both option
+orders per decision):
+
+| model | mode | 2 orders (ms) | 1 order (ms) | dec/s | agreement | accuracy |
+|---|---|---|---|---|---|---|
+| basal-2.0 (4.5B) | `eager-fp32` (CPU) | 3884.7 | 2522.1 | 0.3 | reference | 0.795 |
+| | `tpu` (bf16) | **16.3** | 15.9 | **64.7** | 1.000 | 0.795 |
+| basal-2.0-mini | `eager-fp32` (CPU) | 1212.8 | 754.2 | 0.8 | reference | 0.750 |
+| | `tpu-fp32` | 23.1 | 22.8 | 33.5 | 1.000 | 0.750 |
+| | `tpu` (bf16) | **6.3** | 6.1 | **188.7** | 1.000 | 0.750 |
+
+Identity gate (the items and paths of `basal-bench --identity`, basal/identity.py: single questions over ~1.8k-token
+states, five-question requests over one state and 3.9-5.7k-token states, both option orders; the reference is every
+prompt alone in transformers fp32 on the CPU; 20 single questions, 6 requests and 2 long states per model):
+
+| model, `tpu` dtype | plain | plain-batch | orders2 | orders2-batch | soam | soam-batch | long-plain | long-tree |
+|---|---|---|---|---|---|---|---|---|
+| basal-2.0-mini, fp32 | 1.000 (1.7e-5) | 1.000 (1.7e-5) | 1.000 (1.7e-5) | 1.000 (1.7e-5) | 1.000 (1.4e-5) | 1.000 (1.2e-5) | 1.000 (1.3e-5) | 1.000 (1.3e-5) |
+| basal-2.0-mini, bf16 | 0.975 (0.023) | 1.000 (0.018) | 0.975 (0.022) | 0.975 (0.025) | 1.000 (0.037) | 1.000 (0.033) | 1.000 (0.011) | 1.000 (0.011) |
+| basal-2.0, bf16 | 1.000 (0.027) | 1.000 (0.049) | 1.000 (0.021) | 0.975 (0.049) | 1.000 (0.054) | 1.000 (0.030) | 1.000 (0.015) | 1.000 (0.017) |
+
+Readout agreement (max |Δp|); 40 readouts per single-question path, 60 per request path, 4 per long path. In fp32
+every path is exact (|Δp| ≤ 1.7e-5): the TPU packing (prefix trie, batching, blocked attention for long states) adds no
+error. In bf16 each 0.975 is one readout of 40, always at a reference top-2 gap ≤ 0.027 (the near ties of this
+sample); the decisions (both orders averaged) agree on 20/20 per path except mini orders2-batch, 19/20 (a decision
+with a reference gap ≤ 0.021). The sample is small: one flip moves a path below the 0.999 gate.
+
+Over HTTP (`basal-serve --mode tpu` with the 2.0 defaults: prompt format 2, one option order; `basal-loadtest`, 32
+clients): basal-2.0 17.1 ms p50, 59.6 decisions/s; basal-2.0-mini 7.3 ms p50, 165.5 decisions/s. One request with 1 / 5
+/ 12 questions over one state: 18.8 / 26.4 / 39.9 ms (basal-2.0) and 7.5 / 10.4 / 15.9 ms (mini). Start-up compiles
+every shape: 268 s (basal-2.0) and 180 s (mini) on a v5e, cached for later starts.
+
+Not on TPU: evidence spans, `--media`, early exit and quantisation. The 44 examples are a small sample; agreement and
+speed on your own items: `basal-bench --modes eager-fp32 tpu --questions <file.jsonl>`.
+
 ## Notes per platform
 
 - **DGX Spark (GB10, aarch64, CUDA 13).** In the README install steps use the CUDA 13 build of PyTorch

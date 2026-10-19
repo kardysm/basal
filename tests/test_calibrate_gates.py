@@ -261,7 +261,7 @@ def test_per_type_coverage_does_not_depend_on_the_temperature():
     per, pooled = {}, {}
     for T in (0.7, 1.0, 1.73, 3.0):
         base = {"temperature_per_prim": {"noul": T, "choice": 1.0}}
-        cal, _ = fit(data, base, [0.01, 0.05], min_per_type=10 ** 9, fmt=2)   # the shipped temperatures, not fitted
+        cal, _ = fit(data, base, [0.01, 0.05], min_per_type=10 ** 9, fmt=2, min_blend=0)  # shipped, not fitted
         assert cal["temperature_per_prim"]["noul"] == T
         for risk in ("0.01", "0.05"):
             x = cal["thresholds"][risk]["per_type"]["noul"]

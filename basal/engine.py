@@ -20,6 +20,7 @@ Backends:
                     llama.cpp sequences
   OllamaBackend     Ollama with the GGUF exports (1.5): raw prompt, one token, top log-probabilities of the letters
   LlamaCppBackend   llama.cpp server with the GGUF exports (1.5): token-id prompt, `n_probs` log-probabilities
+  TPUBackend        (basal/tpu.py, extra basal[tpu]; experimental) the same SOAM packing in JAX / XLA on Google TPU
 """
 import json
 import threading
@@ -199,7 +200,13 @@ class EagerBackend:
     def _chunked(self, e, lid):
         """One long prompt, prefilled in CHUNK-token parts through the KV cache (exact up to float rounding)."""
         from transformers import DynamicCache
-        ids, cache = torch.tensor([list(e)], device=self.dev), DynamicCache()
+        # a hybrid model (Qwen3.5: Gated DeltaNet and attention layers) needs its layer types in the cache, so the
+        # linear-attention layers carry their conv and recurrent states from part to part (an empty DynamicCache()
+        # raised IndexError there); attention-only models (Llama, Gemma 4) keep the plain cache
+        cfg = self.model.config
+        types = getattr(cfg.get_text_config() if hasattr(cfg, "get_text_config") else cfg, "layer_types", None) or ()
+        cache = DynamicCache(config=cfg) if "linear_attention" in types else DynamicCache()
+        ids = torch.tensor([list(e)], device=self.dev)
         for s0 in range(0, ids.shape[1], self.CHUNK):
             part = ids[:, s0:s0 + self.CHUNK]
             pos = torch.arange(s0, s0 + part.shape[1], device=self.dev)[None]
@@ -1616,13 +1623,25 @@ def _split(flat, groups):
 
 def mlx_config_overrides(cfg):
     """transformers 5 writes the rotary settings as `rope_parameters`; mlx-lm reads `rope_theta` / `rope_scaling` only
-    (without this override it silently uses rope_theta = 10000)."""
+    (without this override it silently uses rope_theta = 10000). Gemma 4 (basal-omni): transformers 5 writes the global
+    layers' head size (and KV heads) in `per_layer_config`; mlx-lm reads `global_head_dim` /
+    `num_global_key_value_heads` only (without, it assumes 512). A multimodal config gets its `text_config` back whole."""
+    if isinstance(cfg.get("text_config"), dict):
+        t = mlx_config_overrides(cfg["text_config"])
+        return {"text_config": {**cfg["text_config"], **t}} if t else {}
     rp = cfg.get("rope_parameters") or {}
     out = {}
     if "rope_theta" not in cfg and "rope_theta" in rp:
         out["rope_theta"] = rp["rope_theta"]
     if not cfg.get("rope_scaling") and rp.get("rope_type", "default") != "default":
         out["rope_scaling"] = {k: v for k, v in rp.items() if k != "rope_theta"}
+    types = cfg.get("layer_types") or []
+    full = [c for i, c in (cfg.get("per_layer_config") or {}).items()
+            if int(i) < len(types) and types[int(i)] == "full_attention"]
+    for key, name in (("global_head_dim", "head_dim"), ("num_global_key_value_heads", "num_key_value_heads")):
+        vals = {c[name] for c in full if name in c}
+        if cfg.get(key) is None and len(vals) == 1:
+            out[key] = vals.pop()
     return out
 
 
@@ -1658,13 +1677,16 @@ class MLXBackend:
             raise ValueError(f"unknown MLX quantisation {quant!r} (q8)")
         # lazy for q8: the weights are materialised once, after quantisation (never the full bf16 copy)
         self.model, self.config = load_model(md, lazy=bool(quant), model_config=mlx_config_overrides(cfg))
+        # the final logit softcap of the decoder (Gemma) is applied to the fp32 code logits
+        self.softcap = getattr(self.lm.args, "final_logit_softcapping", None)
         self.quantization = self.config.get("quantization")
         if quant:
             if self.quantization:
                 raise ValueError(f"{md} is already quantised ({self.quantization}); use it without --quant")
             import mlx.nn as nn
             nn.quantize(self.model, group_size=64, bits=8,
-                        class_predicate=lambda path, m: isinstance(m, nn.Linear) and path.startswith("model.layers."))
+                        class_predicate=lambda path, m: isinstance(m, nn.Linear)
+                        and path.removeprefix("language_model.").startswith("model.layers."))
             mx.eval(self.model.parameters())
             self.quantization = {"group_size": 64, "bits": 8}
         # keep the weights resident (wired: under memory pressure macOS would page them out and every forward would
@@ -1680,8 +1702,14 @@ class MLXBackend:
     def encode(self, prompts):
         return EagerBackend.encode(self, prompts)
 
+    @property
+    def lm(self):
+        """The decoder: the model itself (Llama, Bielik) or the text model of a multimodal wrapper (Gemma 4,
+        basal-omni; mlx-lm drops its image / audio towers)."""
+        return getattr(self.model, "language_model", self.model)
+
     def _head(self, h):
-        m = self.model
+        m = self.lm
         return m.model.embed_tokens.as_linear(h) if m.args.tie_word_embeddings else m.lm_head(h)
 
     def _code_rows(self, key):
@@ -1690,7 +1718,7 @@ class MLXBackend:
         probabilities). None for a quantised head (its logits come from the head itself)."""
         rows = self.__dict__.setdefault("_wrows", {})
         if key not in rows:
-            m = self.model
+            m = self.lm
             head = m.model.embed_tokens if m.args.tie_word_embeddings else m.lm_head
             rows[key] = None if hasattr(head, "scales") else head.weight[self.mx.array(key)].astype(self.mx.float32)
         return rows[key]
@@ -1704,6 +1732,8 @@ class MLXBackend:
             z, col = self._head(h).astype(mx.float32), None
         else:
             z, col = h.astype(mx.float32) @ W.T, {t: j for j, t in enumerate(key)}
+        if self.softcap:
+            z = mx.tanh(z / self.softcap) * self.softcap
         K = max(map(len, lids))
         idx = mx.array([[col[i] if col else i for i in ids] + [col[ids[0]] if col else ids[0]] * (K - len(ids))
                         for ids in lids])
@@ -1727,14 +1757,16 @@ class MLXBackend:
                 c = KVCache()
                 c.keys, c.values, c.offset = mx.repeat(k, B, axis=0), mx.repeat(v, B, axis=0), k.shape[2]
                 cache.append(c)
-        h = self.model.model(ids, cache=cache)
+        h = self.lm.model(ids, cache=cache)
         return h[mx.arange(B), mx.array([len(r) - 1 for r in rows])]
 
     def _prefix(self, toks):
         mx = self.mx
-        from mlx_lm.models.cache import make_prompt_cache
-        cache = make_prompt_cache(self.model)
-        self.model.model(mx.array([toks]), cache=cache)
+        from mlx_lm.models.cache import KVCache, make_prompt_cache
+        # plain caches: a sliding-window layer (Gemma 4) gets a rotating cache from mlx-lm, which keeps only the last
+        # window of the prefix; here every layer keeps the whole prefix and the window is applied by the mask
+        cache = [KVCache() for _ in make_prompt_cache(self.model)]
+        self.lm.model(mx.array([toks]), cache=cache)
         kv = [(c.keys[..., : c.offset, :], c.values[..., : c.offset, :]) for c in cache]
         mx.eval(kv)
         return kv
@@ -1816,6 +1848,7 @@ class GGUFBackend(GraphBackend):
         # calibration without config.json (their .gguf files belong to them)
         cp = Path(model_dir) / "config.json"
         cfg = json.loads(cp.read_text()) if cp.exists() else {}
+        cfg = cfg.get("text_config") or cfg  # Gemma 4 (basal-omni): the decoder's settings are in text_config
         for name, llama_name in (("num_hidden_layers", "llama_model_n_layer"), ("hidden_size", "llama_model_n_embd")):
             if not cfg:
                 break
@@ -1838,6 +1871,7 @@ class GGUFBackend(GraphBackend):
         cp.n_ubatch = 512
         cp.n_seq_max = self.N_SEQ
         cp.kv_unified = True  # sequences share the cells of their common prefix
+        cp.swa_full = True  # sliding-window layers (Gemma 4) keep every cell: a shared prefix cell stays readable
         self.ctx = C.llama_init_from_model(self.cmodel, cp)
         if not self.ctx:
             raise ValueError("llama.cpp could not create a context")

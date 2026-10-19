@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "basal"
-version = "2.1.0"
+version = "2.2.0"
 description = "Inference engine for basal: fast, calibrated typed decisions (choice / yes-no / score) for Polish and English"
 readme = "README.md"
 license = "Apache-2.0"
@@ -29,8 +29,12 @@ mlx = [  # Apple Silicon: --mode mlx / mlx-q8 (-MLX-8bit / -MLX-fp4 exports or b
   "mlx-lm>=0.32; sys_platform == 'darwin' and platform_machine == 'arm64' and python_version >= '3.11'",
 ]
 media = ["pillow", "soundfile", "scipy", "torchvision"]  # --media on (basal-omni): images and audio; Gemma 4 image processing needs torchvision (the build of the installed torch)
-gguf = ["llama-cpp-python>=0.3.35"]  # --mode gguf: a GGUF file in process (Metal, CUDA or CPU)
+gguf = ["llama-cpp-python>=0.3.36"]  # --mode gguf: a GGUF file in process (Metal, CUDA or CPU); 0.3.36: Gemma 4 (basal-omni) checked
+gguf-export = ["gguf>=0.19"]  # basal-export-gguf: GGUF with the Hugging Face tokenization (docs/GGUF.md)
 mcp = ["mcp>=2.3,<3"]  # basal-serve --mcp on (MCP at /mcp) and the basal-mcp stdio bridge, for agents
+# --mode tpu (experimental, Google TPU VMs; docs/HARDWARE.md, "Google TPU"): JAX with libtpu (both from PyPI), pinned to
+# the version the backend was validated with
+tpu = ["jax[tpu]==0.11.1; python_version >= '3.12' and sys_platform == 'linux'"]
 test = [
   "pytest", "jsonschema", "mcp>=2.3,<3",
   "mlx>=0.32; sys_platform == 'darwin' and platform_machine == 'arm64' and python_version >= '3.11'",
@@ -42,14 +46,16 @@ basal-serve = "basal.server:main"
 basal-bench = "basal.bench:main"
 basal-loadtest = "basal.loadtest:main"
 basal-run = "basal.run:main"
+basal-export-gguf = "basal.gguf_export:main"
 basal-mcp = "basal.mcp_server:main"
 basal-calibrate = "basal.calibrate:main"
+basal-viz = "basal.viz:main"
 
 [tool.setuptools]
 packages = ["basal"]
 
 [tool.setuptools.package-data]
-basal = ["examples/*.jsonl", "examples/*.py"]
+basal = ["examples/*.jsonl", "examples/*.py", "viz.html"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]  # tests import shared stubs from tests.test_server

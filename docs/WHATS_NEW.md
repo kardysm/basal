@@ -1,3 +1,44 @@
+# What is new in basal 2.2
+
+**Engine v2.2.0: calibration on your own data, for every basal model**
+- **Task thresholds from your labels.** `basal-calibrate` now takes labelled `classify`, `verify` and `extract`
+  questions and certifies the `automated` flag of their answers (`task_thresholds`), by the same bound as the decision
+  types, on the answers as served. A file with task questions only keeps the decision calibration and adds the task
+  thresholds. [CALIBRATION.md](CALIBRATION.md#tasks-classify-verify-extract)
+- **`extract` fields report `automated`**, like `classify` and each `verify` claim.
+- **A few dozen labels are enough to start.** Below `--min-per-type` decisions, a type's temperature is blended with
+  the shipped one in proportion to the labels you have (`--min-blend`, from 10), instead of being left as shipped.
+- **Your data, measured as served.** The report shows how the file you would otherwise serve (the shipped one, or
+  `--calibration FILE`) does on your held-out decisions: the share it automates at each target and its error, each
+  type at the threshold basal-serve applies (2.1 compared the pooled threshold, which basal-serve does not apply to
+  prompt-format-2 models). `--report-only` prints the report without writing a file.
+- **A file knows its model.** `fitted_on` records the model and its Hugging Face revision; `basal-serve --calibration`
+  warns when a file was fitted on another model or revision (and reports it in `GET /v1/models`), and
+  `--strict-calibration` refuses it.
+- **Measured on a new domain** (basal-omni-1.0-mini on typed-decisions, test split): the shipped file's 1% setting
+  would automate 12.6% of decisions at 8.0% error there; calibrated on the train split, the calibration error falls
+  from 0.268 / 0.106 / 0.104 to 0.083 / 0.073 / 0.052 (choice / yes-no / score) and nothing is automated above its
+  target. [The example](CALIBRATION.md#example-a-new-domain-measured)
+- **Fix:** a looser `max_error` target no longer keeps a stricter threshold than a tighter one (the scan could stop
+  early at 5% and automate fewer decisions than at 1%); also in the task thresholds.
+- **basal-omni on GGUF and MLX (text only).** `--mode gguf --gguf <file>` runs a GGUF conversion of basal-omni-1.0
+  through llama.cpp (Metal, CUDA or CPU; llama-cpp-python 0.3.36 or newer) and `--mode mlx` / `mlx-q8` the bf16
+  weights through mlx-lm on Apple Silicon. Q8_0 and Q6_K pass the port gate against bf16; Q5_K_M and Q4_K_M do not.
+  `--mode gguf` loads `CALIBRATION.gguf.json` when the model ships one. [OMNI.md](OMNI.md#gguf-llamacpp-ollama-and-mlx-text)
+- **New model repositories:** `-GGUF` (Q8_0, Q6_K) and `-FP8` (`--mode vllm`) of basal-omni-1.0-mini and -max, each with
+  a calibration fitted on the port's own readouts (GGUF: on Q8_0); 8-bit `-MLX` ports (`--mode mlx`,
+  `CALIBRATION.mlx.json`) of 1.0-mini, 1.0-max and 1.1-max. `VLLM_BATCH_INVARIANT=1` gives repeatable answers
+  in `--mode vllm` ([OMNI.md](OMNI.md#serve)).
+- **From the community.** `basal-export-gguf` (Piotr Durlej, #8; extra `basal[gguf-export]`) converts a basal model
+  to GGUF, or repairs an existing GGUF file, with the tokenizer fix of the `-GGUF` files, so that llama.cpp and Ollama
+  tokenize like the Hugging Face tokenizer ([GGUF.md](GGUF.md#convert-yourself)). Two experimental,
+  community-maintained engines for the Llama-architecture models (basal-1.5, basal-2.0), both opt-in: `--mode tpu`
+  (Kuba Sołtys, #15; extra `basal[tpu]`) in JAX / XLA on a Google TPU, and `--mode strix` (Michał Kardyś, #14) with
+  Triton kernels for AMD Strix Halo. Their numbers in [HARDWARE.md](HARDWARE.md) are the contributors' measurements.
+  `basal-viz` (@lukaspoloki, #2) opens a local page that shows every step of a decision, next to the served answer
+  ([SERVING.md](SERVING.md#see-how-a-decision-is-made)).
+- Every other request takes the same code path as in v2.1.0.
+
 # What is new in basal 2.1
 
 **Engine v2.1.0: task types (experimental)**

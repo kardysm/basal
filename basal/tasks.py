@@ -8,7 +8,11 @@ spans is the value (second_round), so a value is always exact source text, with 
   classify  {"labels": {key: rubric} | [keys], "multi_label": false, "none": false, "max_error": [0.01, 0.05]}
   verify    {"claims": {key: claim} | [claims], "binary": false}
   compress  {"instructions": "<query>", "unit": "sentence" | "line" | "paragraph", "keep_ratio": 0.4 | "threshold": 0.5}
-  extract   {"schema": <JSON schema: object properties, enum / oneOf const, boolean, string, number, integer, arrays of enum>}
+  extract   {"schema": <JSON schema: object properties, enum / oneOf const, boolean, string, number, integer, arrays of enum>,
+             "max_error": [0.01, 0.05]}
+
+`automated` (classify, each verify claim, each extract field) needs a threshold certified for the task in the
+calibration file ("task_thresholds"); basal-calibrate fits them on labelled task questions.
 """
 import json
 import math
@@ -381,7 +385,7 @@ def expand(body, max_options=255):
                     crit["__missing__"] = w["missing"]
                     sub[f"f{SEP}{path}"] = {"type": "choice", "criteria": crit, "option_keys": "hide",
                                             "instructions": pre + w["line"].format(field=f)}
-            plans[name] = dict(type=t, fields=fields, lang=lang, pre=pre, regions=regions)
+            plans[name] = dict(type=t, fields=fields, lang=lang, pre=pre, regions=regions, risks=_risks(q))
         for k, v in sub.items():
             questions[f"{name}{SEP}{k}"] = v
     return dict(body, questions=questions), plans
@@ -499,6 +503,12 @@ def finish(out, body, plans, cal, second=None):
                                     f["error"] = f"not a {kind}"
                             else:
                                 f["value"] = txt
+                if "error" in f:  # a number that does not parse is never used without review
+                    f["automated"] = {str(r): False for r in p["risks"]}
+                elif kind == "enum_list":  # a label set has no certified threshold
+                    f["automated"] = {str(r): None for r in p["risks"]}
+                else:
+                    f["automated"] = _automated(cal, "extract", f["confidence"], p["risks"])
                 f["calibration"] = "validated" if f["source"] == "choice" else "per decision"
                 fields[path] = f
                 _set_path(data, path, f["value"])

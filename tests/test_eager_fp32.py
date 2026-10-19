@@ -1,7 +1,9 @@
 """EagerBackend reads option codes in fp32 from the output head's input, with the model's final logit softcap (Gemma):
-equal to the model's own fp32 logits, and in a bf16 model no longer rounded to bf16 logit steps."""
+equal to the model's own fp32 logits, and in a bf16 model no longer rounded to bf16 logit steps. Llama, Gemma 4 and a
+hybrid model (Qwen3.5: Gated DeltaNet and attention layers, left-padded batches and chunked prefill)."""
 import torch
-from transformers import Gemma4ForCausalLM, Gemma4TextConfig, LlamaConfig, LlamaForCausalLM
+from transformers import (Gemma4ForCausalLM, Gemma4TextConfig, LlamaConfig, LlamaForCausalLM, Qwen3_5ForCausalLM,
+                          Qwen3_5TextConfig)
 
 from basal.engine import EagerBackend
 
@@ -27,6 +29,14 @@ def models():
     yield Gemma4ForCausalLM(Gemma4TextConfig(vocab_size=64, hidden_size=32, intermediate_size=64, num_hidden_layers=2,
                                              num_attention_heads=2, num_key_value_heads=1, head_dim=16,
                                              final_logit_softcapping=3.0, max_position_embeddings=128)).eval()
+    torch.manual_seed(0)
+    yield Qwen3_5ForCausalLM(Qwen3_5TextConfig(
+        vocab_size=64, hidden_size=32, intermediate_size=64, num_hidden_layers=2,
+        layer_types=["linear_attention", "full_attention"], num_attention_heads=2, num_key_value_heads=1, head_dim=16,
+        linear_num_key_heads=2, linear_num_value_heads=2, linear_key_head_dim=8, linear_value_head_dim=8,
+        max_position_embeddings=128,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 0.5,
+                         "mrope_section": [2, 1, 1], "mrope_interleaved": True})).eval()
 
 
 def reference(m, toks, lids):
