@@ -1,0 +1,5 @@
+# Experimental, community-maintained backends: changes to these files are sent to their maintainer for review.
+
+# --mode strix (AMD Strix Halo), docs/HARDWARE.md "AMD Strix Halo"
+/basal/strix.py       @kardysm
+/tests/test_strix.py  @kardysm
