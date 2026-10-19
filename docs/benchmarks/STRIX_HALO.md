@@ -4,14 +4,17 @@
 ([#14](https://github.com/rkinas/basal/pull/14)), and every number on this page was measured by @kardysm on the machine
 described below. The benchmark scripts (`bench_matrix.py`, `edge_check.py`, `bench_ab.py`, `report.py`) and the raw
 results behind these tables are in the author's fork: [kardysm/basal#3](https://github.com/kardysm/basal/pull/3);
-[Raw results](#raw-results-summary) summarises them.
+[Raw results](#raw-results-summary) summarises them. The parity run's script (`parity.py`) and answers are in the
+fork's [`strix-parity-data`](https://github.com/kardysm/basal/tree/strix-parity-data/docs/benchmarks) branch.
 
 `--mode strix` (`basal/strix.py`) is a basal forward written for the Radeon 8060S (gfx1151) after a profile of where
 `--mode gguf` spends its time on it. It keeps the bf16 weights and replaces the slow kernels with Triton ones. It was
 written and tuned on basal-1.5; basal-2.0 has the same architecture and runs through it unchanged. On the request matrix
 below it is 1.12–1.75× faster than `--mode gguf` with basal-1.5 and 1.37–1.81× with basal-2.0 (one short question at a
-time excepted), and it agrees with an fp32 reference on every decision that is not a tie. Opt-in by name, measured only
-on this machine; every other mode is unchanged.
+time excepted), and it agrees with an fp32 reference on every decision that is not a tie. On 2,000 public decisions it
+gives the answer of the bf16 eager engine as often as that engine's own packed path does (1,980 and 1,982; see
+[Parity](#parity-against-bf16-eager-2000-public-decisions)). Opt-in by name, measured only on this machine; every other
+mode is unchanged.
 
 Machine: AMD Ryzen AI Max+ PRO 395, Radeon 8060S (gfx1151, 40 CUs), 128 GB unified memory; Fedora 44, kernel 7.2.8,
 Mesa 26.2. Model: basal-1.5 (4.5B); `Q8_0` GGUF for llama.cpp, bf16 for PyTorch. Software: PyTorch 2.12.0 + ROCm 7.2,
@@ -120,6 +123,43 @@ Prompt tokens are `usage.input_tokens`, the sum over all prompts; the state is c
 one question over a long state costs about the same with both models, and the second option order basal-1.5 read for
 every question is what basal-2.0 saves.
 
+## Parity against bf16 eager: 2,000 public decisions
+
+basal-2.0-4.5B (e5ba914), engine 2.2.0, on the test split of
+[LocalLLaMA/typed-decisions](https://huggingface.co/datasets/LocalLLaMA/typed-decisions) (revision 7189f46,
+Apache-2.0): 400 cases in four workflows, each a JSON state (230–1,840 characters) with five questions, 2,000 decisions
+(600 choice with 4–5 options, 600 yes / no, 800 scores with 4–5 levels). Each case is one `/v1/systemone` request with
+all five questions, as the dataset card prescribes, sent by `basal-run`; one option order (the 2.0 default) and the
+shipped `CALIBRATION.json` in every engine. **Reference:** `--mode eager` (bf16, stock transformers forward) with
+`--soam off --max-batch 1`, so every prompt is computed on its own. An answer is the option with the highest calibrated
+probability; *margin* is the reference's gap between its top two options; accuracy is against the argmax of the gold
+distribution (labels from a teacher model, which agrees with itself on 0.735 of them); ECE of the top option, 15 bins.
+
+| engine | same answer as the reference | at margin ≥ 0.2 | mean / max \|Δp\| | accuracy | ECE | p50 per case |
+|---|---|---|---|---|---|---|
+| bf16 eager, every prompt alone (reference) | – | – | – | 0.652 | 0.037 | 2.30 s |
+| bf16 eager, packed (`--mode eager` as shipped) | 1,982 (0.991) | 1,545 / 1,545 | 0.0040 / 0.086 | 0.649 | 0.041 | 2.40 s |
+| **`strix`**, one request at a time | **1,980 (0.990)** | **1,545 / 1,545** | 0.0040 / 0.083 | 0.651 | 0.044 | **331 ms** |
+| **`strix`**, 8 requests in flight | 1,977 (0.989) | 1,545 / 1,545 | 0.0040 / 0.115 | 0.651 | 0.039 | – |
+| `gguf` (Q8_0) | 1,954 (0.977) | 1,545 / 1,545 | 0.0082 / 0.145 | 0.650 | 0.040 | 562 ms |
+
+- `strix` changes 20 of 2,000 answers (1.0%), and the stock engine's own packed path changes 18: in bf16 the order of
+  the sums alone moves decisions at a near tie about as often. Every `strix` flip is at a reference margin of at most
+  0.046 (packed eager: 0.040; `gguf`: 0.187), and none of the 1,545 decisions with a margin of 0.2 or more changes in
+  any engine. Per type (`strix`): choice 593 / 600, yes / no 598 / 600, score 789 / 800.
+- Accuracy −0.1 point and ECE +0.007 against the reference (8 in flight: +0.002); packed eager −0.25 points and +0.004.
+- With 8 requests in flight the server batches waiting requests into one forward, so the packing, and with it the bf16
+  sums, differ: 1,987 answers equal those of `strix` one request at a time. A given layout gives identical answers
+  every time (the determinism test in `tests/test_strix.py`).
+- Throughput: 400 cases in 134 s one at a time (3.0 cases, 15 decisions per second) and 126 s with 8 in flight;
+  `gguf` 223 s, the reference 933 s.
+
+Reproduce (`parity.py` and the answer files of every row above: the fork's
+[`strix-parity-data`](https://github.com/kardysm/basal/tree/strix-parity-data/docs/benchmarks) branch): `parity.py cases`
+turns the split's parquet into request lines; `basal-run --input cases.jsonl --output <engine>.jsonl --url
+http://127.0.0.1:<port>/v1/systemone --concurrency 1` per server, one server at a time; `parity.py compare cases.jsonl
+eager.jsonl <engine>.jsonl ...` prints the table.
+
 ## Results against `gguf`: basal-1.5 (request matrix over HTTP)
 
 | state | 1 question | 5 questions | 20 questions |
@@ -193,7 +233,8 @@ stock layer), the interval mask against the block mask it replaces, and the whol
 biases against separate bf16 forwards of every prompt (1–8 questions over one state, several requests in one sequence
 and the same request alone, several forwards per call with a request bisected, determinism), plus the mode dispatch of
 `basal-serve` and `basal-bench`. Full suite on this machine: 76 passed, 3 skipped (MLX / Apple only); on engine 2.0.0,
-511 passed, 19 skipped (MLX and the extras not installed).
+511 passed, 19 skipped (MLX and the extras not installed). At v2.2.0 (PyTorch 2.12.0 + ROCm 7.2, Triton 3.7.0,
+transformers 5.17.0, kernel 7.2.10): `tests/test_strix.py` 30 passed; full suite 585 passed, 20 skipped.
 
 ## Raw results (summary)
 
