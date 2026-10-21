@@ -235,6 +235,35 @@ def test_warmup_with_a_small_vocabulary():
     assert make(tiny(), warm=True).run_shared(groups_mixed()[:1])
 
 
+@gpu
+def test_warmup_compiles_every_kernel_copy():
+    """After the start-up warmup no row count compiles a kernel. Triton compiles one copy per tile config and per class
+    of each integer argument (1, a multiple of 16, other), and the request that needs a new one waits for it (the first
+    timed pass of S with 1 question and of M with 2 in the request matrix, before the warmup covered them)."""
+    from basal import strix
+    if not hasattr(triton, "knobs"):
+        pytest.skip("Triton without knobs.runtime.jit_cache_hook")
+    for k in (strix._attn_fwd, strix._swiglu_mm, strix._linear, strix._rmsnorm, strix._rope):
+        k.device_caches.clear()  # the copies other tests compiled in this process
+    be = make(tiny(), warm=True)
+    built = []
+
+    def hook(*, repr, **_):
+        built.append(repr)
+        return False  # compile as usual
+
+    old, triton.knobs.runtime.jit_cache_hook = triton.knobs.runtime.jit_cache_hook, hook
+    try:
+        for L in (20, 48, 208, 512, 513, 720, 1536, 1537, 2160, 2304, 2305, 2320, 4609, 5000):
+            for nq in (1, 2, 7, 16, 48, 513, 528):
+                if nq <= L:
+                    be.forward(*be._warm_row(L, nq))
+        be._wait()
+    finally:
+        triton.knobs.runtime.jit_cache_hook = old
+    assert built == []
+
+
 def llama(**kw):
     base = dict(hidden_size=2048, intermediate_size=11008, num_attention_heads=16, num_key_value_heads=2,
                 head_dim=128, num_hidden_layers=1, vocab_size=64)  # basal-1.5 / basal-2.0 4.5B shapes
