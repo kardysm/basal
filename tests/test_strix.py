@@ -21,10 +21,11 @@ class Tok:
     pad_token, eos_token, pad_token_id = "<pad>", "</s>", 0
 
 
-def tiny():
+def tiny(layers=2):
     torch.manual_seed(0)
-    cfg = LlamaConfig(vocab_size=64, hidden_size=128, intermediate_size=256, num_hidden_layers=2, num_attention_heads=4,
-                      num_key_value_heads=2, max_position_embeddings=1024, attention_bias=True, mlp_bias=True)
+    cfg = LlamaConfig(vocab_size=64, hidden_size=128, intermediate_size=256, num_hidden_layers=layers,
+                      num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=1024, attention_bias=True,
+                      mlp_bias=True)
     m = LlamaForCausalLM(cfg).eval()
     m.config._attn_implementation = "sdpa"
     with torch.no_grad():  # random biases (zero by default), so that a missing bias shows
@@ -239,13 +240,15 @@ def test_warmup_with_a_small_vocabulary():
 def test_warmup_compiles_every_kernel_copy():
     """After the start-up warmup no row count compiles a kernel. Triton compiles one copy per tile config and per class
     of each integer argument (1, a multiple of 16, other), and the request that needs a new one waits for it (the first
-    timed pass of S with 1 question and of M with 2 in the request matrix, before the warmup covered them)."""
+    timed pass of S with 1 question and of M with 2 in the request matrix, before the warmup covered them). Three
+    layers: the warmup forwards skip the middle one, and the forwards below run all three."""
     from basal import strix
     if not hasattr(triton, "knobs"):
         pytest.skip("Triton without knobs.runtime.jit_cache_hook")
     for k in (strix._attn_fwd, strix._swiglu_mm, strix._linear, strix._rmsnorm, strix._rope):
         k.device_caches.clear()  # the copies other tests compiled in this process
-    be = make(tiny(), warm=True)
+    be = make(tiny(layers=3), warm=True)
+    assert len(be.layers) == 3
     built = []
 
     def hook(*, repr, **_):

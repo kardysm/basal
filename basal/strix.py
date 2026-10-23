@@ -297,7 +297,8 @@ class StrixHaloFastBackend(GraphBackend):
             self._warm_shapes()
 
     # Start-up forwards for attention and rotary (one tile config each): sequence lengths other and a multiple of 16,
-    # each against readout rows 1, other and a multiple of 16 (the last layer's attention takes both counts)
+    # each against readout rows 1, other and a multiple of 16 (the last layer's attention takes both counts). They run
+    # the first layer and the last only: every layer between needs the copies the first one compiles.
     WARM_FORWARDS = ((17, 1), (32, 1), (17, 3), (32, 3), (17, 16), (32, 16))
 
     @staticmethod
@@ -325,7 +326,8 @@ class StrixHaloFastBackend(GraphBackend):
         LINEAR, the class by its value), and a request that needs a copy not compiled yet waits for it: ~0.2-0.3 s per
         copy on the 8060S, ~1 ms when Triton's disk cache holds it (in the request matrix, the first timed pass of S
         with 1 question and of M with 2 did). The projections run on zero rows of warm_rows, as the forward calls them
-        (same strides, residual for o / down); attention and rotary in the short WARM_FORWARDS."""
+        (same strides, residual for o / down); attention and rotary in the short WARM_FORWARDS, over the first and the
+        last layer (all 60 layers of basal-2.0 took ~0.7 s per start)."""
         z = lambda m, n: torch.zeros(m, n, device=self.dev, dtype=torch.bfloat16)  # noqa: E731
         _, wqkv, bqkv, wo, bo, _, wg, bg, wu, bu, wd, bd = self.layers[0]
         for m in self.warm_rows(self.LINEAR["qkv"]):
@@ -336,9 +338,14 @@ class StrixHaloFastBackend(GraphBackend):
             self._linear("down", z(m, wd.shape[1]), wd, bd, z(m, self.hidden))
         for m in self.warm_rows(self.FFN):
             self._ffn_in(z(m, self.hidden), wg, bg, wu, bu)
-        for L, nq in self.WARM_FORWARDS:
-            self.forward(*self._warm_row(L, nq))
-        self._wait()
+        layers = self.layers
+        self.layers = layers[:1] + layers[-1:] if len(layers) > 1 else layers
+        try:
+            for L, nq in self.WARM_FORWARDS:
+                self.forward(*self._warm_row(L, nq))
+            self._wait()
+        finally:
+            self.layers = layers
 
     def _oversize(self, pack, n):
         return len(pack[0]) > self.TOKEN_BUDGET
