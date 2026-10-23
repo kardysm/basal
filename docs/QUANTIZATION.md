@@ -31,7 +31,7 @@ The same table as in the README: which engine serves which format, and what is v
 <!-- engines -->
 | engine | `basal-serve` mode | hardware | what it is for | quick start | status (basal-1.5, 4.5B) |
 |---|---|---|---|---|---|
-| **basal engine** (PyTorch) | `fast` (also `fast-nocompile`, `fp8`, `nvfp4`); `mps`; `eager --device mps\|cpu` | NVIDIA GPUs (sm80+); Apple Silicon with `mps` (packed requests on the Mac's GPU, no CUDA graphs) or `eager`; CPU with `eager` | the primary server: packed requests (SOAM), evidence spans, `fp8` on Hopper and Blackwell | `basal-serve --model Remek/basal-1.5-4.5B --mode fast` | **verified**: served check on one H100, 13.7 ms p50 per question over HTTP, 64.4 decisions/s with 32 clients |
+| **basal engine** (PyTorch) | `fast` (also `fast-nocompile`, `fp8`, `nvfp4`); `mps`; `eager --device mps\|cpu` | NVIDIA GPUs (sm80+); Apple Silicon with `mps` (packed requests on the Mac's GPU, no CUDA graphs) or `eager`; CPU with `mps --device cpu` (packed requests) or `eager` | the primary server: packed requests (SOAM), evidence spans, `fp8` on Hopper and Blackwell | `basal-serve --model Remek/basal-1.5-4.5B --mode fast` | **verified**: served check on one H100, 13.7 ms p50 per question over HTTP, 64.4 decisions/s with 32 clients |
 | **vLLM** | `vllm` | NVIDIA GPUs | an alternative CUDA server | `basal-serve --model Remek/basal-1.5-4.5B --mode vllm` (extra `basal[vllm]`) | **verified offline** (one H100, `basal-bench`, 1,000 development decisions): agreement 0.994 with the fp32 engine, accuracy 0.928 vs 0.930, 147 decisions/s |
 | **SGLang** | `sglang` | NVIDIA GPUs | an alternative CUDA server (RadixAttention prefix sharing) | `basal-serve --model Remek/basal-1.5-4.5B --mode sglang` (own environment: `sglang[srt]==0.5.21`, then basal with `--no-deps`) | **verified offline** (one H100, `basal-bench`, 1,000 development decisions): agreement 0.995 with the fp32 engine, accuracy 0.925 vs 0.930, 104.6 decisions/s; on Werdykt the same answer as the basal engine on 98.3% of items (97.0% for states over 8k tokens) |
 | **MLX** | `mlx` (default on a Mac with `basal[mlx]`); `mlx-q8` | Apple Silicon | Macs: `-MLX-8bit` (recommended) or `-MLX-fp4` (half the memory); `mlx-q8` makes 8-bit weights from bf16 at load time | `basal-serve --model Remek/basal-1.5-4.5B-MLX-8bit --mode mlx` (extra `basal[mlx]`) | **verified** on an Apple M4 Pro (500 development decisions): agreement with bf16 0.992 (`-MLX-8bit`) / 0.970 (`-MLX-fp4`), 587 / 581 ms per question |
@@ -87,6 +87,30 @@ the basal-1.5 benchmark table ([v1.5.0 README](https://github.com/rkinas/basal/t
 the GPU of an Apple Silicon Mac (install `basal[mlx]`). The state of a request is computed once into a KV cache shared
 by all its questions and option orders.
 
+`--mlx-packed` (opt-in, off by default) runs a group of a Llama model (basal-1.x, 2.x) whose state and option orders fit
+in 512 tokens as one packed forward instead: the state once, then every option order, with explicit positions and a
+mask that lets each order see the state and itself only; several groups share one forward. Groups that do not fit,
+Gemma 4 (basal-omni) and RoPE variants whose frequencies depend on the sequence length (dynamic, yarn, longrope) keep
+the KV cache. In fp32 the decisions equal the KV-cache path; in bf16 and 8-bit the probabilities move slightly (a
+different summation order), and the shipped `CALIBRATION.mlx.json` was fitted on the default path, so check
+`--mlx-packed` against it before relying on the calibrated thresholds.
+
+Our 2.3.1 checks on an Apple M4 Pro (24 GB), `--mlx-packed` against the default path:
+
+| | basal-2.0-mini-MLX-8bit | basal-1.0-1.5B (bf16) | basal-2.0-4.5B-MLX-8bit |
+|---|---|---|---|
+| 2 orders, 44 bench examples (ms, two runs) | 118 / 124 -> 104 / 107 | 158 / 164 -> 136 / 130 | 379 / 390 -> 331 / 330 |
+| decisions/s, two orders | 8.9 / 6.1 -> 9.5 / 8.1 | 6.4 / 6.4 -> 7.7 / 8.1 | 2.7 / 2.7 -> 2.9 / 3.0 |
+| top answer = eager-fp32, per readout (frozen dev v2) | 0.9925 -> 0.9925 (4,000) | 0.9975 -> 0.9958 (2,400; McNemar p 0.29) | not run (fp32 does not fit in 24 GB) |
+| same decision as the default path at margin >= 0.2 | 1,903 / 1,903 | 1,043 / 1,043 | 2,904 / 2,905 |
+| largest probability change | 0.095 | 0.021 | 0.176 |
+| automated at 5% with the shipped `CALIBRATION.mlx.json` (no type is certified at 1%) | 41.8% -> 42.1%, +0.25 pt [-0.10, +0.60] | (no MLX file) | 28.7% -> 28.5%, -0.20 pt [-0.60, +0.20] |
+
+One order is unchanged (single prompts never pack), and no length band up to 512 tokens was slower than the default
+path. The automated decisions made no error on either path. `--mlx-packed` stays opt-in in 2.3.1: on
+basal-2.0-4.5B-MLX-8bit the lower bound of the change in the automated share at 5% (-0.60 pt) is below our -0.5 pt
+bar for a change of path under a shipped calibration file.
+
 - `-MLX-8bit`: affine 8-bit decoder weights (group 64, a bf16 scale and bias per group);
 - `-MLX-fp4`: MLX `nvfp4` decoder weights (4-bit floating point E2M1, group 16, FP8 scales);
 - in both, the token embeddings and the output head stay in bf16, because the decision is read from the output head's
@@ -100,7 +124,7 @@ still the best MLX 4-bit format on mini.) Mini's `-MLX-fp4` ships its own temper
 thresholds are copied from bf16 and not certified for that port.
 
 ```bash
-uv pip install "basal[mlx] @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"
+uv pip install "basal[mlx] @ https://github.com/rkinas/basal/archive/refs/tags/v2.4.1.tar.gz"
 basal-serve --model Remek/basal-1.5-4.5B-MLX-8bit --mode mlx --port 8000
 ```
 
@@ -197,7 +221,7 @@ NVFP4 needs Blackwell (B200, B300, RTX 50xx, RTX PRO 6000, DGX Spark). basal-1.5
 costs basal-1.5-mini about 6 accuracy points with almost no speed gain over FP8; use `-FP8`. Run them with vLLM in a separate environment:
 
 ```bash
-uv pip install "basal[vllm] @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"
+uv pip install "basal[vllm] @ https://github.com/rkinas/basal/archive/refs/tags/v2.4.1.tar.gz"
 basal-serve --model Remek/basal-1.5-4.5B-FP8 --mode vllm --port 8000
 ```
 
@@ -224,7 +248,7 @@ The `Remek/basal-1.0-4.5B-FP8` / `-NVFP4` and `Remek/basal-1.0-1.5B-FP8` / `-NVF
 ModelOpt Hugging Face exports and load in vLLM (tested):
 
 ```bash
-uv pip install "basal[vllm] @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"   # separate environment: vLLM brings its own torch
+uv pip install "basal[vllm] @ https://github.com/rkinas/basal/archive/refs/tags/v2.4.1.tar.gz"   # separate environment: vLLM brings its own torch
 basal-serve --model Remek/basal-1.0-4.5B-NVFP4 --mode vllm --port 8000
 ```
 
@@ -236,6 +260,6 @@ H100, offline (`basal-bench`, 1,000 development decisions, both option orders), 
 calibration file for 1.5; both use `CALIBRATION.json`.
 
 SGLang runs in its own environment. Install it with `uv pip install --prerelease=allow "sglang[srt]==0.5.21"` (its kernels need a CUDA 12.9+ toolkit), then
-`uv pip install --no-deps "basal @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"` and, if missing, `uv pip install starlette uvicorn httpx accelerate
+`uv pip install --no-deps "basal @ https://github.com/rkinas/basal/archive/refs/tags/v2.4.1.tar.gz"` and, if missing, `uv pip install starlette uvicorn httpx accelerate
 safetensors`. This is the setup the SGLang numbers were measured with; the basal engine's own modes (`fast`, `eager`)
 and vLLM use the default install.

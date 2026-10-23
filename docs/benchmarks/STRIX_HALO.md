@@ -2,9 +2,10 @@
 
 *Experimental, community-maintained:* `--mode strix` was contributed by [@kardysm](https://github.com/kardysm)
 ([#14](https://github.com/rkinas/basal/pull/14)), and every number on this page was measured by @kardysm on the machine
-described below. The benchmark scripts (`bench_matrix.py`, `edge_check.py`, `bench_ab.py`, `report.py`) and the raw
-results behind these tables are in the author's fork: [kardysm/basal#3](https://github.com/kardysm/basal/pull/3);
-[Raw results](#raw-results-summary) summarises them.
+described below, except [A second machine](#a-second-machine-basal-20-on-a-rog-flow-z13), measured by
+[@piotrkowski](https://github.com/piotrkowski). The benchmark scripts (`bench_matrix.py`, `edge_check.py`,
+`bench_ab.py`, `report.py`) and the raw results behind these tables are in the author's fork:
+[kardysm/basal#3](https://github.com/kardysm/basal/pull/3); [Raw results](#raw-results-summary) summarises them.
 
 `--mode strix` (`basal/strix.py`) is a basal forward written for the Radeon 8060S (gfx1151) after a profile of where
 `--mode gguf` spends its time on it. It keeps the bf16 weights and replaces the slow kernels with Triton ones. It was
@@ -119,6 +120,34 @@ basal-1.5 → basal-2.0 on the same engines (matrix p50):
 Prompt tokens are `usage.input_tokens`, the sum over all prompts; the state is computed once per request either way, so
 one question over a long state costs about the same with both models, and the second option order basal-1.5 read for
 every question is what basal-2.0 saves.
+
+## A second machine: basal-2.0 on a ROG Flow Z13
+
+*Measured by [@piotrkowski](https://github.com/piotrkowski)* with @kardysm's scripts unchanged: an ASUS ROG Flow Z13
+(GZ302EA) tablet, Ryzen AI Max+ 395, Radeon 8060S, **32 GB**, `balanced` profile on AC power; CachyOS, kernel 7.2.9,
+Mesa 26.2.4; the software above; engine at 2e581da; the same basal-2.0-4.5B bf16 and Q8_0 files. Raw results:
+[the contributor's fork](https://github.com/piotrkowski/basal/tree/strix-z13-results/docs/benchmarks/z13).
+
+**Same answers.** `strix` edge cases bit-identical to @kardysm's run, matrix within 1.6e-6 of it. Against his fp32
+reference (one does not fit in 32 GB): `strix` and `gguf` 142 of 144 decisions each, mean |Δp| 0.0047 and 0.0064.
+
+**Close speed-up, slower times.** Interleaved A/B, median of 5 rounds:
+
+| request | `gguf` | **`strix`** | speed-up | first machine |
+|---|---|---|---|---|
+| S (≈100 tokens), 1 question | 208 ms | **199 ms** | 1.05× | 0.94× |
+| M (≈570), 10 questions | 1.24 s | **751 ms** | 1.65× | 1.76× |
+| L (≈2,000), 1 question | 1.91 s | **1.12 s** | 1.70× | 1.77× |
+| XL (≈6,000), 1 question | 6.34 s | **3.74 s** | 1.70× | 1.73× |
+| XL, 20 questions | 8.00 s | **4.77 s** | 1.68× | 1.81× |
+| single questions, 32 clients | 7.9/s | **12.3/s** | 1.56× | 1.65× |
+
+- Both engines take 1.4–1.7× as long as on the first machine: the tablet ran at about 50 W package power, the GPU at
+  ~1.8 GHz and 86 °C.
+- 32 GB is enough for `strix` (10 GiB of GTT), but its start-up depends on free RAM, since the bf16 weights go through
+  RAM on the way to GTT: 33 s, and 118 s once the system was swapping.
+- In the matrix, the first timed pass of S with 1 question and of M with 2 is a one-off `strix` stall on both
+  machines (here 545 / 1,316 ms against ~190 / ~320 ms), so the matrix p50 of those two shapes overstates `strix`.
 
 ## Results against `gguf`: basal-1.5 (request matrix over HTTP)
 

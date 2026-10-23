@@ -8,7 +8,8 @@ import numpy as np
 import pytest
 
 import basal.server as server_module
-from basal.calibrate import REFERENCE, fit, fit_fallback, is_cert, lofo, main, set_metrics, set_probs
+from basal.calibrate import (REFERENCE, accepted_needed, cert_note, fit, fit_fallback, is_cert, lofo, main,
+                             sample_size, set_metrics, set_probs)
 from basal.sets import label_set_id
 from basal.server import to_items
 from tests.test_server import FakeServer, Tok
@@ -181,7 +182,7 @@ class StubBackend:
 def engine(tmp_path, monkeypatch):
     md = tmp_path / "model"
     md.mkdir()
-    (md / "CALIBRATION.json").write_text(json.dumps({"temperature_per_prim": {"noul": 1.0}}))
+    (md / "CALIBRATION.json").write_text(json.dumps({"temperature_per_prim": {"noul": 1.0}}), encoding="utf-8")
     monkeypatch.setattr(server_module, "resolve", lambda *_, **__: md)
     monkeypatch.setattr(server_module, "EagerBackend", StubBackend)
     return md
@@ -191,7 +192,7 @@ def labelled(path, n=1500, seed=0):
     """Yes/no questions of three families (two over-confident, one calibrated) and multi questions with a fallback."""
     rng = np.random.default_rng(seed)
     crit = {"d": "Damage", "r": "Refund", "i": "Invoice", "g": "General"}
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         for i in range(n):
             fam = ("late", "covered", "signed")[i % 3]
             q = float(rng.uniform(0.02, 0.98))
@@ -216,7 +217,7 @@ def test_end_to_end_gates_strict_and_multi(tmp_path, engine, capsys):
     main(argv + ["--reference"])
     printed = capsys.readouterr().out
     assert "LOFO ECE on CERT" in printed and "automated on CERT" in printed and "multi fallback" in printed
-    cal = json.loads(out.read_text())
+    cal = json.loads(out.read_text(encoding="utf-8"))
     lf = cal["gates"]["ece_lofo"]["noul"]
     assert lf["n_families"] == 3 and lf["worst_family"] == "signed" and lf["reference"] == 0.062
     assert cal["gates"]["ece_reference"].startswith("basal-1.5") and cal["fitted_on"]["multi"] == 750
@@ -230,14 +231,73 @@ def test_end_to_end_gates_strict_and_multi(tmp_path, engine, capsys):
             main(strict)
         assert e.value.code == 1
     ref = tmp_path / "ref.json"
-    ref.write_text(json.dumps({"gates": {"ece_lofo": {"noul": {"mean": 0.9}}}}))
+    ref.write_text(json.dumps({"gates": {"ece_lofo": {"noul": {"mean": 0.9}}}}), encoding="utf-8")
     main(argv + ["--strict", "--reference", str(ref)])                 # far above: no regression, exit 0
-    ref.write_text(json.dumps({"gates": {"ece_lofo": {"noul": {"mean": 0.0}}}}))
+    ref.write_text(json.dumps({"gates": {"ece_lofo": {"noul": {"mean": 0.0}}}}), encoding="utf-8")
     with pytest.raises(SystemExit) as e:
         main(argv + ["--strict", "--reference", str(ref)])
     assert e.value.code == 1 and "above the reference for noul" in capsys.readouterr().err
     with pytest.raises(SystemExit, match="--strict needs --reference"):
         main(argv + ["--strict"])
+
+
+def test_accepted_needed():
+    assert [accepted_needed(0.01, e) for e in range(3)] == [299, 473, 628]
+    assert [accepted_needed(0.05, e) for e in range(3)] == [59, 93, 124]
+
+
+def test_sample_size_warns_before_the_readouts():
+    """Feedback from BRAUN SI: 275 verify claims cannot certify 1% (299 accepted FIT decisions without an error are
+    needed, the FIT split holds about 70% of them); 5% can be. Said up front, per type and task and target."""
+    units = [dict(task="verify", group=f"g{i}") for i in range(275)]
+    decisions = [dict(prim="noul", group=f"n{i}") for i in range(1000)] + [dict(prim="multi", group="m")]
+    n_fit = sum(not is_cert(u["group"]) for u in units)
+    (w,) = sample_size(decisions, units, [0.01, 0.05])
+    assert w.startswith(f"verify: max_error 0.01 needs >= 299 accepted FIT decisions without an error (473 with 1 "
+                        f"error, 628 with 2); this file gives {n_fit} FIT decisions of 275")
+    assert "label about 153 more verify claims. verify will not be certified at max_error 0.01" in w
+
+
+def test_cert_note_when_cert_cannot_confirm_a_written_threshold():
+    """Feedback from BRAUN SI / NovaraX: a threshold certified on FIT whose CERT upper bound is above the target is
+    kept, but the report says CERT cannot confirm it; an observed CERT error above the target is said more strongly."""
+    x = dict(confidence=0.97, cert_accepted=41, cert_error=0.0, cert_upper95=0.0705)
+    assert cert_note("verify", 0.05, x) == ("verify at max_error 0.05: certified on FIT; CERT has 41 accepted, 0 "
+                                            "errors, upper bound 7.05% > 5%, too few to confirm on CERT (0 errors "
+                                            "would need >= 59 accepted CERT decisions)")
+    assert "does not hold on CERT" in cert_note("noul", 0.01, dict(x, cert_accepted=100, cert_error=0.02))
+    assert "accepts no decision" in cert_note("noul", 0.01, dict(x, cert_accepted=0, cert_error=None,
+                                                                  cert_upper95=None))
+    assert cert_note("noul", 0.05, dict(x, cert_accepted=200, cert_upper95=0.0149)) is None  # confirmed
+    assert cert_note("noul", 0.05, dict(confidence=None)) is None
+
+
+def test_sample_size_and_cert_notes_on_stderr(tmp_path, engine, capsys):
+    """Both warnings reach stderr: the sample size before the readouts and again in the end-of-run summary, with the
+    --from-rows refit too; the exit status is unchanged."""
+    labelled(tmp_path / "l.jsonl", n=300)
+    rows = tmp_path / "rows.jsonl"
+    main([str(tmp_path / "l.jsonl"), "--mode", "eager", "--model", "stub", "--out", str(tmp_path / "cal.json"),
+          "--report-only", "--save-rows", str(rows)])
+    err = capsys.readouterr().err
+    first = err.index("noul: max_error 0.01 needs >= 299 accepted FIT decisions")
+    assert first < err.index("basal-calibrate: summary") < err.rindex("noul: max_error 0.01 needs >= 299")
+    main([str(rows), "--from-rows", "--report-only"])
+    err = capsys.readouterr().err
+    assert err.count("noul: max_error 0.01 needs >= 299") == 2 and "basal-calibrate: summary" in err
+
+
+def test_strict_says_when_no_family_was_tested(tmp_path, engine, capsys):
+    """#19: when no family has --min-family CERT decisions of a type, --strict has nothing to test for it. It still
+    passes (status 0), and says so on stderr and in the report."""
+    labelled(tmp_path / "l.jsonl", n=300)
+    main([str(tmp_path / "l.jsonl"), "--mode", "eager", "--model", "stub", "--out", str(tmp_path / "cal.json"),
+          "--strict", "--reference", "--min-family", "1000"])
+    cap = capsys.readouterr()
+    assert ("--strict: noul: 0 families tested (each needs >= 1000 CERT decisions of the type); the family check did "
+            "not run") in cap.err
+    assert "noul: no leave-one-family-out ECE, 0 families tested" in cap.out
+    assert "--strict does not check noul" in cap.out
 
 
 # -- certified thresholds per type ------------------------------------------------------------------------------------
@@ -309,7 +369,7 @@ def test_saved_rows_refit_without_an_engine(tmp_path, engine):
             "--save-rows", str(tmp_path / "rows.jsonl")]
     main(argv)
     main([str(tmp_path / "rows.jsonl"), "--from-rows", "--out", str(tmp_path / "b.json")])
-    a, b = json.loads((tmp_path / "a.json").read_text()), json.loads((tmp_path / "b.json").read_text())
+    a, b = json.loads((tmp_path / "a.json").read_text(encoding="utf-8")), json.loads((tmp_path / "b.json").read_text(encoding="utf-8"))
     for k in ("temperature_per_prim", "thresholds", "gates", "multi"):
         assert a[k] == b[k], k
     with pytest.raises(SystemExit, match="not a file written by"):

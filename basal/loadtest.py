@@ -40,7 +40,7 @@ async def run(a):
     # warm-up, sequential and concurrent phases ask different requests (as far as the questions go), so an engine with
     # a prefix cache across requests (vLLM, SGLang, llama.cpp) cannot answer a timed request from an earlier phase
     n = 10 + a.n_seq + a.n_conc
-    qs = synth.items(n, a.synthetic, long_frac=a.long_frac) if a.synthetic else load_questions(a.questions, n)
+    qs = synth.items(n, a.synthetic, a.seed, long_frac=a.long_frac) if a.synthetic else load_questions(a.questions, n)
     bodies = [body(q, a.early_exit, a.questions_per_request) for q in qs]
     while len(bodies) < n:  # small question files are reused
         bodies += bodies
@@ -73,7 +73,7 @@ async def run(a):
                    questions_per_s=len(ok) * a.questions_per_request / wall)
     print(json.dumps({k: round(v, 2) if isinstance(v, float) else v for k, v in out.items()}))
     if a.out:
-        Path(a.out).write_text(json.dumps(out, indent=1))
+        Path(a.out).write_text(json.dumps(out, indent=1), encoding="utf-8")
 
 
 async def determinism(a, bodies):
@@ -101,7 +101,7 @@ async def determinism(a, bodies):
                                            decision_flips=flips, concurrency=a.concurrency))
     print(json.dumps(out))
     if a.out:
-        Path(a.out).write_text(json.dumps(out, indent=1))
+        Path(a.out).write_text(json.dumps(out, indent=1), encoding="utf-8")
 
 
 def main():
@@ -112,6 +112,9 @@ def main():
                     help="synthetic items with states of about this many tokens instead of --questions (basal.synth)")
     ap.add_argument("--long-frac", dest="long_frac", type=float, default=0.0,
                     help="--synthetic: share of long states (3k-10k tokens)")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="--synthetic: the items' seed (a repeated run with another seed asks states that a server "
+                         "with a prefix cache has not seen)")
     ap.add_argument("--questions-per-request", dest="questions_per_request", type=int, default=1, choices=range(1, 6),
                     help="2-5: that many fixed questions over each item's state in one request (SOAM)")
     ap.add_argument("--n-seq", dest="n_seq", type=int, default=200)
@@ -124,7 +127,8 @@ def main():
     a = ap.parse_args()
     if a.determinism:
         n = 2 * a.determinism
-        qs = synth.items(n, a.synthetic, long_frac=a.long_frac) if a.synthetic else load_questions(a.questions, n)
+        qs = synth.items(n, a.synthetic, a.seed, long_frac=a.long_frac) if a.synthetic \
+            else load_questions(a.questions, n)
         bodies = [body(q, a.early_exit, a.questions_per_request) for q in qs]
         while len(bodies) < n:
             bodies += bodies

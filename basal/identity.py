@@ -89,9 +89,25 @@ def build(tok, fmt, n_single, n_multi, n_long, seed=0, questions=None):
 
 @torch.no_grad()
 def reference(be, toks, ids):
+    if getattr(be, "gemma", None) is not None:
+        return reference_gemma(be, toks, ids)
     h = be.model.model(input_ids=torch.tensor([toks], device=be.dev), use_cache=False).last_hidden_state[0, -1]
     lp = torch.log_softmax(be.model.lm_head(h).float(), -1)
     return torch.softmax(lp[ids], -1).tolist()
+
+
+@torch.no_grad()
+def reference_gemma(be, toks, ids):
+    """Gemma 4 (basal-omni): the transformers forward of the decoder on SDPA's math kernel, as --mode eager runs it, and
+    the code logits as eager reads them (fp32 from the head's input, the final logit softcap in fp32; a softmax over
+    the code rows equals the softmax over the codes of the full log-softmax)."""
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    with sdpa_kernel([SDPBackend.MATH]):
+        h = be.gemma.lm(input_ids=torch.tensor([toks], device=be.dev), use_cache=False).last_hidden_state[0, -1]
+    z = h.float() @ be.model.lm_head.weight[ids].float().T
+    if be.softcap:
+        z = torch.tanh(z / be.softcap) * be.softcap
+    return torch.softmax(z, -1).tolist()
 
 
 def compare(ref, got):
@@ -158,6 +174,9 @@ def main(argv=None):
     ap.add_argument("--tree", choices=["dense", "flex"], default="dense", help="pass-2 mask with --lean on")
     ap.add_argument("--reference-lean", dest="reference_lean", choices=["on", "pass2", "off"], default=None,
                     help="the reference engine with or without the lean layer (built and freed first)")
+    ap.add_argument("--gemma-attn", dest="gemma_attn", choices=["auto", "math", "flex", "fa3", "fa3+math"],
+                    default="auto",
+                    help="Gemma 4 models: the attention kernel of the engine under test (basal-serve --gemma-attn)")
     ap.add_argument("--out", default=None)
     a = ap.parse_args(argv)
     if (a.reference_merge or a.reference_lean) and not a.reference_attn:
@@ -175,7 +194,8 @@ def main(argv=None):
         early.append(round(time.time() - t0, 1))
     t0 = time.time()
     be = None if early else GraphBackend(md, a.dtype, a.quant, compile=a.compile, shared=True, attn=a.attn,
-                                         merge=merge_arg(a.merge), lean=lean_arg(a.lean), tree=a.tree)
+                                         merge=merge_arg(a.merge), lean=lean_arg(a.lean), tree=a.tree,
+                                         gemma_attn=a.gemma_attn)
     if be is not None:
         print(json.dumps(dict(model=a.model, dtype=a.dtype, quant=a.quant, prompt_format=fmt, graphs=len(be.graphs),
                               attention=be.attn, fp8_checkpoint=be.fp8_checkpoint,
@@ -189,7 +209,7 @@ def main(argv=None):
             raise SystemExit(f"--against {a.against}: a different tokenizer")
     qs = None
     if a.questions:
-        qs = [json.loads(x) for x in Path(a.questions).read_text().splitlines() if x.strip()]
+        qs = [json.loads(x) for x in Path(a.questions).read_text(encoding="utf-8").splitlines() if x.strip()]
         qs = [q for q in qs if "options" in q and 2 <= len(q["options"]) <= (255 if fmt == 2 else 10)][: a.n_questions]
     single, multi, long = build(ref_be.tok, fmt, a.n_single, a.n_multi, a.n_long, a.seed, qs)
     rnd = random.Random(a.seed)
@@ -218,7 +238,7 @@ def main(argv=None):
         torch.cuda.empty_cache()
         t0 = time.time()
         be = GraphBackend(md, a.dtype, a.quant, compile=a.compile, shared=True, attn=a.attn, merge=merge_arg(a.merge),
-                          lean=lean_arg(a.lean), tree=a.tree)
+                          lean=lean_arg(a.lean), tree=a.tree, gemma_attn=a.gemma_attn)
         print(json.dumps(dict(model=a.model, dtype=a.dtype, quant=a.quant, prompt_format=fmt, graphs=len(be.graphs),
                               attention=be.attn, fp8_checkpoint=be.fp8_checkpoint,
                               startup_s=round(time.time() - t0, 1))), flush=True)
@@ -253,5 +273,5 @@ def main(argv=None):
                                                tree="flex" if be.flex else "dense",
                                                reference=a.reference, against=a.against,
                                                questions=a.questions and len(qs), rows=rows),
-                                          indent=1))
+                                          indent=1), encoding="utf-8")
     return rows

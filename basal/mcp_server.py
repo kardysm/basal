@@ -58,7 +58,7 @@ def build(decide, model="basal"):
         try:
             return await decide(body)
         except Exception as e:  # noqa: BLE001
-            raise ToolError(str(e)) from e  # the message the HTTP API returns with 422, so the agent can fix its call
+            raise ToolError(str(e)) from e  # the message of the HTTP API's error, so the agent can fix its call
 
     @srv.tool(name="decide", annotations=ro)
     async def decide_one(
@@ -113,7 +113,7 @@ def http(server, host):
     """--mcp on: the MCP tools of a running basal server -> (routes for /mcp, the session manager's lifespan).
     Stateless JSON responses: every call is one request. Bound to a loopback host, Host / Origin are checked (DNS
     rebinding)."""
-    m = build(server.decide, getattr(server, "name", None) or "basal")
+    m = build(getattr(server, "serve", server.decide), getattr(server, "name", None) or "basal")
     app = m.streamable_http_app(host=host, stateless_http=True, json_response=True)
     return app.routes, m.session_manager.run
 

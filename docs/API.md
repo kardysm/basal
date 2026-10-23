@@ -74,11 +74,21 @@ one shared state (SOAM); asking them in one request is faster than separate requ
 - `score` is the expected level (0 = first level); `legend` maps level keys to their texts.
 - `branches` counts the question branches of the request: one per question, one per label of a `multi` and one per
   tool of a `tool` question with `"multi": true` (times the option orders).
-- Errors (unknown type, too many options, a field not available in the server's mode or model) return HTTP 422 with
-  `{"error": "..."}`.
+- Errors return `{"error": "..."}` with a status code (2.3.1; before, every error was 422):
+  - **422**: the request is invalid and must be changed (a body that is not a JSON object, a missing `state` or
+    `questions`, a wrong field value, too many options, a prompt longer than the context, a field not available in
+    the server's mode or model);
+  - **503**: the GPU ran out of memory (CUDA, MPS or Metal). The server frees the failed request's memory, so a retry,
+    later or on another server, may succeed;
+  - **500**: any other server error.
 - `GET /v1/models` returns `{"models": [{"name", "description", "release_date", "mode", "early_exit",
-  "temperature_per_prim"}]}` (`release_date` is the engine's release date, not the model's); `GET /health` returns
-  `{"status": "ok"}`.
+  "temperature_per_prim"}]}` (`release_date` is the engine's release date, not the model's).
+- `GET /health` returns `{"status": "ok", "running": R, "queued": Q}` (2.3.1). The counts cover the decision requests
+  in flight (`/v1/systemone`, `/v1/basal` and MCP tool calls), from the moment the server has read a request until its
+  answer or error. `queued` counts those waiting for the engine: all their queue entries are still in the server's
+  queue (the main queue, the `--scheduler` backlog or the `--long-lane` queue). `running` counts the others: in an
+  engine call, or in the server's own work before or after one (a request with a second pass, such as `--orders auto`,
+  can be queued again). `running` and `queued` both 0 means that the server is idle.
 
 ## Question types
 
@@ -161,8 +171,8 @@ certify your own thresholds on your data. The ports use per-engine files where t
 **Calibrate on your own data.** On your own domain, refit the temperatures and thresholds on your labelled requests
 with `basal-calibrate`. It runs the engine you serve, refits by the same procedure, and prints coverage and error at
 the shipped and the refitted thresholds on a held-out part of your items. A few hundred labelled items usually certify
-the 5% target; the 1% target needs at least 299 accepted decisions without an error in the fitting part, so in
-practice about 1,000 items or more. A target that cannot be certified is marked in the file, and `max_error` then
+the 5% target; the 1% target needs at least 299 accepted decisions without an error in the fitting part, per
+question type, so in practice about 1,000 items of each type or more. A target that cannot be certified is marked in the file, and `max_error` then
 defers every `act` / `tool` decision of that type. Input format and method: [CALIBRATION.md](CALIBRATION.md).
 
 ```bash

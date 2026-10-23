@@ -66,7 +66,7 @@ def main():
         out["too_many_options"] = {"status": r.status_code, "response": r.json()}
         print(f"=== too_many_options {r.status_code} {r.json()}")
     if a.out:
-        with open(a.out, "w") as f:
+        with open(a.out, "w", encoding="utf-8") as f:
             json.dump(out, f, ensure_ascii=False, indent=1)
 
 

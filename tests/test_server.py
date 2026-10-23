@@ -13,7 +13,7 @@ import basal.server as server_module
 from basal.facts import HEADER, facts, inject
 from basal.server import Server, default_mode, models_payload, named_options, parser, to_items
 
-SPEC = json.loads((Path(__file__).parent / "data/systemone_openapi.json").read_text())
+SPEC = json.loads((Path(__file__).parent / "data/systemone_openapi.json").read_text(encoding="utf-8"))
 
 
 def schema(name):
@@ -70,6 +70,61 @@ def test_default_mode_prefers_cuda_over_mlx(monkeypatch):
     assert default_mode() == "fast"
 
 
+def test_default_mode_gemma4_fast_only_where_its_gate_passed(monkeypatch, tmp_path):
+    """basal-omni (Gemma 4) without --mode: fast where its fast configuration passed its gate (Hopper with FlashAttention
+    3, Blackwell workstation GPUs with flex), eager on other GPUs; every other model fast on any CUDA GPU."""
+    omni, llama = tmp_path / "omni", tmp_path / "llama"
+    for d, t in ((omni, "gemma4"), (llama, "llama")):
+        d.mkdir()
+        (d / "config.json").write_text(f'{{"model_type": "{t}"}}', encoding="utf-8")
+    monkeypatch.setattr(server_module.torch.cuda, "is_available", lambda: True)
+    for kernels in ("fa3", "flex"):
+        monkeypatch.setattr(server_module, "gemma_fast_kernels", lambda: kernels)
+        assert default_mode(str(omni)) == "fast"
+    monkeypatch.setattr(server_module, "gemma_fast_kernels", lambda: None)
+    assert default_mode(str(omni)) == "eager"
+    assert default_mode(str(llama)) == default_mode() == "fast"
+
+
+def test_fast_mode_loads_the_eager_fitted_calibration(tmp_path):
+    """The graph engine (--mode fast) has no calibration file of its own: CALIBRATION.json, also next to a
+    CALIBRATION.fast.json. basal-omni's fast mode passed its automation gate with the eager-fitted file; refits on its
+    readouts did not (OMNI.md), so a fast-only file must not be picked up unnoticed."""
+    from basal.server import calibration_file
+    for name in ("CALIBRATION.json", "CALIBRATION.fast.json"):
+        (tmp_path / name).write_text("{}", encoding="utf-8")
+    assert calibration_file(tmp_path, "graph") == tmp_path / "CALIBRATION.json"
+
+
+@pytest.mark.parametrize("fa3, major, want", [(None, 9, "fa3"), ("no flash_attn_3", 9, None), ("Hopper only", 12, "flex"),
+                                              ("Hopper only", 10, None), ("Hopper only", 8, None)])
+def test_gemma_fast_kernels_by_gpu_class(monkeypatch, fa3, major, want):
+    """basal-omni's fast kernels: fa3 where FlashAttention 3 runs, flex on sm_120 (RTX PRO 6000 class, gated 20 Oct),
+    none elsewhere (B200's sm_100 and Ampere have no gate yet)."""
+    import basal.engine as engine_module
+    monkeypatch.setattr(engine_module, "attention_available", lambda impl: fa3 if impl == "fa3" else None)
+    monkeypatch.setattr(engine_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(engine_module.torch.cuda, "get_device_capability", lambda *a: (major, 0))
+    assert engine_module.gemma_fast_kernels() == want
+
+
+def test_gemma_fast_kernels_need_flex(monkeypatch):
+    """Without Triton (FlexAttention) neither fast configuration runs: fa3 takes flex in the global layers."""
+    import basal.engine as engine_module
+    monkeypatch.setattr(engine_module, "attention_available", lambda impl: "no Triton" if impl == "flex" else None)
+    assert engine_module.gemma_fast_kernels() is None
+
+
+def test_gemma_flex_refused_before_loading(tmp_path, monkeypatch):
+    import basal.engine as engine_module
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "gemma4"}), encoding="utf-8")
+    monkeypatch.setattr("basal.engine.AutoTokenizer.from_pretrained", lambda *_: pytest.fail("loaded before refusing"))
+    monkeypatch.setattr("basal.engine.set_attention", lambda *_, **__: "fa2")
+    monkeypatch.setattr(engine_module, "attention_available", lambda impl: "no Triton" if impl == "flex" else None)
+    with pytest.raises(ValueError, match="--gemma-attn flex: no Triton"):
+        engine_module.GraphBackend(str(tmp_path), gemma_attn="flex")
+
+
 def test_default_mode_requires_both_mlx_packages_on_mps(monkeypatch):
     monkeypatch.setattr(server_module.torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(server_module.torch.backends.mps, "is_available", lambda: True)
@@ -78,14 +133,14 @@ def test_default_mode_requires_both_mlx_packages_on_mps(monkeypatch):
 
 
 def test_benchmark_mps_default_avoids_eager_fp32(monkeypatch):
-    monkeypatch.setattr(bench_module, "default_mode", lambda: "mlx")
+    monkeypatch.setattr(bench_module, "default_mode", lambda model=None: "mlx")
     monkeypatch.setattr(bench_module.torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(bench_module.torch.backends.mps, "is_available", lambda: True)
     assert bench_module.default_modes() == ["mps", "mlx"]
 
 
 def test_benchmark_cuda_default_preserves_fp32_reference(monkeypatch):
-    monkeypatch.setattr(bench_module, "default_mode", lambda: "fast")
+    monkeypatch.setattr(bench_module, "default_mode", lambda model=None: "fast")
     monkeypatch.setattr(bench_module.torch.cuda, "is_available", lambda: True)
     assert bench_module.default_modes() == ["eager-fp32", "fast"]
 
@@ -173,6 +228,10 @@ def test_without_force_lang_the_language_is_detected():
     assert multi["lang"] == "pl" and multi["branches"] == [("Co widać?\nCzy dotyczy: „kot”?", ["Tak", "Nie"])]
     qs = {"cat": {"type": "noul", "instructions": "Is it a cat?"}}
     assert to_items("Kot śpi.", qs) == to_items("Kot śpi.", qs, force_lang=None)
+    # a Polish state decides every question; an English one leaves it to each question's own text
+    mixed = {"a": {"type": "noul", "instructions": "Is it a cat?"}, "b": {"type": "noul", "instructions": "Czy śpi?"}}
+    assert [q["lang"] for q in to_items("Kot śpi.", mixed)] == ["pl", "pl"]
+    assert [q["lang"] for q in to_items("The cat sleeps.", mixed)] == ["en", "pl"]
 
 
 def test_request_lang_reaches_the_prompt():
@@ -383,10 +442,40 @@ def test_vat_line_skips_exchange_rates():                         # regression: 
     assert facts("Cena 4,31 zł netto, VAT 23%.")[0].startswith("4,31 zł × 1,23")    # a price, not a rate: kept
 
 
+def test_amounts_with_dot_thousands_separator():                 # regression: "10.000,00 zł" was read as "0,00 zł"
+    assert facts("Faktura na 10.000,00 zł, VAT 23%.") == [
+        "10 000,00 zł × 1,23 = 12 300,00 zł; 10 000,00 zł ÷ 1,23 = 8 130,08 zł"]
+    assert facts("Próg 1.500 zł, zamówienie 1 200 zł.") == ["1 500,00 zł > 1 200,00 zł"]   # was "500,00 zł < 1 200,00 zł"
+    assert facts("Kwota 1.234.567,89 PLN brutto, VAT 23%.") == ["1 234 567,89 zł brutto ÷ 1,23 = 1 003 713,73 zł netto"]
+    for s in ("Termin 01.05.2026, opłata 1.5 zł, VAT 23%.", "Wersja 2.25 zł, VAT 23%."):   # a date, a decimal: no amount
+        assert not any(" zł × " in x or " zł ÷ " in x for x in facts(s)), s
+    assert facts("Opłata 1500 zł, VAT 8%.")[0].startswith("1 500,00 zł × 1,08")          # unchanged forms
+    assert facts("Faktura na 1 000,00 zł netto, VAT 23%.")[0].startswith("1 000,00 zł × 1,23")
+
+
+def test_year_of_a_date_is_not_a_duration():                     # regression: "2025 roku" added "+ 1 rok"
+    ls = facts("Doręczono 3 marca 2025 roku, termin 7 dni.")
+    assert "3 marca 2025 r. + 7 dni (kalendarzowo) = 10 marca 2025 r. (poniedziałek)" in ls
+    assert not any(" rok (kalendarzowo)" in x for x in ls), ls
+    assert not any(" rok (kalendarzowo)" in x for x in facts("Umowę zawarto 5 maja 2026 r. W 2025 roku nie było zmian."))
+    ls = facts("Gwarancja obowiązuje w terminie roku od 3 marca 2025 roku.")                  # a real "roku": kept
+    assert "3 marca 2025 r. + 1 rok (kalendarzowo) = 3 marca 2026 r. (wtorek)" in ls
+    assert any(" + 1 miesiąc " in x for x in facts("Wpłynęło 3 marca 2025 roku; odpowiedź w terminie miesiąca."))
+    for text in ("Doręczono 3 marca 2025  roku, termin 7 dni.", "Doręczono 3 marca 2025\nroku, termin 7 dni.",
+                 "Doręczono 3 marca 2025\troku, termin 7 dni.", "Doręczono 2025-03-03 roku, termin 7 dni."):
+        assert not any(" rok (kalendarzowo)" in x for x in facts(text)), text
+
+
 # VAT rate needs VAT context
 COURT_FEE = ("Pozew o zapłatę 19 726,00 zł. Opłata: ponad 15 000 do 20 000 zł — 1000 zł; ponad 20 000 zł — 5% wartości "
              "przedmiotu sporu, nie więcej niż 200 000 zł.")
 
+
+
+def test_very_long_amounts_do_not_crash_facts():                   # 27+ digits exceeded Decimal's default precision
+    for text in ("Faktura na 123.456.789.012.345.678.901.234.567,00 zł, VAT 23%.",
+                 "Faktura na 123 456 789 012 345 678 901 234 567 890,00 zł, VAT 23%."):
+        assert facts(text)
 
 def test_percentage_is_a_vat_rate_only_with_vat_in_its_sentence():   # regression: "5% wartości sporu" got ×1,05 lines
     assert facts(COURT_FEE) == []
@@ -435,3 +524,29 @@ def test_viz_packing_and_served_comparison():
     out = compare_served(res, served)
     assert abs(out["questions"][0]["served_max_diff"] - 0.05) < 1e-9
     assert abs(out["questions"][1]["served_max_diff"] - 0.025) < 1e-9 and out["served"] is served["answers"]
+
+
+def test_out_of_memory_frees_the_failed_forward():
+    """An out-of-memory error's frames are cleared before the requests get it: the failed forward's tensors are freed at
+    once, not at a later garbage collection (until then the next requests ran out of memory too; ultra eager, 20 Oct)."""
+    import weakref
+
+    import torch
+    from basal.server import _fail
+    held = []
+
+    def forward():
+        t = torch.zeros(4)
+        held.append(weakref.ref(t))
+        raise torch.OutOfMemoryError("CUDA out of memory")
+
+    async def main():
+        fut = asyncio.get_running_loop().create_future()
+        try:
+            forward()
+        except Exception as e:  # noqa: BLE001
+            _fail([fut], e)
+        assert held[0]() is None
+        with pytest.raises(torch.OutOfMemoryError):
+            await fut
+    asyncio.run(main())

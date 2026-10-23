@@ -32,7 +32,7 @@ GGUF_KINDS = ("gguf", "ollama", "llamacpp")  # the engine serves GGUF weights: -
 
 
 def build(mode, md, vllm_model=None, gguf=None, ollama_model=None, ollama_url="http://127.0.0.1:11434",
-          llamacpp_url="http://127.0.0.1:8080", fmt=1):
+          llamacpp_url="http://127.0.0.1:8080", fmt=1, mlx_packed=False):
     if mode == "eager-fp32":
         return EagerBackend(md, "float32")
     if mode.startswith("fast-exit@"):
@@ -45,6 +45,8 @@ def build(mode, md, vllm_model=None, gguf=None, ollama_model=None, ollama_url="h
     if mode in ("tpu", "tpu-fp32"):  # Google TPU (basal[tpu]); tpu-fp32: the same engine in fp32 (parity reference)
         from .tpu import TPUBackend
         return TPUBackend(md, "float32" if mode == "tpu-fp32" else "bfloat16", warm=False)
+    if mode.startswith("vllm@"):  # vllm@<preset>: basal-serve --mode vllm --vllm-preset <preset>
+        return VLLMBackend(vllm_model or md, max_options=max_options(fmt), preset=mode.split("@", 1)[1])
     kind, quant, comp = MODES[mode]
     if kind == "eager":
         return EagerBackend(md, "bfloat16")
@@ -53,7 +55,7 @@ def build(mode, md, vllm_model=None, gguf=None, ollama_model=None, ollama_url="h
     if kind == "sglang":
         return SGLangBackend(md)
     if kind == "mlx":
-        return MLXBackend(md, quant=quant)
+        return MLXBackend(md, quant=quant, packed=mlx_packed)
     if kind == "mps":
         return MPSBackend(md, "bfloat16")
     if kind == "ollama":
@@ -68,12 +70,13 @@ def build(mode, md, vllm_model=None, gguf=None, ollama_model=None, ollama_url="h
     return GraphBackend(md, "bfloat16", quant, compile=comp, shared=True)
 
 
-def default_modes():
+def default_modes(model=None):
     """A reference that fits the device, then the serving default: eager-fp32 on CUDA and CPU, bf16 mps on Apple
-    Silicon (the fp32 4.5B needs about 18 GB)."""
-    mode = default_mode()
+    Silicon (the fp32 4.5B needs about 18 GB); a model with recurrent-state layers (Qwen3.5) gets eager alone there
+    (mps refuses it)."""
+    mode = default_mode(model)
     if not torch.cuda.is_available() and torch.backends.mps.is_available():
-        return [mode] if mode == "mps" else ["mps", mode]
+        return [mode] if mode in ("mps", "eager") else ["mps", mode]
     return ["eager-fp32", mode]
 
 
@@ -140,7 +143,7 @@ def load_questions(paths, n, seed=0):
     with "questions" are skipped)."""
     if isinstance(paths, (str, Path)):
         paths = [paths]
-    qs = [json.loads(line) for p in paths for line in Path(p).read_text().splitlines() if line.strip()]
+    qs = [json.loads(line) for p in paths for line in Path(p).read_text(encoding="utf-8").splitlines() if line.strip()]
     qs = [q for q in qs if "options" in q]
     random.Random(seed).shuffle(qs)
     return qs[:n]
@@ -223,16 +226,19 @@ def main():
     ap.add_argument("--modes", nargs="+", default=None,
                     help="default: eager-fp32 and the serving default (fast on CUDA); on Apple Silicon bf16 mps and mlx "
                          "(--modes eager-fp32 mps mlx for fp32 agreement if memory allows). Modes: eager-fp32, eager, "
-                         "fast, fast-nocompile, fp8, nvfp4, vllm, sglang, fast-exit@off|0.999|0.995|0.99|0.98; Apple "
-                         "Silicon: mlx, mlx-q8, mps; GGUF: gguf, gguf@<file.gguf>, ollama, llamacpp; AMD Strix Halo: "
-                         "strix; Google TPU (basal[tpu]): tpu, tpu-fp32")
+                         "fast, fast-nocompile, fp8, nvfp4, vllm, vllm@deterministic (--vllm-preset), "
+                         "sglang, fast-exit@off|0.999|0.995|0.99|0.98; Apple Silicon: mlx, mlx-q8, mps; GGUF: gguf, "
+                         "gguf@<file.gguf>, ollama, llamacpp; AMD Strix Halo: strix; Google TPU (basal[tpu]): tpu, "
+                         "tpu-fp32")
     ap.add_argument("--questions", nargs="+", default=DEFAULT_QUESTIONS,
                     help="JSONL file(s) with simple items (default: the bundled examples, 44 items)")
     ap.add_argument("--n", type=int, default=500)
     ap.add_argument("--lat-n", dest="lat_n", type=int, default=100)
     ap.add_argument("--out", default=None, help="write results as JSON")
+    ap.add_argument("--mlx-packed", dest="mlx_packed", action="store_true",
+                    help="mlx modes: the packed forward of short Llama groups (basal-serve --mlx-packed)")
     a = ap.parse_args()
-    a.modes = a.modes or default_modes()
+    a.modes = a.modes or default_modes(a.model)
     md = resolve(a.model, metadata_only=all(MODES.get(m.split("@")[0], ("",))[0] in GGUF_KINDS for m in a.modes))
     vm = resolve(a.vllm_model) if a.vllm_model else None
     qs = load_questions(a.questions, a.n)
@@ -241,7 +247,7 @@ def main():
     for mode in a.modes:
         reset_memory()
         t0 = time.time()
-        be = build(mode, md, vm, a.gguf, a.ollama_model, a.ollama_url, a.llamacpp_url, fmt)
+        be = build(mode, md, vm, a.gguf, a.ollama_model, a.ollama_url, a.llamacpp_url, fmt, a.mlx_packed)
         load_s = time.time() - t0
         groups = groups_for(be.tok, qs, fmt)
         dec, r = measure(be, groups, min(a.lat_n, len(groups) - 5))
@@ -264,7 +270,7 @@ def main():
         print(f"{r['mode']:<18}{r['lat2_ms']:>9.1f}{r['lat1_ms']:>9.1f}{r['dec_s']:>8.1f}"
               f"{r.get('agree', float('nan')):>8.3f}{r.get('acc', float('nan')):>7.3f}{r['mem_gb']:>6.1f}")
     if a.out:
-        Path(a.out).write_text(json.dumps(rows, indent=1))
+        Path(a.out).write_text(json.dumps(rows, indent=1), encoding="utf-8")
 
 
 if __name__ == "__main__":

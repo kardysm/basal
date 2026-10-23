@@ -26,6 +26,7 @@ branch over the state; the state is computed once per request. `act`, `multi` an
 import argparse
 import asyncio
 import functools
+import gc
 import hashlib
 import json
 import sys
@@ -33,18 +34,23 @@ import math
 import os
 import re
 import threading
+import traceback
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import torch
 
-from .engine import (ATTN, EagerBackend, ExitGraphBackend, GGUFBackend, GraphBackend, LlamaCppBackend, MLXBackend,
-                     MPSBackend, OllamaBackend, SGLangBackend, VLLMBackend, resolve, set_fp8_fast_accum)
+from .engine import (ATTN, EAGER_FORWARDS, EagerBackend, ExitGraphBackend, GGUFBackend, GraphBackend, LlamaCppBackend,
+                     MLXBackend, MPSBackend, OllamaBackend, SGLangBackend, VLLM_PRESETS, VLLMBackend, fp8_refused,
+                     gemma_fast_kernels, recurrent_layers, recurrent_refused, resolve, set_fp8_fast_accum)
 from .evidence import Evidence
 from .facts import inject as inject_facts
+from .gdn_graph import default_fast as gdn_default_fast, is_gdn, refused as gdn_refused
 from . import tasks
-from .prompt import FORMATS, MAX_OPTIONS, lang_of, letter_ids, max_options, media_messages, model_format, render
+from .prompt import (FORMATS, LAYOUTS, MAX_OPTIONS, RequestError, lang_of, letter_ids, max_options, media_messages,
+                     model_format, model_layout,
+                     reads_request, render)
 from .sets import label_set_id
 from .sets import select as select_set
 from .sets import validate as validate_set
@@ -54,7 +60,7 @@ from .tools import answer as tool_answer
 from .tools import parse as parse_tools
 from .tools import set_answer as tool_set_answer
 
-RELEASE_DATE = "2026-10-19"  # the engine's release date (GET /v1/models), not the served model's
+RELEASE_DATE = "2026-10-22"  # the engine's release date (GET /v1/models), not the served model's
 
 MODES = {
     # mode: (backend, quantisation, compile)
@@ -77,12 +83,23 @@ MODES = {
 }
 
 
-def default_mode():
+def default_mode(model=None, revision=None):
     """fast on CUDA, mlx on Apple Silicon when mlx and mlx-lm are installed, mps otherwise there, tpu on a TPU VM
-    with basal[tpu] installed, else eager."""
+    with basal[tpu] installed, else eager. basal-omni (Gemma 4; model: its directory or repo id) gets fast only on the
+    GPU classes where its fast configuration passed its gate (gemma_fast_kernels: Hopper with flash_attn_3, Blackwell
+    workstation GPUs), eager on other GPUs until they pass theirs (2.2.0 had no working default for it there: fast
+    stopped at "'Gemma4Model' object has no attribute 'layers'"). A model with recurrent-state layers gets eager on CUDA
+    and Apple Silicon (mps refuses it, mlx is not checked on it), except a Qwen3.5 model (Gated DeltaNet), which gets
+    fast on the GPU class where the graph engine's port passed its gate (gdn_graph.default_fast: Hopper with fla)."""
     if torch.cuda.is_available():
+        if model is not None and _recurrent(model, revision):
+            return "fast" if _gdn(model, revision) and gdn_default_fast() else "eager"
+        if model is not None and gemma_fast_kernels() is None and _gemma4(model, revision):
+            return "eager"
         return "fast"
     if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        if model is not None and _recurrent(model, revision):
+            return "eager"
         try:
             import mlx.core  # noqa: F401
             import mlx_lm  # noqa: F401
@@ -93,6 +110,33 @@ def default_mode():
     if tpu_available():
         return "tpu"
     return "eager"
+
+
+def _gemma4(model, revision=None):
+    """A Gemma 4 model (basal-omni), from its config.json; False when that cannot be read (the server says why)."""
+    from .gemma4_graph import is_gemma4_dir
+    try:
+        return is_gemma4_dir(resolve(model, revision, metadata_only=True))
+    except Exception:  # offline without the model cached, a wrong name: the model load reports it
+        return False
+
+
+def _recurrent(model, revision=None):
+    """The recurrent-state layers of a model (recurrent_layers), from its config.json; None when that cannot be read
+    (the model load reports it)."""
+    try:
+        return recurrent_layers(resolve(model, revision, metadata_only=True))
+    except Exception:
+        return None
+
+
+def _gdn(model, revision=None):
+    """A Qwen3.5 model of Gated DeltaNet and attention layers (gdn_graph.is_gdn: the recurrent models the CUDA graph
+    engine serves), from its config.json; False when that cannot be read."""
+    try:
+        return is_gdn(resolve(model, revision, metadata_only=True))
+    except Exception:
+        return False
 
 
 def validate_quant(mode, quant):
@@ -121,7 +165,7 @@ def named_options(crit, option_keys="show"):
     (the format of the training data and of our PL/EN evaluation clients); descriptions that are not unique within the
     question still get their key, otherwise the options could not be told apart."""
     if option_keys not in ("show", "hide"):
-        raise ValueError(f'option_keys must be "show" or "hide", got {option_keys!r}')
+        raise RequestError(f'option_keys must be "show" or "hide", got {option_keys!r}')
     texts = [str(k) if v is None else _text(v) for k, v in crit.items()]
     dup = {t for t in texts if texts.count(t) > 1}
     shown = [t if v is None or (option_keys == "hide" and t not in dup) else f"{k}: {t}"
@@ -138,6 +182,18 @@ def yes_no(lang, crit=None):
                                 _text(crit.get("false") or ("Nie" if lang == "pl" else "No"))])
 
 
+def check_body(body):
+    """The shape of a decision request (its questions are read by to_items) -> RequestError (HTTP 422)."""
+    if not isinstance(body, dict):
+        raise RequestError("the request body must be a JSON object")
+    for k in ("state", "questions"):
+        if k not in body:
+            raise RequestError(f"missing field {k!r}")
+    if not isinstance(body["questions"], dict) or not all(isinstance(q, dict) for q in body["questions"].values()):
+        raise RequestError('"questions" must be an object of {name: question object}')
+
+
+@reads_request
 def to_items(state, questions, max_opts=MAX_OPTIONS, force_lang=None):
     """Questions of a request -> readout items (options as a list) + keys to assemble the answer. Every item has
     `branches` = [(question text, options)]: one for the decision types, one per label for `multi`. max_opts: the
@@ -145,17 +201,18 @@ def to_items(state, questions, max_opts=MAX_OPTIONS, force_lang=None):
     for every question's template, yes/no words and branch text, instead of the language detected from its text."""
     state = _text(state)
     out = []
+    state_pl = not force_lang and lang_of(state) == "pl"  # once per request, not once per question
     for name, q in questions.items():
         t = q.get("type", "choice")
         instr = _text(q.get("instructions", ""))
-        lang = force_lang or lang_of(state + instr)
+        lang = force_lang or ("pl" if state_pl else lang_of(instr))
         extra = {}
         if t == "multi":  # one yes/no branch per label
             crit = q.get("criteria") or {}
             if isinstance(crit, list):
                 crit = {k: None for k in crit}
             if not crit:
-                raise ValueError(f"question {name!r}: multi needs criteria")
+                raise RequestError(f"question {name!r}: multi needs criteria")
             keys = list(crit)
             labels = [str(k) if v is None else _text(v) for k, v in crit.items()]
             yn = yes_no(lang)[1]
@@ -216,7 +273,7 @@ def to_items(state, questions, max_opts=MAX_OPTIONS, force_lang=None):
             keys, opts = named_options(crit, q.get("option_keys", "show"))
         if not 2 <= len(opts) <= max_opts:
             what = " (tools and extra options)" if t == "tool" else ""
-            raise ValueError(f"question {name!r}: {len(opts)} options{what} (supported: 2..{max_opts})")
+            raise RequestError(f"question {name!r}: {len(opts)} options{what} (supported: 2..{max_opts})")
         out.append(dict(name=name, type=t, keys=keys, state=state, question=instr, options=opts, lang=lang,
                         branches=[(instr, opts)], option_keys=q.get("option_keys", "show"), **extra))
     return out
@@ -226,7 +283,7 @@ def act_spec(name, q, outcomes):
     """Cost matrix C[action][outcome] from the full form or the short form {"wrong": W, "defer": D}."""
     costs = q.get("costs")
     if not isinstance(costs, dict) or not costs:
-        raise ValueError(f"question {name!r}: act needs costs")
+        raise RequestError(f"question {name!r}: act needs costs")
     if set(costs) <= {"wrong", "defer"} and not isinstance(costs.get("wrong"), dict):
         w = float(costs["wrong"])
         C = {y: {z: 0.0 if z == y else w for z in outcomes} for y in outcomes}
@@ -235,7 +292,7 @@ def act_spec(name, q, outcomes):
         return dict(costs=C, defer="defer" if "defer" in costs else None, max_error=q.get("max_error"))
     for a, row in costs.items():
         if not isinstance(row, dict) or set(row) != set(outcomes):
-            raise ValueError(f"question {name!r}: costs[{a!r}] must give a cost for every outcome {outcomes}")
+            raise RequestError(f"question {name!r}: costs[{a!r}] must give a cost for every outcome {outcomes}")
     C = {a: {z: float(v) for z, v in row.items()} for a, row in costs.items()}
     defer = q.get("defer_action") or next((a for a in ("defer", "human") if a in C), None)
     return dict(costs=C, defer=defer, max_error=q.get("max_error"))
@@ -270,7 +327,7 @@ def act_answer(q, probs, conf, cal):
             ans["max_error"] = NO_CERTIFICATE
         if (thr is None or conf < thr) and action != spec["defer"]:
             if spec["defer"] is None:
-                raise ValueError("max_error needs a defer action (\"defer\"/\"human\" or defer_action)")
+                raise RequestError("max_error needs a defer action (\"defer\"/\"human\" or defer_action)")
             ans["action"], ans["refused"] = spec["defer"], action
         ans["deferred"] = ans["action"] == spec["defer"]
     validated = bool(cal.get("temperature_per_prim") or cal.get("temperature_per_bucket")) and (
@@ -331,11 +388,14 @@ def check_calibration(cal, fmt, path):
         raise SystemExit(f"{path} was fitted for prompt format {cal['prompt']}, the model uses format {fmt}")
 
 
-def calibration_name(kind, quant):
-    """Engine name of the per-engine calibration file CALIBRATION.<engine>.json: the quantised CUDA modes (fp8, nvfp4)
-    and the engines other than the basal bf16 path; None = CALIBRATION.json."""
+def calibration_name(kind, quant, preset=None):
+    """Engine name of the per-engine calibration file CALIBRATION.<engine>.json: the quantised CUDA modes (fp8, nvfp4),
+    the engines other than the basal bf16 path and a --vllm-preset other than the default (vllm.<preset>); None =
+    CALIBRATION.json."""
     if kind in ("graph", "exit") and quant in ("fp8", "nvfp4"):
         return quant
+    if kind == "vllm" and preset not in (None, "default"):
+        return f"vllm.{preset}"
     return kind if kind in ("vllm", "sglang", "mlx", "gguf", "ollama", "llamacpp", "tpu") else None
 
 
@@ -360,6 +420,33 @@ def deterministic_setup(kind):
 def _answer(fut, res):
     if not fut.done():
         fut.set_result(res)
+
+
+def out_of_memory(e):
+    """The GPU ran out of memory: torch.OutOfMemoryError (CUDA, MPS), or a CUDA / Metal error that says so."""
+    return isinstance(e, torch.OutOfMemoryError) or isinstance(e, RuntimeError) and (
+        "out of memory" in str(e).lower() or "OutOfMemory" in str(e))
+
+
+def http_status(e):
+    """The status code of a failed request: 422 for an invalid request (RequestError: the client must change it),
+    503 when the GPU ran out of memory (a retry may succeed: the server frees the request's memory), 500 for any other
+    server error."""
+    if isinstance(e, RequestError):
+        return 422
+    return 503 if out_of_memory(e) else 500
+
+
+def _fail(futs, e):
+    """Requests of a failed engine call get its error. Out of GPU memory: the frames of the failed forward are cleared
+    first; through the traceback (and the futures that hold it, a reference cycle) they kept its tensors alive until
+    a garbage collection, so the handler's empty_cache could not return them and the next requests ran out of memory
+    too (ultra in eager: a 2k-token request right after an 82k-token one, 20 Oct)."""
+    if out_of_memory(e):
+        traceback.clear_frames(e.__traceback__)
+    for f in futs:
+        if not f.done():
+            f.set_exception(e)
 
 
 class LaneGate:
@@ -446,6 +533,13 @@ def lean_tree(lean, tree, kind, compiled=True, quant=None):
     return lean, tree
 
 
+def refuse_lean_flex(lean, tree):
+    """--lean on with --tree flex (both explicit, so refused before a mode is chosen or a model resolved)."""
+    if lean == "on" and tree == "flex":
+        raise SystemExit("--tree flex runs with --lean pass2; with --lean on its FlexAttention falls back to an "
+                         "uncompiled kernel during CUDA graph capture and the engine fails to start")
+
+
 def merge_arg(value):
     """--merge auto / on / off -> the GraphBackend argument ("auto", True, False)."""
     return {"on": True, "off": False}.get(value, "auto")
@@ -476,10 +570,11 @@ def orders_for(orders, k):
 
 
 def models_payload(name, mode, policies, temperatures=None, prompt_format=None, orders=None, media=(),
-                   calibration_warning=None):
+                   calibration_warning=None, vllm_preset=None, layout=None):
     """GET /v1/models in the official ModelMetadataList shape, plus the serving mode, early-exit levels, the
     temperatures in use ({} = uncalibrated probabilities, what basal-calibrate needs from a running server), the
-    model's prompt format, the option orders served and why the --calibration file may not belong to the model."""
+    model's prompt format, the option orders served, why the --calibration file may not belong to the model and the
+    --vllm-preset (--mode vllm)."""
     entry = {"name": name, "release_date": RELEASE_DATE,
              "description": "basal typed-decision model (choice / noul / score / act / multi / tool), Polish and "
                             "English",
@@ -492,7 +587,26 @@ def models_payload(name, mode, policies, temperatures=None, prompt_format=None, 
         entry["orders"] = orders
     if calibration_warning:
         entry["calibration_warning"] = calibration_warning
+    if vllm_preset:
+        entry["vllm_preset"] = vllm_preset
+    if layout not in (None, "canonical"):  # the prompt layout served (2.4.1; basal-calibrate fits its file)
+        entry["layout"] = layout
     return {"models": [entry]}
+
+
+def refuse_layout_caches(layout, a):
+    """--state-cache-gb and --prefix-cache cache the prompt up to the end of the state, which only the canonical layout
+    starts with."""
+    if getattr(a, "state_cache_gb", 0) or getattr(a, "prefix_cache", "off") == "on":
+        raise SystemExit(f"layout {layout}: --state-cache-gb and --prefix-cache need the canonical layout (they cache "
+                         "the prompt up to the end of the state, which only that layout starts with)")
+
+
+def calibration_layout(cal):
+    """The prompt layout a calibration file was fitted on: fitted_on.layout (basal-calibrate --layout), else a top-level
+    "layout" (the training side's files), else canonical."""
+    fitted = cal.get("fitted_on")
+    return (fitted.get("layout") if isinstance(fitted, dict) else None) or cal.get("layout") or "canonical"
 
 
 def calibration_orders(cal):
@@ -528,18 +642,22 @@ def calibration_mismatch(cal, name, md):
     return None
 
 
-def load_calibration(md, kind, path, quant, orders, off=False):
+def load_calibration(md, kind, path, quant, orders, off=False, preset=None, layout="canonical"):
     """The calibration basal-serve applies -> (calibration dict, its file, None or why it is unvalidated). A file
     fitted on other option orders than the served ones gives wrong temperatures and thresholds: the file for the
     served orders, CALIBRATION[.<engine>].o<orders>.json, is used when the model ships one; otherwise the file is kept
     for its temperatures without its thresholds, fitted fallback thresholds and task thresholds (max_error defers,
     tasks report automated: null), and the answers are marked unvalidated. An explicit --calibration file is not replaced."""
-    cal = calibration_file(md, kind, path, quant)
-    data = {} if off or not cal.exists() else json.loads(cal.read_text())
+    layout = layout or "canonical"
+    cal = calibration_file(md, kind, path, quant, preset, layout)
+    data = {} if off or not cal.exists() else json.loads(cal.read_text(encoding="utf-8"))
+    if data and calibration_layout(data) != layout:  # another layout's thresholds do not hold here (2.4.1)
+        why = f"{cal.name} was fitted on the {calibration_layout(data)} layout, served with --layout {layout}"
+        return {k: v for k, v in data.items() if k not in ("thresholds", "multi", "task_thresholds")}, cal, why
     fitted = calibration_orders(data)
     alt = cal.with_name(f"{cal.stem}.o{orders}{cal.suffix}")
     if fitted is not None and fitted != orders and not path and alt.exists():
-        cal, data = alt, json.loads(alt.read_text())
+        cal, data = alt, json.loads(alt.read_text(encoding="utf-8"))
         fitted = calibration_orders(data)
     if fitted is None or fitted == orders:
         return data, cal, None
@@ -547,20 +665,29 @@ def load_calibration(md, kind, path, quant, orders, off=False):
     return {k: v for k, v in data.items() if k not in ("thresholds", "multi", "task_thresholds")}, cal, why
 
 
-def calibration_file(md, kind, path=None, quant=None):
+def calibration_file(md, kind, path=None, quant=None, preset=None, layout="canonical"):
     """The calibration file basal-serve loads: `path` (--calibration), else CALIBRATION.<engine>.json when the model
-    ships one for the engine (calibration_name), else CALIBRATION.json."""
+    ships one for the engine (calibration_name; a --vllm-preset without a file of its own: CALIBRATION.vllm.json),
+    else CALIBRATION.json. Another --layout than canonical: CALIBRATION[.<engine>].<layout>.json first (2.4.1; without
+    one the canonical file is loaded and its thresholds are not applied, load_calibration)."""
     if path:
         return Path(path)
-    eng = calibration_name(kind, quant)  # 1.5: each engine has its own calibration file when shipped (fp8 too)
-    cal = md / f"CALIBRATION.{eng}.json"
-    return cal if eng and cal.exists() else md / "CALIBRATION.json"
+    layout = layout or "canonical"
+    # 1.5: each engine has its own calibration file when shipped (fp8 too); 2.2.1: each vLLM preset
+    engines = dict.fromkeys((calibration_name(kind, quant, preset), calibration_name(kind, quant)))
+    for sfx in ([f".{layout}"] if layout != "canonical" else []) + [""]:
+        for eng in engines:
+            if eng and (md / f"CALIBRATION.{eng}{sfx}.json").exists():
+                return md / f"CALIBRATION.{eng}{sfx}.json"
+        if sfx and (md / f"CALIBRATION{sfx}.json").exists():
+            return md / f"CALIBRATION{sfx}.json"
+    return md / "CALIBRATION.json"
 
 
 def model_context(md):
     """The model's context in tokens (max_position_embeddings in its config.json), None when unknown."""
     try:
-        cfg = json.loads((Path(md) / "config.json").read_text())
+        cfg = json.loads((Path(md) / "config.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     n = cfg.get("max_position_embeddings") or (cfg.get("text_config") or {}).get("max_position_embeddings")
@@ -585,6 +712,11 @@ class Server:
     LONG_BATCH, LONG_BATCH_TOKENS = 4, 32768  # --long-lane: long requests (and their tokens) per long-lane engine call
     SCHED_CALL_TOKENS = 8192  # --scheduler: prompt tokens of long requests per main-lane engine call (at least one)
     TRUNC_MARK, TRUNC_MARGIN = "\n[…]\n", 32  # --context-overflow truncate: the cut in the state, spare tokens
+    # GET /health: client requests in flight (serve) and the calls of ask whose queue entries all wait for an engine
+    # call (waiting: future of a queue entry -> [True while its call waits])
+    in_flight = queued = 0
+    waiting = None
+
     def __init__(self, a):
         validate_quant(a.mode, a.quant)
         kind, quant, comp = MODES[a.mode]
@@ -599,43 +731,81 @@ class Server:
         if getattr(a, "state_cache_gb", 0) and (a.deterministic or kind not in ("graph", "exit")):
             raise SystemExit("--state-cache-gb needs the CUDA graph engine (fast, fast-nocompile, fp8, nvfp4) and is "
                              "not combined with --deterministic (a cached state changes the shapes of the forwards)")
+        if getattr(a, "layout", None) not in (None, "canonical"):
+            refuse_layout_caches(a.layout, a)
         if getattr(a, "prefix_cache", "off") == "on" and (a.deterministic or kind != "graph"):
             raise SystemExit("--prefix-cache needs the CUDA graph engine (fast, fast-nocompile, fp8, nvfp4) and is not "
                              "combined with --deterministic")
         a.lean, a.tree = lean_tree(getattr(a, "lean", "off"), getattr(a, "tree", "dense"), kind, comp, a.quant or quant)
-        if a.lean == "on" and a.tree == "flex":
-            raise SystemExit("--tree flex runs with --lean pass2; with --lean on its FlexAttention falls back to an "
-                             "uncompiled kernel during CUDA graph capture and the engine fails to start")
+        refuse_lean_flex(a.lean, a.tree)
         if getattr(a, "batches", "default") not in ("default", "auto") and kind not in ("graph", "exit"):
             raise SystemExit("--batches needs the CUDA graph engine (fast, fast-nocompile, fast-exit, fp8, nvfp4)")
+        if getattr(a, "vllm_preset", "default") != "default" and kind != "vllm":
+            raise SystemExit("--vllm-preset needs --mode vllm (the CUDA graph engine has --deterministic)")
         attn = getattr(a, "attn", "auto")
         if attn not in ("auto", "fa2") and kind not in ("graph", "exit"):
             raise SystemExit(f"--attn {attn} needs the CUDA graph engine (--mode fast, fast-nocompile, fast-exit, fp8, "
                              "nvfp4)")
+        if getattr(a, "mlx_packed", False) and kind != "mlx":
+            raise SystemExit("--mlx-packed needs --mode mlx (or mlx-q8)")
+        if kind == "mps" and a.device == "cuda":
+            raise SystemExit("--mode mps runs on Apple Silicon or the CPU (--device mps / cpu); on CUDA: --mode fast")
+        if kind in ("graph", "exit"):  # before the weights are downloaded (mps: MPSBackend, when it shares prefixes)
+            what = _recurrent(a.model, a.revision)
+            gdn = bool(what) and _gdn(a.model, a.revision)
+            if what and (kind == "exit" or not gdn):
+                raise SystemExit(recurrent_refused(a.model, what, gdn))
+            if gdn:  # Qwen3.5 in the graph engine (basal 2.4): bf16, plain and branched rows
+                why = gdn_refused(a.quant or quant, getattr(a, "state_cache_gb", 0),
+                                  getattr(a, "prefix_cache", "off") == "on", getattr(a, "batches", "default"),
+                                  lean_arg(getattr(a, "lean", "off")), getattr(a, "tree", "dense"),
+                                  getattr(a, "readout_layer", "off"), getattr(a, "template_prefix", "off"))
+                if not why and getattr(a, "long_lane", "off") == "on":
+                    why = "--long-lane is not available for Qwen3.5 (Gated DeltaNet) models"
+                if why:
+                    raise SystemExit(f"{a.model}: {why}")
+        if kind in ("graph", "exit") and (a.quant or quant) == "fp8" and fp8_refused():
+            raise SystemExit(fp8_refused())
         # GGUF modes: the engine serves the GGUF weights, so only tokenizer, template and calibration are downloaded
         md = resolve(a.model, a.revision, metadata_only=kind in ("gguf", "ollama", "llamacpp"))
         self.fmt = model_format(md)  # prompt format of the model (basal.json "prompt"; 1 when absent)
         self.max_options = max_options(self.fmt)
         self.orders = default_orders(a.orders, self.fmt)
+        # the prompt layout (prompt.LAYOUTS; 2.4.1): --layout, else the model's basal.json "layout", else canonical
+        self.layout = getattr(a, "layout", None) or model_layout(md)
+        if self.layout != "canonical" and self.fmt != 2:
+            raise SystemExit(f"layout {self.layout} needs a prompt-format-2 model (basal.json \"prompt\": 2)")
+        if self.layout != "canonical":
+            refuse_layout_caches(self.layout, a)
         self.tau, self.band = a.auto_tau, tuple(a.auto_band)
         shared = self.orders != 1 or a.soam == "on"  # prefix sharing: option orders, or the questions of a request
         self.name = a.name or a.model.rstrip("/").split("/")[-1]
         quant = a.quant or quant
-        if getattr(a, "media", "off") == "on" and kind != "eager":
-            raise SystemExit("--media on needs --mode eager (the media path of basal-omni runs in the eager backend)")
+        if getattr(a, "media", "off") == "on" and kind not in ("eager", "vllm"):
+            raise SystemExit("--media on needs --mode eager or vllm (the media paths of basal-omni)")
+        if getattr(a, "ple_offload", "off") == "on" and kind != "eager":
+            raise SystemExit("--ple-offload on needs --mode eager")
+        if getattr(a, "eager_attn", "math") != "math" and kind != "eager":
+            raise SystemExit("--eager-attn needs --mode eager (the CUDA graph engine takes --attn)")
         if kind == "eager":
-            self.backend = EagerBackend(md, a.dtype, device=a.device, media=getattr(a, "media", "off") == "on")
+            self.backend = EagerBackend(md, a.dtype, device=a.device, media=getattr(a, "media", "off") == "on",
+                                        forward=getattr(a, "eager_forward", None),
+                                        ple_offload=getattr(a, "ple_offload", "off") == "on",
+                                        attn=getattr(a, "eager_attn", "math"))
         elif kind == "exit":
             self.backend = ExitGraphBackend(md, a.dtype, quant, compile=comp, heads_dir=a.exit_heads,
                                             default_policy=a.early_exit, attn=attn, merge=merge_arg(a.merge))
         elif kind == "vllm":
-            self.backend = VLLMBackend(md, a.dtype, mem=a.gpu_memory, max_len=a.max_len, max_options=self.max_options)
+            self.backend = VLLMBackend(md, a.dtype, mem=a.gpu_memory, max_len=a.max_len, max_options=self.max_options,
+                                       preset=getattr(a, "vllm_preset", "default"),
+                                       fast_prefill=getattr(a, "vllm_fast_prefill", "auto") == "auto",
+                                       media=getattr(a, "media", "off") == "on")
         elif kind == "sglang":
             self.backend = SGLangBackend(md, a.dtype, mem=a.gpu_memory, max_len=a.max_len)
         elif kind == "mlx":
-            self.backend = MLXBackend(md, quant=quant)
+            self.backend = MLXBackend(md, quant=quant, packed=getattr(a, "mlx_packed", False))
         elif kind == "mps":
-            self.backend = MPSBackend(md, a.dtype, shared=shared)
+            self.backend = MPSBackend(md, a.dtype, shared=shared, device=a.device)
         elif kind == "gguf":
             self.backend = GGUFBackend(md, a.gguf)
         elif kind == "strix":
@@ -656,7 +826,8 @@ class Server:
                                         prefix=getattr(a, "prefix_cache", "off") == "on",
                                         batches=getattr(a, "batches", "default"),
                                         readout_layer=getattr(a, "readout_layer", "off"),
-                                        template=getattr(a, "template_prefix", "off"))
+                                        template=getattr(a, "template_prefix", "off"),
+                                        gemma_attn=getattr(a, "gemma_attn", "auto"))
         self.tok = self.backend.tok
         self.states_cached = bool(getattr(a, "state_cache_gb", 0))  # --state-cache-gb: requests are cut at their state
         model = getattr(self.backend, "model", None)  # evidence head: needs the in-process HF model
@@ -664,7 +835,8 @@ class Server:
         self.md, self.kind = md, kind
         self.context = context_limit(md, self.backend)
         self.cal, cal, self.cal_unvalidated = load_calibration(md, kind, a.calibration, quant, self.orders,
-                                                                a.no_calibration)
+                                                                a.no_calibration, getattr(a, "vllm_preset", None),
+                                                                self.layout)
         check_calibration(self.cal, self.fmt, cal)
         self.cal_mismatch = calibration_mismatch(self.cal, a.model, md) if a.calibration and not a.no_calibration \
             else None  # a file of your own (--calibration); the files in the model directory belong to it
@@ -675,11 +847,11 @@ class Server:
                   "(refit with basal-calibrate, or --strict-calibration to refuse such a file)", flush=True)
         if self.cal_unvalidated:
             print(f"basal: warning: {self.cal_unvalidated}; its answers are marked \"calibration\": \"unvalidated\" "
-                  "and max_error defers (fit a file for these orders with basal-calibrate, or serve with the file's "
-                  "orders)", flush=True)
+                  "and max_error defers (fit a file for this serving with basal-calibrate, or serve with the file's "
+                  "orders and layout)", flush=True)
         self.temps = self.cal.get("temperature_per_prim", {})
         self.soam = a.soam == "on"
-        self.log = open(a.log_decisions, "a", buffering=1) if a.log_decisions else None
+        self.log = open(a.log_decisions, "a", buffering=1, encoding="utf-8") if a.log_decisions else None
         self.letters = {}
         self.queue, self.max_batch, self.wait = asyncio.Queue(), a.max_batch, a.wait_ms / 1000
         self.window = a.batch_window_ms / 1000
@@ -714,7 +886,8 @@ class Server:
             perms = [list(range(k)), list(range(k))[::-1]][: orders_for(self.orders, k)]
         jobs = []
         for perm in perms:
-            prompt = render(self.tok, q["state"], question, [options[c] for c in perm], q["lang"], self.fmt)
+            prompt = render(self.tok, q["state"], question, [options[c] for c in perm], q["lang"], self.fmt,
+                            getattr(self, "layout", "canonical"))
             jobs.append((perm, prompt, self.code_ids(prompt, k)))
         return jobs
 
@@ -765,8 +938,32 @@ class Server:
         if q["type"] == "tool":
             hint = ("lower description_chars, give fewer tools, or shortlist the tools first (an embedding or keyword "
                     "prefilter to about 30-50)")
-        raise ValueError(f"question {q['name']!r}: the prompt is {longest[i]} tokens (state, question and options), "
-                         f"more than the {limit[0]} tokens of {limit[1]}; {hint}")
+        raise RequestError(f"question {q['name']!r}: the prompt is {longest[i]} tokens (state, question and options), "
+                           f"more than the {limit[0]} tokens of {limit[1]}; {hint}")
+
+    async def serve(self, body):
+        """One client request (POST /v1/systemone, /v1/basal or an MCP tool call): the body's shape, then decide.
+        Counted as in flight from here to its answer or error (GET /health)."""
+        self.in_flight += 1
+        try:
+            check_body(body)
+            return await self.decide(body)
+        finally:
+            self.in_flight -= 1
+
+    def load(self):
+        """GET /health: "queued" = requests waiting for the engine (every queue entry of their current engine work
+        still in the main queue, the --scheduler backlog or the --long-lane queue); "running" = the other requests in
+        flight (in an engine call, or in the server's own work before and after it). running + queued = 0: idle."""
+        return {"running": self.in_flight - self.queued, "queued": self.queued}
+
+    def started(self, entries):
+        """Queue entries that go into an engine call: their requests are no longer queued (GET /health)."""
+        for e in entries:
+            wait = self.waiting.pop(e[2], None) if self.waiting else None
+            if wait and wait[0]:
+                wait[0] = False
+                self.queued -= 1
 
     async def ask(self, branches, pol, cut=None, lane="main"):
         """Position probabilities of every prompt of every branch: [[probs per prompt] per branch]. cut: the number of
@@ -776,11 +973,15 @@ class Server:
         # SOAM: the whole request is one queue entry (one packed row: state once, every branch after it);
         # otherwise one entry per branch (all option orders of one question share the prefix)
         entries = [branches] if self.soam or lane == "long" else [[b] for b in branches]
-        futs = []
+        futs, wait = [], [True]  # this call waits (queued) until one of its entries starts an engine call
+        if self.waiting is None:
+            self.waiting = {}
+        self.queued += 1
         if lane == "main" and getattr(self, "gate", None) is not None:
             self.gate.main_add(len(entries))
         for e in entries:
             fut = loop.create_future()
+            self.waiting[fut] = wait
             entry = ([p for b in e for p in b[3]], [x for b in e for x in b[4]], fut, pol, cut)
             if lane == "long":
                 lens = [len(p) for p in entry[0]]
@@ -791,10 +992,16 @@ class Server:
                 await self.queue.put(entry)
             futs.append(fut)
         outs = []
-        for e, fut in zip(entries, futs):
-            res, j = await fut, 0
-            for b in e:
-                outs.append(res[j: j + len(b[3])]); j += len(b[3])
+        try:
+            for e, fut in zip(entries, futs):
+                res, j = await fut, 0
+                for b in e:
+                    outs.append(res[j: j + len(b[3])]); j += len(b[3])
+        finally:
+            for fut in futs:
+                self.waiting.pop(fut, None)
+            if wait[0]:
+                self.queued -= 1
         return outs
 
     def cut_of(self, q, branches):
@@ -947,6 +1154,7 @@ class Server:
                 total += e[6]
             for e in batch:
                 self.long_entries.remove(e)
+            self.started(batch)
             if not self.long_entries:
                 self.long_ready.clear()
             groups = [(e[0], e[1]) + ((e[4],) if e[4] else ()) for e in batch]
@@ -959,9 +1167,7 @@ class Server:
                     _answer(e[2], o)
                 self.long_rate = 0.8 * self.long_rate + 0.2 * (time.perf_counter() - t0) / max(total, 1)
             except Exception as ex:  # noqa: BLE001
-                for e in batch:
-                    if not e[2].done():
-                        e[2].set_exception(ex)
+                _fail([e[2] for e in batch], ex)
 
     def lane_of(self, branches, longest, cut):
         """--long-lane: a request whose longest prompt has more than --long-tokens tokens goes to the long lane, unless
@@ -981,6 +1187,7 @@ class Server:
         if not batch:
             slots.release()
             return
+        self.started(batch)
         try:
             for pol in {b[3] for b in batch}:  # requests with the same early-exit policy run together
                 ix = [i for i, b in enumerate(batch) if b[3] == pol]
@@ -995,9 +1202,7 @@ class Server:
                 for i, o in zip(ix, out):
                     _answer(batch[i][2], o)
         except Exception as e:  # noqa: BLE001
-            for b in batch:
-                if not b[2].done():
-                    b[2].set_exception(e)
+            _fail([b[2] for b in batch], e)
         finally:
             slots.release()
             if getattr(self, "gate", None) is not None:
@@ -1028,28 +1233,30 @@ class Server:
             pol = str(pol)
             allowed = sorted(getattr(self.backend, "policies", {}))
             if pol not in allowed:
-                raise ValueError(f"early_exit={pol!r} not available (server mode must be fast-exit); allowed: {allowed}")
+                raise RequestError(f"early_exit={pol!r} not available (server mode must be fast-exit); "
+                                   f"allowed: {allowed}")
         state = body["state"]
         if body.get("facts", "off") not in ("off", "auto"):
-            raise ValueError('facts must be "off" or "auto"')
+            raise RequestError('facts must be "off" or "auto"')
         if body.get("facts") == "auto":  # append computed calendar / arithmetic facts (PL dates, gaps, VAT)
             state = inject_facts(state if isinstance(state, str) else json.dumps(state, ensure_ascii=False))
         m = self.media_of(body, pol)
         lang = body.get("lang")  # the prompt language when the text alone does not show it (a state that is only media)
         if lang is not None and lang not in ("pl", "en"):
-            raise ValueError('lang must be "pl" or "en"')
+            raise RequestError('lang must be "pl" or "en"')
         qs = to_items(state, body["questions"], self.max_options, force_lang=lang)
         for q in qs:
             stored_fallback(self.cal, q)
         cap = getattr(self.backend, "max_codes", None)  # an engine that reads fewer option codes (Ollama: 20)
         for q in qs:
             if cap is not None and len(q["options"]) > cap:
-                raise ValueError(f"question {q['name']!r}: {len(q['options'])} options, but {type(self.backend).__name__} "
-                                 f"reads at most {cap} ({self.backend.max_codes_reason})")
+                raise RequestError(f"question {q['name']!r}: {len(q['options'])} options, but "
+                                   f"{type(self.backend).__name__} reads at most {cap} "
+                                   f"({self.backend.max_codes_reason})")
         # (question index, branch index, perms, prompts, code ids): every branch in the first pass's option orders
         branches = [self.branch(i, bi, q) for i, q in enumerate(qs) for bi in range(len(q["branches"]))]
         truncation, cut, lane, n_media = None, None, "main", 0
-        if m is not None:  # media: one forward per prompt in the eager backend (no queue, no truncation)
+        if m is not None:  # media: one forward per prompt (eager) or one vLLM call per request; no queue or truncation
             outs, n_tok, longest, n_media = await self.ask_media(qs, branches, m)
         else:
             qs, branches, outs, n_tok, longest, truncation, cut, lane = await self.ask_text(body, qs, branches, pol)
@@ -1079,6 +1286,7 @@ class Server:
             out["usage"]["latency_ms"] = round((time.perf_counter() - t0) * 1000, 2)
         return out
 
+    @reads_request
     def media_of(self, body, pol):
         """The request's media decoded (basal/media.py), or None without media."""
         if body.get("media") is None:
@@ -1086,12 +1294,12 @@ class Server:
         from .media import decode, detail_tokens
         kinds = getattr(self.backend, "media_kinds", ())
         if not kinds:
-            raise ValueError("this server does not take media (basal-serve --mode eager --media on, with a model that "
-                             "has an image / audio encoder)")
+            raise RequestError("this server does not take media (basal-serve --mode eager or vllm with --media on, and "
+                               "a model that has an image / audio encoder)")
         if pol is not None:
-            raise ValueError("early_exit is not available with media")
+            raise RequestError("early_exit is not available with media")
         if any(q.get("evidence") for q in body["questions"].values() if isinstance(q, dict)):
-            raise ValueError("evidence is not available with media")
+            raise RequestError("evidence is not available with media")
         soft = detail_tokens(body.get("detail", "default"))
         images, audio, order = decode(body["media"], kinds, getattr(self.backend, "max_audio_s", None))
         return dict(images=images, audio=audio, kinds=order, max_soft_tokens=soft, detail=body.get("detail", "default"))
@@ -1099,6 +1307,9 @@ class Server:
     async def ask_media(self, qs, branches, m):
         """Position probabilities of every prompt of every branch, with the request's media -> (outs, prompt tokens,
         the longest prompt of each branch, media tokens)."""
+        if getattr(self, "layout", "canonical") != "canonical":
+            raise RequestError(f"images and audio are read in the canonical layout only (this server: --layout "
+                               f"{self.layout})")
         msgs, ids, where = [], [], []
         for j, b in enumerate(branches):
             q = qs[b[0]]
@@ -1174,14 +1385,14 @@ class Server:
             answers[q["name"]] = ans
         ev_q = [q for q in qs if body["questions"][q["name"]].get("evidence")]
         if ev_q and truncation:
-            raise ValueError("evidence is not available for a state truncated to the context (shorten the state)")
+            raise RequestError("evidence is not available for a state truncated to the context (shorten the state)")
         if ev_q:  # evidence spans: character offsets into the request's state (facts block excluded)
             if not (self.evidence and self.evidence.available):
-                raise ValueError("evidence is not available for this model (no evidence_head.pt)")
+                raise RequestError("evidence is not available for this model (no evidence_head.pt)")
             limit = len(_text(body["state"])) if body.get("facts") == "auto" else None
             for q in ev_q:
                 if q["type"] == "multi" or q.get("multi"):
-                    raise ValueError(f"question {q['name']!r}: evidence is not supported for multi")
+                    raise RequestError(f"question {q['name']!r}: evidence is not supported for multi")
                 answers[q["name"]]["evidence"] = await loop.run_in_executor(
                     None, self.evidence.spans, q["state"], q["question"], q["options"], q["lang"], limit)
         if getattr(self, "cal_unvalidated", None):  # the calibration was fitted on other option orders
@@ -1230,10 +1441,38 @@ def add_engine_args(ap):
                     help="override the quantisation of the mode (fp8 / nvfp4: CUDA graph modes, q8: mlx)")
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--media", choices=["off", "on"], default="off",
-                    help="on: requests may carry images / audio (\"media\", basal/media.py); --mode eager and a model "
-                         "with an image / audio encoder (basal-omni, Gemma 4)")
+                    help="on: requests may carry images / audio (\"media\", basal/media.py); --mode eager or vllm "
+                         "and a model with an image / audio encoder (basal-omni, Gemma 4)")
+    ap.add_argument("--eager-forward", dest="eager_forward", choices=list(EAGER_FORWARDS), default=None,
+                    help="--mode eager with a Gemma 4 model (basal-omni): basal = the engine's own forward (the shared "
+                         "prefix of a request once, the last layers at the answer rows only; default), hf = the "
+                         "transformers forward of basal 2.2.0 (default: BASAL_EAGER_FORWARD, else basal)")
+    ap.add_argument("--eager-attn", dest="eager_attn", default="math",
+                    help="--mode eager with a Gemma 4 model and the engine's own forward: the attention kernel per layer "
+                         "type. math (default) = the math kernel everywhere, as basal 2.2; auto (opt-in) = on Hopper "
+                         "FlashAttention 3 in the sliding-window layers (the memory-efficient kernel without "
+                         "flash_attn_3) and the memory-efficient kernel in the global layers, the math kernel elsewhere; "
+                         "or sliding=K,full=K with K in sdpa, efficient, cudnn, fa3, fa4")
+    ap.add_argument("--ple-offload", dest="ple_offload", choices=["off", "on"], default="off",
+                    help="--mode eager with Gemma 4 E2B / E4B (basal-omni mini): keep the per-layer embedding table in "
+                         "host memory and copy only the rows of each forward's tokens (E4B: 5.6 GB less GPU memory)")
+    ap.add_argument("--mlx-packed", dest="mlx_packed", action="store_true",
+                    help="--mode mlx, opt-in: a group of a Llama model (basal-1.x, 2.x; static RoPE) whose state and "
+                         "option orders fit in 512 tokens runs as one packed forward (explicit positions, block mask) "
+                         "instead of a KV cache plus a continuation; faster on short prompts, exact in fp32, but in "
+                         "bf16 / 8-bit the probabilities move slightly, so check it against CALIBRATION.mlx.json "
+                         "(fitted on the default path) before relying on the calibrated thresholds")
     ap.add_argument("--device", default=None, choices=["cuda", "mps", "cpu"],
-                    help="device for --mode eager (default: BASAL_DEVICE, else cuda, else Apple Silicon mps, else cpu)")
+                    help="device for --mode eager (default: BASAL_DEVICE, else cuda, else Apple Silicon mps, else cpu) "
+                         "and --mode mps (mps or cpu; default: mps on Apple Silicon, else cpu: a request's state "
+                         "computed once for all its prompts, where eager computes it once per prompt)")
+    ap.add_argument("--layout", choices=LAYOUTS, default=None,
+                    help="prompt layout (prompt-format-2 models trained on it): canonical = the "
+                         "state, then the question (questions share the state; state cache); state_twice = the state "
+                         "read twice; qfirst = the question also before the state, one pass per question (the state "
+                         "is read knowing the question: slower with several questions, no state cache). Default: the "
+                         "model's basal.json \"layout\", else canonical. Loads CALIBRATION.<layout>.json when the model "
+                         "ships one")
     ap.add_argument("--orders", type=orders_arg, default=None,
                     help="1 = the option order given; 2 = also the reversed order, averaged (shares the state); auto = "
                          "order 1, and the reversed order only where order 1 is uncertain (--auto-tau, --auto-band); "
@@ -1248,6 +1487,14 @@ def add_engine_args(ap):
     ap.add_argument("--soam", choices=["on", "off"], default="on",
                     help="on = the whole request (every question and option order) is one packed row over the state")
     ap.add_argument("--gpu-memory", dest="gpu_memory", type=float, default=0.6, help="vLLM memory fraction")
+    ap.add_argument("--vllm-preset", dest="vllm_preset", choices=list(VLLM_PRESETS), default="default",
+                    help="--mode vllm: default = as 2.2; deterministic = batch-invariant kernels without the prefix "
+                         "cache and chunked prefill (VLLM_BATCH_INVARIANT: answers independent of the other requests, "
+                         "lower throughput). Loads CALIBRATION.vllm.<preset>.json when the model ships one, else "
+                         "CALIBRATION.vllm.json")
+    ap.add_argument("--vllm-fast-prefill", dest="vllm_fast_prefill", choices=["auto", "off"], default="auto",
+                    help="--mode vllm: auto = layers that reuse earlier layers' keys and values (Gemma 4 E2B / E4B) "
+                         "run at the answer position only during prefill (vLLM's kv_sharing_fast_prefill); off = as 2.2")
     ap.add_argument("--max-len", dest="max_len", type=int, default=4096,
                     help="--mode vllm / sglang / tpu: context length in tokens (longer states are refused; raise it for "
                          "long documents)")
@@ -1261,6 +1508,14 @@ def add_engine_args(ap):
     ap.add_argument("--attn", choices=list(ATTN), default="auto",
                     help="attention kernel of the CUDA graph engine: auto (FlashAttention 3 on Hopper when installed, "
                          "else 2; FP8 checkpoints and --mode fp8: 2), fa2 (torch SDPA), fa3, fa4 (flash-attn-4), cudnn")
+    ap.add_argument("--gemma-attn", dest="gemma_attn", choices=["auto", "math", "flex", "fa3", "fa3+math"],
+                    default="auto",
+                    help="CUDA graph engine, Gemma 4 (basal-omni): the attention kernel of its layers: math (torch "
+                         "SDPA's math kernel, as --mode eager), flex (FlexAttention with block masks: sliding window, "
+                         "trie), fa3 (FlashAttention 3 in the sliding-window layers' plain rows, flex elsewhere; "
+                         "Hopper), fa3+math (FlashAttention 3 in the sliding layers, math in the global ones). auto: "
+                         "fa3 in --mode fast where FlashAttention 3 runs (with merged projections and compact rows), "
+                         "flex on Blackwell workstation GPUs (sm_120), else math")
     ap.add_argument("--merge", choices=["auto", "on", "off"], default="auto",
                     help="CUDA graph engine: one q/k/v and one gate/up GEMM per layer (bf16: the same products; FP8 "
                          "checkpoints: the merged weights re-quantised per tensor). auto: on for bf16 weights, off for "
@@ -1281,9 +1536,10 @@ def add_engine_args(ap):
                          "to the state) once and run short requests over its cached keys and values")
     ap.add_argument("--batches", choices=["auto", "compact", "default", "fine"], default="auto",
                     help="CUDA graph engine: compact = single prompts packed back to back into one row (FlashAttention "
-                         "3 varlen, Hopper), no padding to graph lengths and row counts; default = rows padded to graph "
-                         "lengths; fine = more row counts (less padding of short batches, longer start-up); auto = "
-                         "compact where FlashAttention 3 runs, else default")
+                         "3 varlen on Hopper; elsewhere, sm80+, torch's varlen attention, Llama models), no padding to "
+                         "graph lengths and row counts; default = rows padded to graph lengths; fine = more row "
+                         "counts (less padding of short batches, longer start-up); auto = compact where FlashAttention "
+                         "3 runs, else default")
     ap.add_argument("--readout-layer", dest="readout_layer", choices=["auto", "on", "off"], default="off",
                     help="CUDA graph engine with compact rows, Llama models: the last decoder layer computes keys, values "
                          "and attention for every token and its o_proj and MLP at the readout positions only (auto: on; off by "
@@ -1351,52 +1607,42 @@ def parser():
     return ap
 
 
-def main():
-    a = parser().parse_args()
-    a.mode = a.mode or default_mode()
-    validate_quant(a.mode, a.quant)
-    if a.mcp == "on":
-        from .mcp_server import available
-        missing = available()
-        if missing:
-            raise SystemExit(missing)
+def http_app(srv, mode, mcp=None):
+    """The app of basal-serve: POST /v1/systemone and /v1/basal, GET /v1/models and /health; mcp: (routes, lifespan) of
+    --mcp on. A failed request answers {"error": message} with http_status: 422 invalid request, 503 out of GPU
+    memory, 500 any other server error."""
     from contextlib import asynccontextmanager, nullcontext
 
-    import uvicorn
     from starlette.applications import Starlette
     from starlette.responses import JSONResponse
     from starlette.routing import Route
 
-    t0 = time.time()
-    if a.think == "off":
-        srv = Server(a)
-    else:
-        from .think import ThinkServer
-        srv = ThinkServer(a)
-    attn = getattr(srv.backend, "attn", None)
-    print(f"basal: model {a.model} mode {a.mode}{f' attention {attn}' if attn else ''} ready in {time.time() - t0:.0f}s "
-          f"on port {a.port}", flush=True)
+    def failed(e):
+        print(f"basal: request failed: {type(e).__name__}: {str(e)[:300]}", file=sys.stderr, flush=True)
+        if isinstance(e, torch.OutOfMemoryError):  # the failed forward's blocks back to the GPU: kept by the
+            torch.cuda.empty_cache()  # allocator, they failed the next requests too (ultra, 20 Oct)
+        return JSONResponse({"error": str(e)}, status_code=http_status(e))
 
     async def systemone(request):
         try:
-            return JSONResponse(await srv.decide(await request.json()))
+            body = await request.json()
+        except ValueError as e:  # not JSON (or not UTF-8)
+            return failed(RequestError(f"the request body is not valid JSON: {e}"))
+        try:
+            return JSONResponse(await srv.serve(body))
         except Exception as e:  # noqa: BLE001
-            print(f"basal: request failed: {type(e).__name__}: {str(e)[:300]}", file=sys.stderr, flush=True)
-            return JSONResponse({"error": str(e)}, status_code=422)
+            return failed(e)
 
     async def models(_):
-        return JSONResponse(models_payload(srv.name, a.mode, getattr(srv.backend, "policies", {}), srv.temps,
+        return JSONResponse(models_payload(srv.name, mode, getattr(srv.backend, "policies", {}), srv.temps,
                                            srv.fmt, srv.orders, getattr(srv.backend, "media_kinds", ()),
-                                           getattr(srv, "cal_mismatch", None)))
+                                           getattr(srv, "cal_mismatch", None), getattr(srv.backend, "preset", None),
+                                           getattr(srv, "layout", None)))
 
     async def health(_):
-        return JSONResponse({"status": "ok"})
+        return JSONResponse({"status": "ok", **srv.load()})
 
-    mcp_routes, mcp_run = [], None
-    if a.mcp == "on":
-        from .mcp_server import http
-        mcp_routes, mcp_run = http(srv, a.host)
-        print(f"basal: MCP (streamable HTTP) at http://{a.host}:{a.port}/mcp", flush=True)
+    mcp_routes, mcp_run = mcp or ([], None)
 
     @asynccontextmanager
     async def lifespan(_app):
@@ -1408,9 +1654,46 @@ def main():
         for task in tasks:
             task.cancel()
 
-    app = Starlette(routes=[Route("/v1/systemone", systemone, methods=["POST"]),
-                            Route("/v1/basal", systemone, methods=["POST"]), Route("/v1/models", models),
-                            Route("/health", health), *mcp_routes], lifespan=lifespan)
+    return Starlette(routes=[Route("/v1/systemone", systemone, methods=["POST"]),
+                             Route("/v1/basal", systemone, methods=["POST"]), Route("/v1/models", models),
+                             Route("/health", health), *mcp_routes], lifespan=lifespan)
+
+
+def main():
+    a = parser().parse_args()
+    refuse_lean_flex(a.lean, a.tree)  # before default_mode, which resolves the model on CUDA GPUs without FA3
+    a.mode = a.mode or default_mode(a.model, a.revision)
+    validate_quant(a.mode, a.quant)
+    if a.mcp == "on":
+        from .mcp_server import available
+        missing = available()
+        if missing:
+            raise SystemExit(missing)
+    import uvicorn
+
+    t0 = time.time()
+    if a.think == "off":
+        srv = Server(a)
+    else:
+        from .think import ThinkServer
+        srv = ThinkServer(a)
+    attn = getattr(srv.backend, "attn", None)
+    rows = getattr(srv.backend, "compact_kernel", None)  # compact rows: their kernel, and the template prefix with them
+    info = (f" attention {attn}" if attn else "") + (f" compact rows {rows}" if rows else "") \
+        + (" template prefix" if rows and getattr(srv.backend, "template", None) else "")
+    # everything built so far (weights, graphs, compiled code) lives as long as the server: out of the garbage
+    # collector's sight, so a full collection no longer walks it (up to 1.4 s each at the end of start-up on 4.5B, and
+    # a 2.9 s stall of one request under nsys, 20 Oct)
+    gc.collect()
+    gc.freeze()
+    print(f"basal: model {a.model} mode {a.mode}{info} ready in {time.time() - t0:.0f}s on port {a.port}", flush=True)
+
+    mcp = None
+    if a.mcp == "on":
+        from .mcp_server import http
+        mcp = http(srv, a.host)
+        print(f"basal: MCP (streamable HTTP) at http://{a.host}:{a.port}/mcp", flush=True)
+    app = http_app(srv, a.mode, mcp)
     try:  # uvloop + httptools when available (uvicorn[standard]); plain asyncio otherwise
         import httptools  # noqa: F401
         import uvloop  # noqa: F401

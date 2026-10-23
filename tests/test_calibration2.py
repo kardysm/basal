@@ -41,9 +41,9 @@ def test_per_engine_file_names():
 
 
 def test_per_engine_file_when_shipped(tmp_path):
-    (tmp_path / "CALIBRATION.json").write_text("{}")
+    (tmp_path / "CALIBRATION.json").write_text("{}", encoding="utf-8")
     assert calibration_file(tmp_path, "tpu") == tmp_path / "CALIBRATION.json"  # none for the engine: the default
-    (tmp_path / "CALIBRATION.tpu.json").write_text("{}")
+    (tmp_path / "CALIBRATION.tpu.json").write_text("{}", encoding="utf-8")
     assert calibration_file(tmp_path, "tpu") == tmp_path / "CALIBRATION.tpu.json"
     assert calibration_file(tmp_path, "graph") == tmp_path / "CALIBRATION.json"
     assert calibration_file(tmp_path, "tpu", path="X.json").name == "X.json"  # --calibration wins

@@ -33,7 +33,7 @@ basal-2.0 (4.5B); replace the repository name for mini or max.
 <!-- engines -->
 | engine | `basal-serve` mode | hardware | what it is for | quick start |
 |---|---|---|---|---|
-| **basal engine** (PyTorch) | `fast` (also `fast-nocompile`); `mps`; `eager --device mps\|cpu` | NVIDIA GPUs (sm80+); Apple Silicon (`mps`); CPU (`eager`) | the primary server: packed requests (SOAM), compact batching, `--deterministic` | `basal-serve --model Remek/basal-2.0-4.5B --mode fast --template-prefix off` |
+| **basal engine** (PyTorch) | `fast` (also `fast-nocompile`); `mps`; `eager --device mps\|cpu` | NVIDIA GPUs (sm80+); Apple Silicon (`mps`); CPU (`mps --device cpu`, `eager`) | the primary server: packed requests (SOAM), compact batching, `--deterministic` | `basal-serve --model Remek/basal-2.0-4.5B --mode fast --template-prefix off` |
 | **basal engine, FP8** | `fp8` | NVIDIA sm89+ (Hopper, Blackwell) | the `-FP8` checkpoints in the same engine (bf16 weights are quantised on load) | `basal-serve --model Remek/basal-2.0-4.5B-FP8 --mode fp8 --template-prefix off` |
 | **vLLM** | `vllm` | NVIDIA GPUs | an alternative CUDA server for bf16 weights (the `-FP8` checkpoints are checked in `--mode fp8` only) | `basal-serve --model Remek/basal-2.0-4.5B --mode vllm` (extra `basal[vllm]`) |
 | **SGLang** | `sglang` | NVIDIA GPUs | an alternative CUDA server (measured with basal-1.5) | `basal-serve --model Remek/basal-2.0-4.5B --mode sglang` (own environment) |
@@ -62,7 +62,7 @@ missing):
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-env && source ~/basal-env/bin/activate
 uv pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
-uv pip install "basal[fp8] @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"
+uv pip install "basal[fp8] @ https://github.com/rkinas/basal/archive/refs/tags/v2.4.1.tar.gz"
 basal-serve --model Remek/basal-2.0-4.5B --mode fast --template-prefix off --port 8000
 ```
 
@@ -78,8 +78,13 @@ basal-serve --model Remek/basal-2.0-4.5B --mode fast --template-prefix off --por
 - The first start in mode `fast` compiles the model and captures CUDA graphs (several minutes); `--mode
   fast-nocompile` starts in seconds. On Hopper, FlashAttention 3 is used when its wheel is installed
   (`uv pip install flash_attn_3 --extra-index-url https://download.pytorch.org/whl/cu128`); compact batching and
-  the template cache need it.
+  the template cache use it. On other GPUs, `--batches compact` runs them through torch's varlen attention (about
+  6 GB more GPU memory for mini and 7 GB for the 4.5B where the card has room, 2.4 GB on a full 16 GB card;
+  [SERVING.md](SERVING.md#serving-modes)).
 - Other models: `--model Remek/basal-2.0-max` or `--model Remek/basal-2.0-mini`.
+- **basal-omni-pico (Qwen3.5) needs flash-linear-attention** for its Gated DeltaNet layers in `--mode fast` (2.4+):
+  `uv pip install "flash-linear-attention==0.5.2"`, then `basal-serve --model Remek/basal-omni-pico`. Without it,
+  `--mode fast` refuses the model and says so, and without `--mode` the model runs in `eager` (3-10x slower).
 - From a clone instead: `git clone https://github.com/rkinas/basal && cd basal && uv pip install -e ".[fp8]"`
   (after the torch line above).
 
@@ -147,13 +152,13 @@ ties, and accuracy moved by −0.8 to +1.4 points against them on a development 
 ```bash
 # vLLM brings its own torch: a separate environment. vLLM 0.31 brings torch built for CUDA 13.0: NVIDIA driver >= 580
 uv venv --python 3.12 --allow-existing ~/basal-vllm && source ~/basal-vllm/bin/activate
-uv pip install "basal[vllm] @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"
+uv pip install "basal[vllm] @ https://github.com/rkinas/basal/archive/refs/tags/v2.4.1.tar.gz"
 basal-serve --model Remek/basal-2.0-4.5B --mode vllm --port 8000          # --max-len 32768 for long documents
 
 # SGLang (own environment; its kernels need a CUDA 12.9+ toolkit; it also brings torch for CUDA 13.0: driver >= 580)
 uv venv --python 3.12 --allow-existing ~/basal-sglang && source ~/basal-sglang/bin/activate
 uv pip install --prerelease=allow "sglang[srt]==0.5.21"
-uv pip install --no-deps "basal @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"
+uv pip install --no-deps "basal @ https://github.com/rkinas/basal/archive/refs/tags/v2.4.1.tar.gz"
 uv pip install starlette uvicorn httpx accelerate safetensors   # if missing
 basal-serve --model Remek/basal-2.0-4.5B --mode sglang --port 8000
 ```
@@ -168,7 +173,7 @@ basal-1.5 ([QUANTIZATION.md](QUANTIZATION.md)).
 
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-mlx && source ~/basal-mlx/bin/activate
-uv pip install "basal[mlx] @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"
+uv pip install "basal[mlx] @ https://github.com/rkinas/basal/archive/refs/tags/v2.4.1.tar.gz"
 basal-serve --model Remek/basal-2.0-4.5B-MLX-8bit --mode mlx --port 8000
 ```
 
@@ -185,7 +190,7 @@ log-probabilities of the option codes of one generated token. Ollama 0.12.11 or 
 
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-env && source ~/basal-env/bin/activate
-uv pip install "basal @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"   # also installs the hf CLI
+uv pip install "basal @ https://github.com/rkinas/basal/archive/refs/tags/v2.4.1.tar.gz"   # also installs the hf CLI
 hf download Remek/basal-2.0-4.5B-GGUF --local-dir basal-2.0-4.5B-GGUF
 cd basal-2.0-4.5B-GGUF && ollama create basal-2.0-4.5b:q8_0 -f Modelfile.Q8_0 && cd ..
 basal-serve --model ./basal-2.0-4.5B-GGUF --mode ollama --ollama-model basal-2.0-4.5b:q8_0 --port 8000
@@ -204,7 +209,7 @@ Without a separate server, `--mode gguf` loads the file in process through llama
 CUDA build it first, see [GGUF.md](GGUF.md)):
 
 ```bash
-uv pip install "basal[gguf] @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"
+uv pip install "basal[gguf] @ https://github.com/rkinas/basal/archive/refs/tags/v2.4.1.tar.gz"
 basal-serve --model ./basal-2.0-4.5B-GGUF --mode gguf --gguf basal-2.0-4.5B-GGUF/basal-2.0-4.5B-Q8_0.gguf --port 8000
 ```
 
@@ -230,7 +235,7 @@ use transformers), then the `tpu` extra (JAX and libtpu from PyPI; Python 3.12 o
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-tpu && source ~/basal-tpu/bin/activate
 uv pip install "torch>=2.11" --index-url https://download.pytorch.org/whl/cpu
-uv pip install "basal[tpu] @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"   # 2.2.0: the first release with --mode tpu
+uv pip install "basal[tpu] @ https://github.com/rkinas/basal/archive/refs/tags/v2.4.1.tar.gz"   # 2.2.0: the first release with --mode tpu
 basal-serve --model Remek/basal-2.0-4.5B --port 8000   # --mode tpu is the default on a TPU VM
 ```
 
@@ -247,6 +252,10 @@ basal-serve --model Remek/basal-2.0-4.5B --port 8000   # --mode tpu is the defau
 ### CPU
 
 `basal-serve --model Remek/basal-2.0-mini --mode eager --device cpu` runs everywhere, for tests and low volumes.
+Requests with several questions or option orders over one state (tasks, `--orders 2`) run faster with
+`--mode mps --device cpu`: the packed engine computes the state once, where `eager` computes it once per prompt
+(basal-2.0-mini, `--dtype float32`, a 6-core Zen 2: 838 s -> 88 s on three task requests, 75 of 75 top answers the
+same; single questions take as long as in `eager`).
 
 ### Images and audio: basal-omni (experimental)
 
@@ -256,7 +265,7 @@ Install the `media` extra (pillow, soundfile, scipy, torchvision) and serve a ba
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-env && source ~/basal-env/bin/activate
 uv pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
-uv pip install "basal[media] @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"
+uv pip install "basal[media] @ https://github.com/rkinas/basal/archive/refs/tags/v2.4.1.tar.gz"
 basal-serve --model Remek/basal-omni-1.0-mini --mode eager --media on --port 8000   # or Remek/basal-omni-1.0-max
 ```
 

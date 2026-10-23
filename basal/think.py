@@ -35,8 +35,9 @@ import torch
 from . import server
 from .engine import resolve
 from .facts import inject as inject_facts
-from .prompt import PREFILL, render
-from .server import Server, act_answer, certified, check_calibration, temper, temperature, to_items
+from .prompt import PREFILL, RequestError, render
+from .server import (Server, act_answer, certified, check_calibration, refuse_lean_flex, temper, temperature,
+                     to_items)
 from .tools import answer as tool_answer
 
 TYPES = ("choice", "noul", "score", "act", "tool")  # single-readout types
@@ -89,7 +90,7 @@ class Sidecar:
         t0 = time.time()
         while time.time() - t0 < timeout:
             if self.proc and self.proc.poll() is not None:
-                tail = Path(self.log).read_text(errors="replace").splitlines()[-15:]
+                tail = Path(self.log).read_text(errors="replace", encoding="utf-8").splitlines()[-15:]
                 raise SystemExit(f"basal think: the vLLM server exited ({self.proc.returncode}):\n" + "\n".join(tail))
             try:
                 if httpx.get(self.url + "/health", timeout=5).status_code == 200:
@@ -138,7 +139,7 @@ def think_calibration(md, path):
             raise SystemExit(f"--think-calibration {path}: no such file")
         print(f"basal think: warning: no {p.name} in the model; readout 2 is served uncalibrated", flush=True)
         return {}, "missing"
-    return json.loads(p.read_text()), p.name
+    return json.loads(p.read_text(encoding="utf-8")), p.name
 
 
 def answer(q, pl, cal):
@@ -163,6 +164,7 @@ class ThinkServer(Server):
         if a.think == "off":
             super().__init__(a)
             return
+        refuse_lean_flex(a.lean, a.tree)  # before the model is resolved and the sidecar started
         md = resolve(a.model, a.revision)
         weights = a.think_model or (md / "think" if (md / "think" / "config.json").exists() else md)
         adapter = a.think_adapter or (md / "think" / "adapter" if (md / "think" / "adapter").exists() else None)
@@ -206,7 +208,7 @@ class ThinkServer(Server):
     async def decide(self, body):
         mode = body.get("think", self.think)
         if mode not in ("off", "auto", "force"):
-            raise ValueError('think must be "off", "auto" or "force"')
+            raise RequestError('think must be "off", "auto" or "force"')
         out = await super().decide(body)
         if self.think == "off":
             return out
@@ -330,7 +332,7 @@ def rows_main(argv):
             row["think"] = {k: v for k, v in th.items() if k != "no_think"}
         rows.append(row)
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
-    Path(a.out).write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
+    Path(a.out).write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8")
     s = dict(summary(rows), failed=failed, wall_s=round(time.time() - t0, 1), think_mode=a.think, data=a.data)
     print(json.dumps(s))
     return s

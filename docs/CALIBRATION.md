@@ -44,7 +44,8 @@ answer `"calibration": "unvalidated"`. A format-2 model may ship an optional `CA
 - `--reference [basal-1.5 | FILE]`: what the leave-one-family-out ECE is compared with. The flag alone means the
   basal-1.5 values; a FILE is a calibration file whose `gates.ece_lofo` holds the means.
 - `--strict`: exit with status 1 when a type's leave-one-family-out ECE is above the reference. The file is still
-  written. Use it in CI.
+  written. Use it in CI. A type with no family of `--min-family` CERT decisions is not tested and does not fail;
+  2.3.1 says so on stderr ("0 families tested") and in the report.
 - `--min-family 30`: the CERT decisions of a type that a family needs for its own ECE.
 - `--min-per-set 30`: the FIT questions that a label set needs before its `fallback_threshold` is fitted.
 - `--save-rows FILE`: also write the uncalibrated probabilities of every decision (decision questions only: task
@@ -233,12 +234,28 @@ The files that ship in a model's directory are not checked.
 
 For the **temperatures**, a few dozen labelled decisions of a type already help (`--min-blend`, above); 50 FIT
 decisions, about 72 labelled ones, fit it fully. For the **thresholds**, a few hundred labelled decisions usually certify the 5% target. The 1% target needs at least 299 accepted FIT
-decisions without an error (more with any error), so in practice about 1,000 items or more. With fewer, use the
-refitted temperatures and the 5% threshold, or route uncertain cases to a person. When no confidence meets a bound,
-the type's entry has `"confidence": null` and a `reason` for that target; `act` and `tool` questions of that type
+decisions without an error (473 with one error, 628 with two), so in practice about 1,000 labelled decisions of a
+type or more. The thresholds are certified per question type, so these numbers hold for each type on its own: 299
+accepted `noul` decisions without an error, and again 299 `choice` decisions, not 299 in total. An error made with
+very high confidence is accepted at every threshold below it and raises the count for its type. On one external set
+of 1,254 Polish business decisions (FIT: 462 `noul`, 371 `choice`) no type of five basal-2.0 and basal-omni models
+was certified at 1%: the lowest bound of any type was 1.2%, and for the basal-omni models a few errors at confidence
+0.997–0.999 set that floor. With fewer, use the refitted temperatures and the 5% threshold, or route uncertain cases
+to a person. When no confidence meets a bound, the type's entry has `"confidence": null` and a `reason` for that target; `act` and `tool` questions of that type
 with that `max_error` then defer every decision (the defer action, the `refused` one named, `"deferred": true` and
 `"max_error": "no certified threshold for this type at this max_error"`), and `basal-calibrate` warns about it. With fewer than 200
 decisions it warns that the bounds are loose.
+
+`basal-calibrate` checks this before it runs the model (2.3.1). For each question type and task and each target, it
+counts the FIT decisions in your file. If they could not meet the bound even if all of them were accepted and correct,
+it says so on stderr and again at the end of the run, for example "verify: max_error 0.01 needs >= 299 accepted FIT
+decisions without an error (...); this file gives 192 FIT decisions of 275; label about 153 more verify claims".
+
+A threshold certified on FIT is written even when its CERT decisions are too few to confirm it. 2.3.1 then says so,
+in the report and on stderr: "noul at max_error 0.01: certified on FIT; CERT has 150 accepted, 1 error, upper bound
+3.12% > 1%, too few to confirm on CERT (0 errors would need >= 299 accepted CERT decisions)". If the error observed on
+CERT is above the target, it says that the threshold does not hold on CERT. The threshold and the exit status do not
+change (`--strict` checks only the leave-one-family-out ECE).
 
 ## Output
 
@@ -278,5 +295,6 @@ classify  ...
 `--calibration FILE`) automates at each target and their error, each type at the threshold basal-serve applies to it:
 how the file you would otherwise serve does on your data.
 
-*ECE* is the expected calibration error of the top answer (10 bins); *bound* is the one-sided 95% upper bound of the
-error on CERT.
+*ECE* is the expected calibration error of the top answer (10 bins), with the temperatures as basal-serve applies them
+(in calibration file 2, a `choice` question gets its option-count bucket temperature, so the `choice` row covers all
+its buckets); *bound* is the one-sided 95% upper bound of the error on CERT.

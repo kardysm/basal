@@ -18,7 +18,7 @@ import json
 import math
 import re
 
-from .prompt import lang_of
+from .prompt import lang_of, reads_request
 
 TASKS = ("classify", "verify", "compress", "extract")
 SEP = "::"  # expanded question names: <task question>::<part>
@@ -79,6 +79,7 @@ def _labels(spec, name):
 ABBREV = {"np", "itd", "itp", "tzw", "ul", "nr", "sp", "o.o", "tj", "ok", "godz", "pkt", "art", "ust", "zł", "e.g",
           "i.e", "etc", "mr", "mrs", "dr", "prof", "inc", "ltd", "co", "no", "vs", "st", "jr", "fig", "al"}
 SENT_END = re.compile(r"[.!?…]+[\"”»)\]]*\s+(?=[\"„«(\[]?[A-ZĄĆĘŁŃÓŚŹŻ0-9])")
+WORD_BEFORE = re.compile(r"[.!?…]*(\w[\w.]*)")  # matched on the reversed text before a sentence end
 
 
 def units(text, unit="sentence"):
@@ -92,10 +93,13 @@ def units(text, unit="sentence"):
     elif unit == "paragraph":
         cuts = [m.end() for m in re.finditer(r"\n[ \t]*\n", text)]
     else:
-        cuts = []
+        cuts, prev = [], 0
         for m in SENT_END.finditer(text):
-            word = re.search(r"([\w.]+)[.!?…]*[\"”»)\]]*$", text[:m.start() + 1].rstrip())
-            w = (word.group(1) if word else "").rstrip(".").lower()
+            # The word before the sentence end: the window starts after the previous match (no word spans its
+            # whitespace) and is read backwards from the end, so every character is scanned once (O(n) per document).
+            word = WORD_BEFORE.match(text[prev:m.start() + 1][::-1])
+            prev = m.end()
+            w = word.group(1)[::-1].lower() if word else ""
             if m.group(0)[0] == "." and (w in ABBREV or len(w) == 1 and w.isalpha()):
                 continue
             cuts.append(m.end())
@@ -294,11 +298,13 @@ def parse_number(text, integer=False):
 
 # --- expansion ------------------------------------------------------------------------------------------------------
 
+@reads_request
 def expand(body, max_options=255):
     """A request with task questions -> (the request with only decision questions, plans to assemble the answers)."""
     state = body.get("state")
     text = state if isinstance(state, str) else ""
     questions, plans = {}, {}
+    text_pl = not body.get("lang") and lang_of(text) == "pl"  # once per request, not once per task question
     for name, q in body["questions"].items():
         if not is_task(q):
             questions[name] = q
@@ -306,7 +312,7 @@ def expand(body, max_options=255):
         if SEP in name:
             raise ValueError(f"question {name!r}: a task question's name may not contain {SEP!r}")
         t = q["type"]
-        lang = body.get("lang") or lang_of(text + str(q.get("instructions") or ""))
+        lang = body.get("lang") or ("pl" if text_pl else lang_of(str(q.get("instructions") or "")))
         w = W[lang]
         sub = {}
         if t == "classify":

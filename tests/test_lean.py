@@ -1,5 +1,8 @@
 """The lean layer function reproduces transformers' Llama forward (fp32, CPU): plain rows with the keys / values
 written for pass 2, and pass 2 over a prefix with an additive mask; merged projections and FP8 linears included."""
+import json
+
+import pytest
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
@@ -100,17 +103,32 @@ def test_flex_tree_mask_is_the_dense_mask():
     assert isinstance(tm, TreeMask) and tm.anc.shape == (B, S + 1, S + 1)
 
 
-def test_flex_with_lean_on_refused_before_loading(monkeypatch):
-    """--lean on with --tree flex fails at CUDA graph capture (FlexAttention falls back to its uncompiled kernel)."""
+@pytest.mark.parametrize("entry", ["serve", "calibrate", "think"])
+def test_flex_with_lean_on_refused_before_loading(monkeypatch, tmp_path, entry):
+    """--lean on with --tree flex fails at CUDA graph capture (FlexAttention falls back to its uncompiled kernel). The
+    refusal comes before the model is resolved, also on a CUDA GPU without FlashAttention 3 (simulated here), where
+    choosing the default mode resolves the model to see whether it is Gemma 4: from basal-serve, basal-calibrate with
+    the engine in process, and a ThinkServer built directly (it resolves the model and starts its sidecar first)."""
     import sys
 
-    import pytest
-
+    import basal.calibrate as calibrate_module
     import basal.server as server_module
-    monkeypatch.setattr(sys, "argv", ["basal-serve", "--lean", "on", "--tree", "flex"])
-    monkeypatch.setattr(server_module, "resolve", lambda *_, **__: pytest.fail("must reject before loading a model"))
+    import basal.think as think_module
+    for module in (server_module, calibrate_module, think_module):
+        monkeypatch.setattr(module, "resolve", lambda *_, **__: pytest.fail("must reject before loading a model"))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)  # e.g. an RTX 4060 Ti: CUDA, no FlashAttention 3
+    monkeypatch.setattr(server_module, "gemma_fast_kernels", lambda: None)  # and not sm_120: Gemma 4 has no fast
+    args = ["--lean", "on", "--tree", "flex"]
     with pytest.raises(SystemExit, match="--tree flex runs with --lean pass2"):
-        server_module.main()
+        if entry == "serve":
+            monkeypatch.setattr(sys, "argv", ["basal-serve", *args])
+            server_module.main()
+        elif entry == "calibrate":
+            (tmp_path / "l.jsonl").write_text(json.dumps({"state": "x", "questions": {
+                "q": {"type": "choice", "instructions": "?", "criteria": ["a", "b"], "gold": "a"}}}) + "\n", encoding="utf-8")
+            calibrate_module.main([str(tmp_path / "l.jsonl"), *args, "--out", str(tmp_path / "c.json")])
+        else:
+            think_module.ThinkServer(server_module.parser().parse_args([*args, "--think", "auto"]))
 
 
 def test_lean_tree_auto():

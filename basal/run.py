@@ -57,7 +57,7 @@ def summarise(item, resp):
 
 
 async def run(a):
-    items = [json.loads(line) for line in Path(a.input).read_text().splitlines() if line.strip()]
+    items = [json.loads(line) for line in Path(a.input).read_text(encoding="utf-8").splitlines() if line.strip()]
     for i, it in enumerate(items):
         it.setdefault("id", i)
     results: list[dict] = [{} for _ in items]
@@ -74,7 +74,7 @@ async def run(a):
         t0 = time.perf_counter()
         await asyncio.gather(*(one(i, it) for i, it in enumerate(items)))
         wall = time.perf_counter() - t0
-    with open(a.output, "w") as f:
+    with open(a.output, "w", encoding="utf-8") as f:
         for r in results:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
     ok = [r for r in results if "error" not in r]

@@ -40,6 +40,12 @@ letters.
 5. **Batching across requests.** The rows of all requests that wait at the same time are sorted by length and run
    together, at most 12,288 padded tokens per forward pass, and every request is answered as soon as its passes are
    read out.
+6. **Sliding-window layers (basal-omni, Gemma 4).** A sliding-window layer lets a token see only the last W tokens of
+   its own prompt (W = 512 or 1,024). Positions in the packed row are each token's position in its own prompt, so the
+   window is one more condition of the mask: a branch token at position p sees an ancestor at position j only when
+   p - j < W, in pass 2 over the root's keys as well. Every answer therefore still sees exactly what it sees as a
+   separate prompt. Since every branch comes after the root, pass 2 of a sliding layer reads only the root's last W
+   tokens: for a state beyond its largest graph the engine keeps only those.
 
 ### Which kernel runs
 

@@ -49,13 +49,14 @@ Method (the one the shipped files were fitted with):
     once pooled over all types (thresholds[r].confidence, informational: basal-serve never applies it). A type
     without a certified threshold of its own ("confidence": null, or no entry) has every automatic action of act and
     tool with that max_error deferred ("no certified threshold for this type at this max_error"). A few hundred
-    decisions usually certify 5%; 1% needs at least 299 accepted FIT decisions without an error (about 1,000 items or
-    more);
+    decisions usually certify 5%; 1% needs at least 299 accepted FIT decisions of the type without an error (about
+    1,000 items of the type or more);
   * gates: ece_lofo per type, for every family the temperatures fitted on the FIT decisions of the other families and
     the ECE measured on its CERT decisions (mean and max over the families with at least --min-family CERT decisions
     of the type, and pooled over all of them), next to --reference (basal-1.5: the same statistic on our calibration
     split); automated_at, the share of CERT decisions at or above their type's certified threshold. --strict exits with
-    status 1 when a type's mean LOFO ECE is above the reference;
+    status 1 when a type's mean LOFO ECE is above the reference (a type without a family of --min-family CERT
+    decisions is not tested: a warning on stderr and in the report, status unchanged);
   * multi: per label set (its labels and fallback; id = basal.sets.label_set_id) the fallback_threshold with the best
     mean IoU on FIT over a log grid (null = the default rule wins), with IoU, empty-set accuracy and false-empty rate
     on CERT next to the default. basal-serve uses it for a request with the same label set and fallback and no
@@ -84,9 +85,10 @@ import torch
 from . import __version__
 from . import tasks as task_types
 from .engine import resolve
-from .prompt import max_options, model_format
+from .prompt import max_options, model_format, model_layout
 from .server import (MODES, Server, _text, add_engine_args, calibration_file, calibration_name, calibration_orders,
-                     certified, default_mode, load_calibration, model_identity, temper, temperature, to_items)
+                     certified, default_mode, load_calibration, model_identity, refuse_lean_flex, temper, temperature,
+                     to_items)
 from .sets import label_set_id
 from .sets import select as select_set
 
@@ -550,8 +552,83 @@ def threshold(cs, risk, alpha=ALPHA, min_n=MIN_ACCEPTED):
     return thr
 
 
+def accepted_needed(risk, errors=0, alpha=ALPHA, min_n=MIN_ACCEPTED):
+    """The fewest accepted decisions with `errors` errors whose one-sided upper bound is at most `risk` (0 / 1 / 2
+    errors: 299 / 473 / 628 at 1%, 59 / 93 / 124 at 5%)."""
+    if errors == 0:
+        return max(min_n, math.ceil(math.log(alpha) / math.log(1 - risk)))
+    lo = hi = accepted_needed(risk, 0, alpha, min_n)
+    while cp_upper(errors, hi, alpha) > risk:
+        lo, hi = hi, hi * 2
+    while lo < hi:  # lo fails (or equals hi), hi passes
+        mid = (lo + hi) // 2
+        lo, hi = (mid + 1, hi) if cp_upper(errors, mid, alpha) > risk else (lo, mid)
+    return hi
+
+
+def sample_size(decisions, units, targets):
+    """Before any readout: per question type (decisions) and task (units) and per target, whether its FIT decisions
+    (the groups outside CERT, about 70%) could certify the target at all, i.e. with every one of them accepted and
+    correct -> warnings for those that cannot."""
+    count = defaultdict(lambda: [0, 0])  # name -> [labelled decisions, FIT decisions]
+    for name, group in [(d["prim"], d["group"]) for d in decisions if d["prim"] != "multi"] + \
+            [(u["task"], u["group"]) for u in units]:
+        count[name][0] += 1
+        count[name][1] += not is_cert(group)
+    out = []
+    for name, (n, n_fit) in count.items():
+        what = {"verify": "claims", "extract": "fields"}.get(name, "questions")
+        for risk in sorted(targets):
+            need = accepted_needed(risk)
+            if n_fit >= need:
+                continue
+            falls = (f"its answers report automated: null at this max_error" if name in TASKS else
+                     f"basal-serve defers the automatic actions of act and tool on {name} at this max_error")
+            out.append(f"{name}: max_error {risk:g} needs >= {need} accepted FIT decisions without an error "
+                       f"({accepted_needed(risk, 1)} with 1 error, {accepted_needed(risk, 2)} with 2); this file gives "
+                       f"{n_fit} FIT decisions of {n} (FIT: about 70% of the groups); label about "
+                       f"{max(1, math.ceil(need / 0.7) - n)} more {name} {what}. {name} will not be certified at "
+                       f"max_error {risk:g}: {falls}")
+    return out
+
+
+def cert_note(name, risk, x):
+    """A written threshold (entry x: confidence, cert_accepted, cert_error, cert_upper95) that CERT does not confirm:
+    its observed error is above the target, or too few accepted CERT decisions bring the upper bound below it. The
+    threshold is certified on FIT and stays; None when CERT confirms it."""
+    if x.get("confidence") is None:
+        return None
+    n = x.get("cert_accepted") or 0
+    e = round((x.get("cert_error") or 0.0) * n)
+    errs, need = f"{e} error{'' if e == 1 else 's'}", accepted_needed(risk)
+    if n == 0:
+        return (f"{name} at max_error {risk:g}: certified on FIT; CERT accepts no decision at this threshold, so it "
+                f"cannot confirm it (0 errors would need >= {need} accepted CERT decisions)")
+    if e / n > risk:
+        return (f"{name} at max_error {risk:g}: certified on FIT, but CERT has {n} accepted, {errs} "
+                f"({pct(e / n)}), above the target: the threshold does not hold on CERT; label more data before "
+                "relying on it")
+    if x.get("cert_upper95") is not None and x["cert_upper95"] > risk:
+        return (f"{name} at max_error {risk:g}: certified on FIT; CERT has {n} accepted, {errs}, upper bound "
+                f"{100 * x['cert_upper95']:.2f}% > {100 * risk:g}%, too few to confirm on CERT (0 errors would need "
+                f">= {need} accepted CERT decisions)")
+    return None
+
+
+def cert_notes(report, task_report, targets):
+    """cert_note for every written threshold of the decision types and the tasks."""
+    out = []
+    for risk in targets if report else ():
+        for t, x in ((report["targets"][risk]["fitted"].get("per_type")) or {}).items():
+            out.append(cert_note(t, risk, x))
+    for t, e in (task_report or {}).items():
+        for risk, x in e["targets"].items():
+            out.append(cert_note(t, float(risk), x))
+    return [x for x in out if x]
+
+
 def no_threshold_reason(cs, risk, alpha=ALPHA, min_n=MIN_ACCEPTED):
-    need = max(min_n, math.ceil(math.log(alpha) / math.log(1 - risk)))  # accepted decisions without an error
+    need = accepted_needed(risk, 0, alpha, min_n)  # accepted decisions without an error
     if len(cs) < need:
         return f"a {risk:g} bound needs at least {need} accepted FIT decisions without an error; FIT has {len(cs)}"
     best = min(((cp_upper(e, n, alpha), n) for _, n, e in levels(cs) if n >= min_n), default=None)
@@ -814,10 +891,12 @@ def fit(rows, baseline, targets, min_per_type=50, fmt=1, min_family=30, referenc
         if not rs:
             continue
         cert = [r for r in cert_rows if r["prim"] == t]
+        # as served: a choice question of a format-2 file gets its option-count bucket temperature first
         report["types"][t] = dict(n=len(rs), n_fit=len(rs) - len(cert), n_cert=len(cert),
                                   accuracy=float(np.mean([ok for _, ok in served(rs, {})])),
                                   T_shipped=shipped_T.get(t), T=temps.get(t), source=source.get(t, "default 1.0"),
-                                  ece_shipped=ece(served(cert, shipped_T)), ece=ece(served(cert, temps)))
+                                  ece_shipped=ece(served(cert, shipped_T, shipped_B)),
+                                  ece=ece(served(cert, temps, buckets)))
     gates = dict(ece_lofo=lofo(fit_rows, cert_rows, shipped_T, shipped_B, min_per_type, fmt, min_family, reference,
                                min_blend=min_blend),
                  automated_at=automated, automated_error=automated_error, automated_at_pooled=automated_pooled,
@@ -845,16 +924,16 @@ def fit(rows, baseline, targets, min_per_type=50, fmt=1, min_family=30, referenc
     return dict(temperature_per_prim=temps, temperature_source=source, thresholds=thresholds, **extra), report
 
 
-def compared(md, kind, path, quant, orders, off):
+def compared(md, kind, path, quant, orders, off, preset=None, layout="canonical"):
     """The calibration to compare with and keep, as basal-serve would apply it with these option orders
     (server.load_calibration: the model's file for those orders when it ships one; a file fitted on other orders
     without its thresholds) -> (calibration, its file or None)."""
     if off or (md is None and not path):
         return {}, None
     if orders is None:  # a server that does not report its orders: the file as it is
-        f = calibration_file(md, kind, path, quant)
-        return (json.loads(f.read_text()) if f.exists() else {}), f
-    data, f, why = load_calibration(md, kind, path, quant, orders)
+        f = calibration_file(md, kind, path, quant, preset, layout)
+        return (json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}), f
+    data, f, why = load_calibration(md, kind, path, quant, orders, preset=preset, layout=layout)
     if why:
         print(f"warning: {why}: its thresholds are not compared or kept (as in basal-serve)", file=sys.stderr)
     return data, f if f.exists() else None
@@ -932,7 +1011,7 @@ def reference_values(ref):
     p = Path(ref)
     if not p.exists():
         raise SystemExit(f"--reference {ref}: not {' or '.join(REFERENCE)} and no such file")
-    lf = (json.loads(p.read_text()).get("gates") or {}).get("ece_lofo") or {}
+    lf = (json.loads(p.read_text(encoding="utf-8")).get("gates") or {}).get("ece_lofo") or {}
     vals = {t: v["mean"] for t, v in lf.items() if isinstance(v, dict) and v.get("mean") is not None}
     if not vals:
         raise SystemExit(f"--reference {ref}: the file has no gates.ece_lofo means")
@@ -1044,9 +1123,8 @@ def task_warnings(report, dropped=()):
             if x["confidence"] is None:
                 out.append(f"max_error {float(risk):g}: {t} has no certified threshold; its answers report "
                            "automated: null at this max_error")
-            elif x["cert_error"] is not None and x["cert_error"] > float(risk):
-                out.append(f"max_error {float(risk):g}: {t} CERT error {pct(x['cert_error'])} is above the target; "
-                           "label more data before relying on this threshold")
+            elif cert_note(t, float(risk), x):
+                out.append(cert_note(t, float(risk), x))
     for t in dropped:
         out.append(f"{t}: the shipped task threshold was certified with the shipped temperatures, which this file "
                    f"changes; it is left out (add labelled {t} questions to certify one)")
@@ -1070,14 +1148,14 @@ def warnings(report, targets):
             if x.get("confidence") is None:
                 out.append(f"max_error {risk:g}: {t} has no certified threshold; basal-serve defers every automatic "
                            f"action of act and tool on {t} questions with this max_error")
-            elif x.get("cert_error") is not None and x["cert_error"] > risk:
-                out.append(f"max_error {risk:g}: {t} CERT error {pct(x['cert_error'])} is above the target; "
-                           "label more data before relying on this threshold")
+            elif cert_note(t, risk, x):
+                out.append(cert_note(t, risk, x))
     for t, g in ((report.get("gates") or {}).get("ece_lofo") or {}).items():
         if g.get("regression"):
             out.append(f"{t}: the leave-one-family-out ECE {g['mean']:.3f} is above the reference {g['reference']:.3f}")
         elif g.get("mean") is None:
-            out.append(f"{t}: no leave-one-family-out ECE ({g['reason']})")
+            out.append(f"{t}: no leave-one-family-out ECE, 0 families tested ({g['reason']}); --strict does not check "
+                       f"{t}")
     for sid, m in (report.get("multi") or {}).items():
         if "reason" in m:
             out.append(f"multi label set {sid} (fallback {m['fallback']}): no fallback_threshold fitted "
@@ -1090,10 +1168,31 @@ def regressions(report):
     return [t for t, g in ((report.get("gates") or {}).get("ece_lofo") or {}).items() if g.get("regression")]
 
 
-def engine_name(kind, quant):
+def summary(lines):
+    """End of a run, on stderr: the targets the labels could not certify (sample_size) and the written thresholds that
+    CERT does not confirm (cert_notes), also in the report above."""
+    if lines:
+        print("basal-calibrate: summary\n" + "\n".join(f"  warning: {x}" for x in lines), file=sys.stderr)
+
+
+def strict_check(report, min_family):
+    """--strict: on stderr, every type the family check did not test (no family with min_family CERT decisions of the
+    type, or one family: it passes them), then status 1 when a type's mean LOFO ECE is above the reference."""
+    for t, g in ((report.get("gates") or {}).get("ece_lofo") or {}).items():
+        if g.get("mean") is None:
+            why = (f"each needs >= {min_family} CERT decisions of the type" if g["reason"].startswith("no family")
+                   else g["reason"])
+            print(f"--strict: {t}: 0 families tested ({why}); the family check did not run", file=sys.stderr)
+    bad = regressions(report)
+    if bad:
+        print(f"--strict: leave-one-family-out ECE above the reference for {', '.join(bad)}", file=sys.stderr)
+        sys.exit(1)
+
+
+def engine_name(kind, quant, preset=None):
     """The engine a calibration file is for (its "engine" field): the name of its CALIBRATION.<engine>.json, else
     fast for the basal CUDA engine and the backend's own name (eager, mps, gguf)."""
-    return calibration_name(kind, quant) or {"graph": "fast", "exit": "fast"}.get(kind, kind or "unknown")
+    return calibration_name(kind, quant, preset) or {"graph": "fast", "exit": "fast"}.get(kind, kind or "unknown")
 
 
 def refit(a, targets, reference, reference_name):
@@ -1104,8 +1203,11 @@ def refit(a, targets, reference, reference_name):
     if head.get("basal_calibrate_rows") != 1:
         raise SystemExit(f"{a.input}: not a file written by basal-calibrate --save-rows")
     rows = [json.loads(x) for x in lines[1:] if x.strip()]
+    small = sample_size(rows, [], targets)
+    for w in small:
+        print(f"warning: {w}", file=sys.stderr)
     base_file = Path(a.calibration) if a.calibration else (Path(head["baseline"]) if head.get("baseline") else None)
-    baseline = json.loads(base_file.read_text()) if base_file is not None and base_file.exists() else {}
+    baseline = json.loads(base_file.read_text(encoding="utf-8")) if base_file is not None and base_file.exists() else {}
     fo = calibration_orders(baseline)
     if baseline and fo is not None and head.get("orders") is not None and fo != head["orders"]:  # as basal-serve
         print(f"warning: {base_file.name} was fitted on {fo} option order(s), the rows on {head['orders']}: its "
@@ -1114,7 +1216,7 @@ def refit(a, targets, reference, reference_name):
     cal, report = fit(rows, baseline, targets, a.min_per_type, head["fmt"], a.min_family, reference, a.min_per_set,
                       a.min_blend)
     cal["gates"]["ece_reference"] = reference_name
-    cal["engine"] = engine_name(head["kind"], head["quant"])
+    cal["engine"] = engine_name(head["kind"], head["quant"], head.get("vllm_preset"))
     cal["fitted_on"] = dict(data=head["data"], decisions=sum(r["prim"] != "multi" for r in rows),
                             requests=head["requests"], fit=report["n_fit"], cert=report["n_cert"],
                             per_type={t: r["n"] for t, r in report["types"].items()},
@@ -1131,12 +1233,11 @@ def refit(a, targets, reference, reference_name):
     if a.report_only:
         print("\n--report-only: no file written")
     else:
-        Path(a.out).write_text(json.dumps(cal, indent=1, ensure_ascii=False) + "\n")
+        Path(a.out).write_text(json.dumps(cal, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
         print(f"\nwrote {a.out} (calibration file {head['fmt']}, engine {cal['engine']}, refitted from {a.input})")
-    bad = regressions(report)
-    if a.strict and bad:
-        print(f"--strict: leave-one-family-out ECE above the reference for {', '.join(bad)}", file=sys.stderr)
-        sys.exit(1)
+    summary(small + cert_notes(report, None, targets))
+    if a.strict:
+        strict_check(report, a.min_family)
 
 
 # -- command line ----------------------------------------------------------------------------------------------------
@@ -1202,6 +1303,9 @@ def main(argv=None):
     print(f"basal-calibrate: {len(decisions)} labelled decisions in {len(bodies)} requests"
           + (f", {len(units)} labelled task decisions in {len(task_bodies)} requests" if units else ""),
           file=sys.stderr)
+    small = sample_size(decisions, units, targets)
+    for w in small:  # before the readouts: a target these labels cannot certify (feedback from BRAUN SI)
+        print(f"warning: {w}", file=sys.stderr)
     if units and a.url:
         raise SystemExit("task questions (classify / verify / extract) need the engine in process: their thresholds "
                          "are certified on the answers as served with the fitted temperatures; give --model and --mode "
@@ -1239,21 +1343,30 @@ def main(argv=None):
         model, engine = a.model or entry.get("name"), f"{mode} at {base}"
         orders = entry.get("orders")  # the server's option orders (servers before this field: unknown)
         kind, quant = MODES.get(mode, ("", None, False))[:2]
+        preset = entry.get("vllm_preset")  # --mode vllm: the server's preset (servers before 2.2.1: none)
         md = resolve(a.model, a.revision, metadata_only=True) if a.model else None
         revision = model_identity(a.model, md)[1] if md is not None else None
         fmt = entry.get("prompt_format") or (model_format(md) if md is not None else 1)
-        baseline, base_file = compared(md, kind, a.calibration, quant, orders, a.no_calibration)
+        # the layout the server reads prompts in (servers before 2.4.1 and canonical ones do not say)
+        a.layout = getattr(a, "layout", None) or entry.get("layout") or (model_layout(md) if md is not None
+                                                                          else "canonical")
+        baseline, base_file = compared(md, kind, a.calibration, quant, orders, a.no_calibration, preset, a.layout)
         settle(asyncio.run(over_http(base + "/v1/systemone", bodies, a.concurrency)) if bodies else [])
         task_responses = []
     else:
         a.model = a.model or add_engine_args(argparse.ArgumentParser()).get_default("model")  # basal-serve's
-        mode = a.mode or default_mode()
+        refuse_lean_flex(a.lean, a.tree)  # before default_mode, which resolves the model on CUDA GPUs without FA3
+        mode = a.mode or default_mode(a.model, a.revision)
         srv = Server(argparse.Namespace(**{**vars(a), "mode": mode, "name": None, "calibration": None,
                                            "no_calibration": True, "log_decisions": None}))
         kind, quant, fmt, orders = srv.kind, a.quant or MODES[mode][1], srv.fmt, srv.orders
-        baseline, base_file = compared(srv.md, srv.kind, a.calibration, quant, orders, a.no_calibration)
+        preset = getattr(srv.backend, "preset", None)
+        a.layout = srv.layout  # --layout, else the model's basal.json "layout"
+        baseline, base_file = compared(srv.md, srv.kind, a.calibration, quant, orders, a.no_calibration, preset,
+                                       a.layout)
         model, revision = a.model, model_identity(a.model, srv.md)[1]
-        engine = mode + (f" --quant {a.quant}" if a.quant else "") + (f" --gguf {Path(a.gguf).name}" if a.gguf else "")
+        engine = mode + (f" --quant {a.quant}" if a.quant else "") + (f" --gguf {Path(a.gguf).name}" if a.gguf else "") \
+            + (f" --vllm-preset {preset}" if preset not in (None, "default") else "")
         _, task_responses = asyncio.run(two_passes(srv, bodies, task_bodies, a.concurrency, settle))
     rows, failed, cal, report = fitted["rows"], fitted["failed"], fitted["cal"], fitted["report"]
     trows, tfailed = task_rows(units, task_responses) if units else ([], [])
@@ -1273,13 +1386,13 @@ def main(argv=None):
     if task_report:
         cal["task_gates"] = task_report
     if a.save_rows and rows:
-        head = dict(basal_calibrate_rows=1, fmt=fmt, kind=kind, quant=quant, model=str(model), engine=engine,
-                    data=Path(a.input).name, requests=len(bodies) - len(failed),
+        head = dict(basal_calibrate_rows=1, fmt=fmt, kind=kind, quant=quant, vllm_preset=preset, model=str(model),
+                    engine=engine, data=Path(a.input).name, requests=len(bodies) - len(failed),
                     baseline=str(base_file) if baseline else None, orders=orders)
-        with open(a.save_rows, "w") as f:
+        with open(a.save_rows, "w", encoding="utf-8") as f:
             for x in [head] + rows:
                 f.write(json.dumps(x, ensure_ascii=False) + "\n")
-    cal["engine"] = engine_name(kind, quant)
+    cal["engine"] = engine_name(kind, quant, preset)
     cal["fitted_on"] = dict(data=Path(a.input).name, decisions=sum(r["prim"] != "multi" for r in rows),
                             requests=len(bodies) - len(failed),
                             fit=report["n_fit"] if report else 0, cert=report["n_cert"] if report else 0,
@@ -1294,6 +1407,8 @@ def main(argv=None):
         cal["fitted_on"]["task_requests"] = len(task_bodies) - len(tfailed)
     if orders is not None:  # basal-serve applies the file only to these orders (or loads CALIBRATION.o<N>.json)
         cal["fitted_on"]["orders"] = orders
+    if getattr(a, "layout", None) not in (None, "canonical"):  # basal-serve applies it only in this layout (2.4.1)
+        cal["fitted_on"]["layout"] = a.layout
     cal["certified_on"] = "CERT split of fitted_on.data (30% by group)"
     cal["baseline"] = (str(a.calibration or f"{a.model}/{base_file.name}") if baseline else "none") + \
         (f" ({baseline['source_tag']})" if baseline.get("source_tag") else "")
@@ -1311,13 +1426,12 @@ def main(argv=None):
     if a.report_only:
         print("\n--report-only: no file written")
     else:
-        Path(a.out).write_text(json.dumps(cal, indent=1, ensure_ascii=False) + "\n")
+        Path(a.out).write_text(json.dumps(cal, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
         print(f"\nwrote {a.out} (calibration file {fmt}, engine {cal['engine']})\n"
               f"  basal-serve --model {a.model or '<model>'} --mode {mode} --calibration {a.out}")
-    bad = regressions(report) if report else []
-    if a.strict and bad:
-        print(f"--strict: leave-one-family-out ECE above the reference for {', '.join(bad)}", file=sys.stderr)
-        sys.exit(1)
+    summary(small + cert_notes(report, task_report, targets))
+    if a.strict and report:
+        strict_check(report, a.min_family)
 
 if __name__ == "__main__":
     main()

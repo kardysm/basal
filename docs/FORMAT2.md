@@ -548,8 +548,9 @@ say its orders is not checked.
 
 `input_tokens` sums the tokens of every prompt. `GET /v1/models` reports the model's `prompt_format`.
 
-**Errors.** A request the server cannot answer gets HTTP 422 with `{"error": "<message>"}`. Messages about one
-question start with `question '<name>': `.
+**Errors.** An invalid request gets HTTP 422 with `{"error": "<message>"}` (the cases below); the GPU out of memory
+gets 503 and any other server error 500, with the same body ([API.md](API.md)). Messages about one question start
+with `question '<name>': `.
 
 | case | message shape |
 |---|---|

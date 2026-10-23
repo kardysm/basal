@@ -33,7 +33,7 @@ def write_model(d, tokenizer=TOKENIZER, scores=(-1000.0,) * 5, decision=False):
         w.add_string("llama.decision.type", "basal")
         w.add_float32("llama.decision.temperature.choice", 1.14)
     w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
-    (d / "tokenizer.json").write_text(json.dumps(tokenizer))
+    (d / "tokenizer.json").write_text(json.dumps(tokenizer), encoding="utf-8")
     return d / "raw.gguf"
 
 
@@ -167,7 +167,7 @@ def test_cli_creates_missing_output_directory(tmp_path):
     write_model(tmp_path)
     llama = tmp_path / "llama.cpp"
     llama.mkdir()
-    (llama / "convert_hf_to_gguf.py").write_text("import sys; sys.exit(3)\n")  # stops right after the temp dir
+    (llama / "convert_hf_to_gguf.py").write_text("import sys; sys.exit(3)\n", encoding="utf-8")  # stops right after the temp dir
     out = tmp_path / "new" / "dir" / "model.gguf"
     with pytest.raises(SystemExit) as e:
         main([str(tmp_path), str(out), "--llama-cpp", str(llama)])
@@ -181,11 +181,11 @@ def test_cli_converts_a_local_model_then_fixes_it(tmp_path, monkeypatch):
     (llama / "convert_hf_to_gguf.py").write_text(
         "import json, shutil, sys\n"
         f"json.dump(sys.argv[1:], open({str(tmp_path / 'argv.json')!r}, 'w'))\n"
-        f"shutil.copy({str(raw)!r}, sys.argv[sys.argv.index('--outfile') + 1])\n")
+        f"shutil.copy({str(raw)!r}, sys.argv[sys.argv.index('--outfile') + 1])\n", encoding="utf-8")
     monkeypatch.setattr("huggingface_hub.snapshot_download", lambda *a, **k: pytest.fail("download"))
     out = tmp_path / "out" / "model-Q8_0.gguf"
     main([str(tmp_path / "model"), str(out), "--outtype", "q8_0", "--llama-cpp", str(llama)])
-    argv = json.loads((tmp_path / "argv.json").read_text())
+    argv = json.loads((tmp_path / "argv.json").read_text(encoding="utf-8"))
     assert argv[:4] == [str(tmp_path / "model"), "--outtype", "q8_0", "--outfile"]
     assert Path(argv[4]).parent.parent == out.parent and sorted(out.parent.iterdir()) == [out]  # temp dir removed
     assert gguf.GGUFReader(out).fields["tokenizer.ggml.scores"].contents() == [-1000, 0, 0, -1, -2]
@@ -196,7 +196,7 @@ def test_cli_conversion_from_a_repo_downloads_the_whole_model(tmp_path, monkeypa
     llama = tmp_path / "llama.cpp"
     llama.mkdir()
     (llama / "convert_hf_to_gguf.py").write_text(
-        f"import shutil, sys; shutil.copy({str(raw)!r}, sys.argv[sys.argv.index('--outfile') + 1])\n")
+        f"import shutil, sys; shutil.copy({str(raw)!r}, sys.argv[sys.argv.index('--outfile') + 1])\n", encoding="utf-8")
     calls = []
     monkeypatch.setattr("huggingface_hub.snapshot_download",
                         lambda r, **kw: calls.append((r, kw)) or str(tmp_path / "model"))

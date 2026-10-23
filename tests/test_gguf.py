@@ -33,7 +33,7 @@ def model(tmp_path_factory):
     model_dir.mkdir()
     (model_dir / "config.json").write_text(json.dumps({
         "model_type": "llama", "num_hidden_layers": L, "hidden_size": H, "vocab_size": V,
-    }))
+    }), encoding="utf-8")
     w = gguf.GGUFWriter(str(path), "llama")
     w.add_context_length(256); w.add_embedding_length(H); w.add_block_count(L); w.add_feed_forward_length(F)
     w.add_head_count(NH); w.add_head_count_kv(NKV); w.add_rope_freq_base(1e6); w.add_layer_norm_rms_eps(1e-6)
@@ -77,7 +77,7 @@ def test_mismatched_architecture_fails_before_context_creation(model, tmp_path, 
     model_dir.mkdir()
     (model_dir / "config.json").write_text(json.dumps({
         "model_type": "llama", "num_hidden_layers": L + 1, "hidden_size": H, "vocab_size": V,
-    }))
+    }), encoding="utf-8")
     monkeypatch.setattr("basal.engine.AutoTokenizer.from_pretrained", lambda _: Tok())
     monkeypatch.setattr(C, "llama_init_from_model",
                         lambda *args: pytest.fail("context creation must follow architecture validation"))
@@ -124,6 +124,39 @@ def test_soam_nested_prefixes_equal_separate(backend):
     assert np.allclose(packed, separate, atol=5e-3)
 
 
+def test_context_takes_pytorchs_thread_count(model, monkeypatch):
+    """Not llama.cpp's default of 4: the count PyTorch runs with (physical cores, CPU affinity, OMP_NUM_THREADS)."""
+    import llama_cpp as C
+    import torch
+
+    gguf_path, model_dir = model
+    monkeypatch.setattr("basal.engine.AutoTokenizer.from_pretrained", lambda _: Tok())
+    n = torch.get_num_threads()
+    torch.set_num_threads(3)
+    try:
+        be = GGUFBackend(model_dir, gguf_path, n_gpu_layers=0)
+    finally:
+        torch.set_num_threads(n)
+    assert (C.llama_n_threads(be.ctx), C.llama_n_threads_batch(be.ctx)) == (3, 3)
+
+
+def test_thread_count_does_not_change_probabilities(backend):
+    """The context uses PyTorch's thread count; any count must give the same probabilities bit for bit (ggml computes
+    each output element as one dot product in one thread)."""
+    import llama_cpp as C
+
+    g = group("a shared state of a request, long enough to matter: " * 3)
+    n = C.llama_n_threads_batch(backend.ctx)
+    try:
+        runs = []
+        for k in (1, 2, 3, 5):
+            C.llama_set_n_threads(backend.ctx, k, k)
+            runs.append(backend.run_shared([g])[0])
+    finally:
+        C.llama_set_n_threads(backend.ctx, n, n)
+    assert all(np.array_equal(r, runs[0]) for r in runs)
+
+
 def test_readouts_beyond_n_seq_are_split(backend):
     """A group with more readouts than sequences per chunk is bisected (exact: each part keeps the shared prefix)."""
     prompts = [f"shared state; option set {k}" for k in range(10)]
@@ -144,7 +177,7 @@ def test_multimodal_config_is_checked_on_its_text_config(model, tmp_path, monkey
         model_dir = tmp_path / name
         model_dir.mkdir()
         (model_dir / "config.json").write_text(json.dumps({"model_type": "gemma4", "text_config": {
-            "model_type": "gemma4_text", "num_hidden_layers": layers, "hidden_size": H, "vocab_size": V}}))
+            "model_type": "gemma4_text", "num_hidden_layers": layers, "hidden_size": H, "vocab_size": V}}), encoding="utf-8")
         if ok:
             assert GGUFBackend(model_dir, gguf_path, n_gpu_layers=0).n_vocab == V
         else:

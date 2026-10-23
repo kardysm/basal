@@ -1,6 +1,7 @@
 """EagerBackend reads option codes in fp32 from the output head's input, with the model's final logit softcap (Gemma):
 equal to the model's own fp32 logits, and in a bf16 model no longer rounded to bf16 logit steps. Llama, Gemma 4 and a
 hybrid model (Qwen3.5: Gated DeltaNet and attention layers, left-padded batches and chunked prefill)."""
+import pytest
 import torch
 from transformers import (Gemma4ForCausalLM, Gemma4TextConfig, LlamaConfig, LlamaForCausalLM, Qwen3_5ForCausalLM,
                           Qwen3_5TextConfig)
@@ -82,3 +83,53 @@ def test_eager_long_prompts_chunked_and_batches_capped(monkeypatch):
         got = s.run(toks, lids)
         for g, r in zip(got, ref):
             assert torch.allclose(torch.tensor(g), torch.tensor(r), atol=1e-5), (type(m).__name__, g, r)
+
+
+def test_eager_sdpa_kernels_without_memory_efficient_before_2_14_1(monkeypatch):
+    """pytorch/pytorch#191937: before torch 2.14.1 the eager backend's transformers forward runs without SDPA's
+    memory-efficient kernel on CUDA (wrong attention for expanded keys / values at query lengths = 1 mod 32 / 64)."""
+    from torch.nn.attention import SDPBackend
+
+    from basal import engine
+    assert engine.eager_sdpa_kernels("cpu") is None
+    monkeypatch.setattr(torch, "__version__", "2.11.0+cu128")
+    kernels = engine.eager_sdpa_kernels("cuda")
+    assert SDPBackend.EFFICIENT_ATTENTION not in kernels and SDPBackend.MATH in kernels
+    monkeypatch.setattr(torch.backends.cuda, "flash_sdp_enabled", lambda: False)  # Gemma 4 turns the others off
+    monkeypatch.setattr(torch.backends.cuda, "cudnn_sdp_enabled", lambda: False)
+    assert engine.eager_sdpa_kernels("cuda") == [SDPBackend.MATH]
+    monkeypatch.setattr(torch, "__version__", "2.14.1")
+    assert engine.eager_sdpa_kernels("cuda") is None
+    s = Stub(next(models()))  # the forward runs under those kernels
+    seen = []
+    import torch.nn.attention as attention
+    real = attention.sdpa_kernel
+    monkeypatch.setattr(attention, "sdpa_kernel", lambda ks: seen.append(ks) or real([SDPBackend.MATH]))
+    s.sdpa_kernels = [SDPBackend.MATH]
+    s.run([[1, 2, 3, 4]], [[11, 12]])
+    assert seen == [[SDPBackend.MATH]]
+
+
+def test_eager_padded_batch_at_one_mod_64_equals_math_on_gpu():
+    """On CUDA: a left-padded batch of a one-KV-head model (transformers repeats it as an expanded view under a mask)
+    at padded lengths = 1 mod 64 gives the math kernel's readouts."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA only")
+    from torch.nn.attention import SDPBackend
+
+    from basal import engine
+    torch.manual_seed(0)
+    m = LlamaForCausalLM(LlamaConfig(vocab_size=64, hidden_size=256, intermediate_size=256, num_hidden_layers=2,
+                                     num_attention_heads=2, num_key_value_heads=1, head_dim=128,
+                                     max_position_embeddings=4096)).cuda().eval()
+    s = Stub(m)
+    s.dev = torch.device("cuda")
+    s.sdpa_kernels = engine.eager_sdpa_kernels("cuda")
+    for L in (65, 1857):
+        toks = [torch.randint(1, 60, (n,)).tolist() for n in (L, L - 40)]
+        got = s.run(toks, [[11, 12, 13]] * 2)
+        s2 = Stub(m)
+        s2.dev, s2.sdpa_kernels = torch.device("cuda"), [SDPBackend.MATH]
+        ref = s2.run(toks, [[11, 12, 13]] * 2)
+        for g, r in zip(got, ref):
+            assert max(abs(a - b) for a, b in zip(g, r)) < 1e-4

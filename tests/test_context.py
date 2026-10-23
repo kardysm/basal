@@ -30,11 +30,11 @@ def ask(srv, questions, state):
 
 def test_model_and_engine_limits(tmp_path):
     assert model_context(tmp_path) is None
-    (tmp_path / "config.json").write_text(json.dumps({"max_position_embeddings": 8192}))
+    (tmp_path / "config.json").write_text(json.dumps({"max_position_embeddings": 8192}), encoding="utf-8")
     assert model_context(tmp_path) == 8192
-    (tmp_path / "config.json").write_text(json.dumps({"text_config": {"max_position_embeddings": 32768}}))
+    (tmp_path / "config.json").write_text(json.dumps({"text_config": {"max_position_embeddings": 32768}}), encoding="utf-8")
     assert model_context(tmp_path) == 32768
-    (tmp_path / "config.json").write_text(json.dumps({"max_position_embeddings": 8192}))
+    (tmp_path / "config.json").write_text(json.dumps({"max_position_embeddings": 8192}), encoding="utf-8")
     plain = type("B", (), {})()
     assert context_limit(tmp_path, plain) == MINI
     vllm = type("B", (), {"context": 4095, "context_reason": "vLLM's --max-len 4096"})()

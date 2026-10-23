@@ -129,8 +129,11 @@ class Lean:
             return o.transpose(1, 2)
         r = self.H // self.Hkv
         b, _, Lk, d = k.shape
-        k = k[:, :, None].expand(b, self.Hkv, r, Lk, d).reshape(b, self.H, Lk, d)
-        v = v[:, :, None].expand(b, self.Hkv, r, Lk, d).reshape(b, self.H, Lk, d)
+        # contiguous: with one key / value head the reshape is a stride-0 view, from which SDPA's memory-efficient
+        # kernel (the dispatcher's pick for a masked call) returns a wrong last query row on torch < 2.14.1
+        # (pytorch/pytorch#191937); with more heads the reshape copies anyway
+        k = k[:, :, None].expand(b, self.Hkv, r, Lk, d).reshape(b, self.H, Lk, d).contiguous()
+        v = v[:, :, None].expand(b, self.Hkv, r, Lk, d).reshape(b, self.H, Lk, d).contiguous()
         return F.scaled_dot_product_attention(q.transpose(1, 2), k, v, attn_mask=mask, scale=self.scale).transpose(1, 2)
 
     def _layer(self, h, res, P, cos, sin, kb=None, vb=None, pk=None, pv=None, mask=None):

@@ -45,7 +45,7 @@ def engine(tmp_path, monkeypatch):
     """A model directory with a shipped CALIBRATION.json and the stub engine behind --mode eager."""
     md = tmp_path / "model"
     md.mkdir()
-    (md / "CALIBRATION.json").write_text(json.dumps(SHIPPED))
+    (md / "CALIBRATION.json").write_text(json.dumps(SHIPPED), encoding="utf-8")
     monkeypatch.setattr(server_module, "resolve", lambda *_, **__: md)
     monkeypatch.setattr(server_module, "EagerBackend", StubBackend)
     return md
@@ -55,7 +55,7 @@ def synthetic(path, n=900, sharpen=2.0, seed=0):
     """Labelled requests whose engine is over-confident: it serves q ** sharpen (normalised) while the gold answer is
     drawn from q, so the fitted temperatures should be close to `sharpen`. Two consecutive lines share a group."""
     rng = np.random.default_rng(seed)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         for i in range(n):
             t = ("choice", "noul", "score")[i % 3]
             k = 2 if t == "noul" else 3 if t == "score" else int(rng.integers(2, 5))
@@ -91,7 +91,7 @@ def test_load_reports_every_problem_with_its_line(tmp_path):
         json.dumps({"state": "x", "facts": "yes", "questions": {"q": {"type": "noul", "gold": "yes"}}}),
         json.dumps({"state": "x", "questions": {"q": {"type": "score", "criteria": ["lo", "hi"], "gold": 2}}}),
     ]
-    (tmp_path / "bad.jsonl").write_text("\n".join(lines) + "\n")
+    (tmp_path / "bad.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
     with pytest.raises(InputError) as e:
         load(tmp_path / "bad.jsonl")
     msg = str(e.value)
@@ -123,7 +123,8 @@ def test_gold_forms_and_groups(tmp_path):
     (tmp_path / "ok.jsonl").write_text("\n".join(json.dumps(r) for r in [
         {"state": "s", "questions": {"a": {"type": "noul", "gold": "yes", "evidence": True},
                                      "b": {"type": "noul", "gold": "no", "group": "twin-1"}}},
-        {"id": "x", "group": "twin-1", "state": "s", "questions": {"c": {"type": "noul", "gold": "no"}}}]) + "\n")
+        {"id": "x", "group": "twin-1", "state": "s", "questions": {"c": {"type": "noul", "gold": "no"}}}]) + "\n",
+                                     encoding="utf-8")
     bodies, decisions = load(tmp_path / "ok.jsonl")
     examples = Path(server_module.__file__).parent / "examples"                           # basal-run simple items
     assert [len(load(examples / f"{t}.jsonl")[1]) for t in ("choice", "noul", "score")] == [8, 8, 8]
@@ -190,7 +191,7 @@ def test_calibrate_end_to_end_round_trips_through_the_server(tmp_path, engine, c
     main([str(tmp_path / "labelled.jsonl"), "--mode", "eager", "--model", "stub", "--out", str(out)])
     printed = capsys.readouterr().out
     assert "max_error on CERT" in printed and "basal-serve --model stub --mode eager --calibration" in printed
-    cal = json.loads(out.read_text())
+    cal = json.loads(out.read_text(encoding="utf-8"))
     assert cal["fitted_on"]["decisions"] == 900 and cal["fitted_on"]["engine"] == "eager"
     assert cal["fitted_on"]["fit"] + cal["fitted_on"]["cert"] == 900
     assert cal["baseline"] == "stub/CALIBRATION.json (shipped)"

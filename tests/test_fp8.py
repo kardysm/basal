@@ -31,9 +31,9 @@ def fp8_checkpoint(path):
     for f in path.glob("*.safetensors"):
         f.unlink()
     save_file({k: v.contiguous() for k, v in sd.items()}, str(path / "model.safetensors"))
-    cfg = json.loads((path / "config.json").read_text())
+    cfg = json.loads((path / "config.json").read_text(encoding="utf-8"))
     cfg["quantization_config"] = QCFG
-    (path / "config.json").write_text(json.dumps(cfg))
+    (path / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
     return m
 
 
