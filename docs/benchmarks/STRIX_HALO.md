@@ -68,11 +68,13 @@ reaches 16–19 useful TFLOPS at every request size. GPU time by operation, from
 - Start-up compiles every kernel copy a request can need. Triton compiles a kernel once per tile config and per class
   of each length argument (1, a multiple of 16, other), and the row count picks both, so a request that needs a copy
   not compiled yet waits for it: 0.2–0.3 s per copy here, about 1 ms when Triton's disk cache (`~/.triton/cache`)
-  already holds it. In engine 2.3.1 and earlier the start-up ran two lengths only, and the first request whose length
+  already holds it. In engine 2.4.1 and earlier the start-up ran two lengths only, and the first request whose length
   was a multiple of 16 in a range waited: in the request matrix, the first timed pass of S with 1 question (208 tokens)
   and of M with 2 (720 tokens), on both machines. With an empty Triton cache those passes took 1.82 and 2.30 s against
-  0.18 and 0.33 s for the next pass. Now no request compiles a kernel, and start-up takes 0.9 s longer (8.8 against
-  7.9 s with a filled Triton cache; 18.7 against 13.8 s at the first start on a machine).
+  0.18 and 0.33 s for the next pass. Now no request compiles a kernel. The warm-up's short forwards run the first layer
+  and the last only (the layers between need the same copies), so start-up takes no longer once Triton's disk cache
+  holds the copies (6.0–6.1 against 6.0–6.2 s) and about 5 s longer at the first start on a machine (13.4–13.6 against
+  8.7–8.8 s).
 
 ## Results against `gguf`: basal-2.0
 
