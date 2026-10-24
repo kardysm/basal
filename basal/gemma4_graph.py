@@ -53,7 +53,7 @@ def is_gemma4_dir(model_dir):
     from pathlib import Path
     p = Path(model_dir) / "config.json"
     try:
-        return str(json.loads(p.read_text()).get("model_type", "")).startswith("gemma4")
+        return str(json.loads(p.read_text(encoding="utf-8")).get("model_type", "")).startswith("gemma4")
     except (OSError, ValueError):
         return False
 
@@ -71,6 +71,19 @@ KERNELS = ("math", "flex", "fa3")
 _FLEX = []
 
 
+def _compile(fn):
+    """torch.compile in Inductor's deterministic mode (TORCHINDUCTOR_DETERMINISTIC=0: without it). Otherwise Inductor
+    times some reduction kernels at their first launch and keeps the faster config: the RMSNorm kernels ran with a
+    reduction block of 4,096 or 2,048 (Inductor adds the halved block when a kernel needs many registers), whichever
+    was faster by timings within 1% of each other, and the block sets the order of the sum. The choice is not always
+    cached, so another process can time it again: basal-omni-1.0-mini on an H100, 2.3.3, two runs on fresh compile
+    caches differed in 485 of 840 identity readouts (top answer in 7), a cold and a warm cache in 400 (top answer in
+    4; 22 Oct). In this mode every such kernel has one config, chosen without timing. Set per compile: Dynamo resets the
+    global switch after every frame it traces (it restores torch.use_deterministic_algorithms, which sets it)."""
+    import os
+    return torch.compile(fn, options={"deterministic": os.environ.get("TORCHINDUCTOR_DETERMINISTIC", "1") == "1"})
+
+
 def _flex_attention():
     """flex_attention as it is inside the compiled forward (Inductor generates its kernel there); from uncompiled code
     (fast-nocompile, shapes without a graph, the long lane) one compiled instance (automatic dynamic shapes), since
@@ -79,7 +92,7 @@ def _flex_attention():
     if torch.compiler.is_compiling():
         return flex_attention
     if not _FLEX:
-        _FLEX.append(torch.compile(flex_attention))
+        _FLEX.append(_compile(flex_attention))
     return _FLEX[0]
 
 
@@ -203,7 +216,7 @@ class Gemma4Graph:
         # (each recompile of 42 layers; and with dynamic=True every dimension went symbolic and tracing did not end)
         self.compiled = compile
         if compile:
-            self.pre, self.post, self.embed = torch.compile(_pre), torch.compile(_post), torch.compile(self._embed)
+            self.pre, self.post, self.embed = _compile(_pre), _compile(_post), _compile(self._embed)
 
     @staticmethod
     def _fuse(mods):

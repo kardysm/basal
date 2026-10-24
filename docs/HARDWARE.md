@@ -46,6 +46,7 @@ measurements):
 | Desktop with unified memory (DGX Spark GB10) | `fp8` | memory-bandwidth-bound; FP8 halves latency |
 | Batched high-throughput serving with vLLM | `vllm` + the `-FP8` checkpoint on Hopper / Ada, the `-NVFP4` checkpoint on Blackwell (RTX 50xx, RTX PRO 6000, B200, DGX Spark); see [QUANTIZATION](QUANTIZATION.md#basal-15-the-modelopt-checkpoints) | basal-1.0 NVFP4: 3.2× throughput on the DGX Spark, but −3 accuracy points; the basal-1.5 checkpoints' agreement and speed: FP8 agrees with the bf16 model on 0.979–0.989 of decisions; NVFP4 on 0.979 for max and 0.937 for basal-1.5 (−2.8 points); no NVFP4 for mini |
 | A100 and other GPUs without FP8 (not measured) | `fast` | the bf16 path runs on any sm80+ GPU |
+| RTX 3090 (Ampere, sm_86; measured by @krzysztofkaminski, [#33](https://github.com/rkinas/basal/issues/33)) | `fast` (bf16); `--batches compact` for basal-2.0-mini | basal-2.0-mini 13.4 ms per decision (one option order), 161.6 decisions/s with compact rows at 32 clients; basal-2.0 (4.5B) `fast` fits 24 GB from v2.3.1 (peak 23.1 GB); no `fp8` (torchao needs sm 8.9 or newer; 2.3.2 says so before loading) |
 | Apple Silicon (M-series) | MLX port: `-MLX-8bit` (decisions as with bf16); `-MLX-fp4` for 8 GB Macs (about 1.4 accuracy points less on basal-1.5, 2.0 on max, 3.6 on mini: for mini prefer `-MLX-8bit` or GGUF); without MLX: `gguf` (a `-GGUF` file in process) or `mps` (PyTorch, evidence spans) | see [Apple Silicon](#apple-silicon) |
 
 With basal-1.0 models (which ship exit heads), add `--mode fast-exit` to let requests choose `"early_exit": "0.99"`
@@ -157,6 +158,30 @@ machine; `o1` / `o2` = one option order or both (`--orders`).
   with deterministic kernels, and 541 decisions differed between batched and deterministic. `--deterministic` therefore
   runs FP8 GEMMs with full accumulation: 0.6958, the same decisions batched and alone (max |dp| 0.1), 39.6 instead of
   41.2 decisions/s at 16 clients (H100).
+
+## basal-omni-pico (Qwen3.5, Gated DeltaNet) on one H100
+
+basal-omni-pico (0.8B: 18 Gated DeltaNet layers, 6 attention layers) through `basal-serve --no-calibration`, HTTP,
+one connection per request (the profiles of the pico's model card): states of about 1,500 tokens ("short") and of
+3,000-10,000 tokens ("long"), one question or five per request; p50 latency of single requests and throughput at 16
+clients (decisions/s; questions/s with five per request). fla 0.5.2 for the Gated DeltaNet layers.
+
+| path | short, 1 q: p50 / 16 clients | short, 5 q: p50 / 16 clients | long, 1 q: p50 / 16 clients | long, 5 q: p50 / 16 clients |
+|---|---|---|---|---|
+| `fast` (2.4) | 13.5 ms / 134.6 dec/s | 26.6 ms / 400.4 q/s | 45.9 ms / 34.4 dec/s | 90.6 ms / 94.4 q/s |
+| `fast-nocompile` (2.4) | 17.4 ms / 89.3 | 33.5 ms / 328.2 | 64.0 ms / 22.9 | 110.5 ms / 80.1 |
+| `eager` | 47.0 ms / 31.7 | 111.4 ms / 41.1 | 187.7 ms / 6.4 | 925.7 ms / 6.4 |
+| `vllm` (vLLM 0.31.0; the model card's run) | 54.3 ms / 93.9 | 67 ms / 188.7 | 39 ms / 43.7 | 109 ms / 90.6 |
+
+- `fast` against `eager`: 3.5x lower latency and 4.2x the throughput on one question over a short state, 4.2x /
+  9.7x with five questions, 10.2x / 14.8x with five questions over a long state (the state is computed once, not
+  once per question). Against vLLM: faster on short states and on five questions over a long state; slower on one
+  question over a long state (46 against 39 ms, 34 against 44 decisions/s).
+- Start-up: 109 s for `fast` (404 CUDA graphs, compiled), 76 s for `fast-nocompile`; at most 9.2 GB of GPU memory
+  in use under these loads (nvidia-smi; `eager` 14.6 GB).
+- Where the time goes (in process): one question over a 1.5k-token state takes 10.1 ms, 7.6 ms of it GPU kernels
+  (GEMMs ~3 ms, fla's Gated DeltaNet and convolution kernels ~2.3 ms); a five-question request about 27 ms, of which
+  8.5 ms is the tokenizer (with `TOKENIZERS_PARALLELISM=false`, as in these runs).
 
 ## Kernels of the CUDA graph engine (one H100)
 
@@ -309,6 +334,38 @@ below 2%).
   4.2–5.5× faster than fp32 here. A likely cause is the matrix hardware of the M5's GPU cores, which speeds up bf16
   but not fp32 (not verified).
 - `mlx-q8` changes one decision of 44 on the 4.5B (agreement 0.977; 1.000 on the M4 Max).
+
+### Apple M5 Pro (basal-2.0 and `--mlx-packed`)
+
+Measured by Kamil ([@kamilrosa](https://github.com/kamilrosa), [#36](https://github.com/rkinas/basal/issues/36)) on
+the same MacBook Pro as above (Apple M5 Pro, 20-core GPU, 64 GB), macOS 26.5.2, torch 2.14.1 (MPS), MLX 0.32.3, basal
+v2.3.1, mains power. `basal-bench` on the 44 bundled examples, both option orders, two repetitions with a cool-down
+before each (two values where they differ by more than 1%); agreement with `mps` (bf16) of the same run. `mlx` = bf16
+weights, `mlx-q8` = 8-bit weights made at load time; `--mlx-packed` is the opt-in packed forward of 2.3.1 (see the
+M5 Max section below).
+
+| model | mode | 2 orders (ms) | dec/s | agreement | accuracy | GB |
+|---|---|---|---|---|---|---|
+| basal-2.0-mini | `mps` (bf16) | 38.2 | 30.1 | reference | 0.750 | 4.1 |
+| | `mlx` | 46.7 | 21.9 | 1.000 | 0.750 | 3.1 |
+| | `mlx` `--mlx-packed` | **31.3** | **43.0** | 1.000 | 0.750 | 3.8 |
+| | `mlx-q8` | 73.4 | 14.0 | 0.977 | 0.727 | 2.1 |
+| | `mlx-q8` `--mlx-packed` | 41.4 | 35.3 / 33.5 | 0.977 | 0.727 | 2.4 |
+| basal-2.0 (4.5B) | `mps` (bf16) | 101.6 | 10.5 / 10.2 | reference | 0.795 | 10.1 |
+| | `mlx` | 133.4 / 135.1 | 7.7 / 7.6 | 1.000 | 0.795 | 9.0 |
+| | `mlx` `--mlx-packed` | **87.6 / 88.0** | **13.5 / 13.1** | 1.000 | 0.795 | 9.6 |
+| | `mlx-q8` | 193.0 / 195.3 | 5.2 / 5.1 | 0.977 | 0.773 | 5.3 |
+| | `mlx-q8` `--mlx-packed` | 99.7 / 101.5 | 11.2 / 11.1 | 0.955 | 0.795 | 5.6 |
+
+The `-MLX-8bit` ports (`--modes mlx`, as in #18): basal-2.0-mini 73 -> 41 ms with `--mlx-packed`, basal-2.0-4.5B
+186 -> 98 ms (one order: 49 and 95 ms, unchanged by the flag).
+
+- With `--mlx-packed`, `mlx` is the fastest route on this chip for both models (4.5B 88 vs 102 ms for `mps`, mini 31
+  vs 38 ms). Without it, `mlx` is 22-31% slower than `mps`.
+- Against the M5 Max (40 cores) on the same 4.5B port: 1.39x slower by default and 1.27x slower packed, with half
+  the GPU cores.
+- The 4.5B `mlx-q8` agreement is 0.955 packed against 0.977 default: one more of the 44 decisions changes. Whether
+  packing changes the 8-bit rounding is not checked yet.
 
 ### Apple M5 Max (basal-1.0 and basal-2.0)
 

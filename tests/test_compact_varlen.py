@@ -87,7 +87,7 @@ def test_torch_varlen_matches_fa3_where_both_run():
 def test_unsupported_compact_refused_before_loading(tmp_path, monkeypatch):
     """--batches compact where no compact kernel runs (here: fp32 activations, or no CUDA) names the reason before the
     tokenizer or the weights are loaded."""
-    (tmp_path / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "llama"}), encoding="utf-8")
     monkeypatch.setattr("basal.engine.AutoTokenizer.from_pretrained", lambda *_: pytest.fail("loaded before refusing"))
     monkeypatch.setattr("basal.engine.set_attention", lambda *_, **__: "fa2")
     with pytest.raises(ValueError, match="--batches compact needs .* torch's varlen attention"):

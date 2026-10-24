@@ -36,7 +36,7 @@ def load_safetensors(path):
 
 
 def model_config(model_dir):
-    cfg = json.loads((Path(model_dir) / "config.json").read_text())
+    cfg = json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8"))
     if cfg.get("model_type") != "llama":
         raise ValueError(f"TPU backend supports Llama-architecture checkpoints, got {cfg.get('model_type')!r}")
     rope = cfg.get("rope_parameters") or {}

@@ -90,7 +90,7 @@ class Sidecar:
         t0 = time.time()
         while time.time() - t0 < timeout:
             if self.proc and self.proc.poll() is not None:
-                tail = Path(self.log).read_text(errors="replace").splitlines()[-15:]
+                tail = Path(self.log).read_text(errors="replace", encoding="utf-8").splitlines()[-15:]
                 raise SystemExit(f"basal think: the vLLM server exited ({self.proc.returncode}):\n" + "\n".join(tail))
             try:
                 if httpx.get(self.url + "/health", timeout=5).status_code == 200:
@@ -139,7 +139,7 @@ def think_calibration(md, path):
             raise SystemExit(f"--think-calibration {path}: no such file")
         print(f"basal think: warning: no {p.name} in the model; readout 2 is served uncalibrated", flush=True)
         return {}, "missing"
-    return json.loads(p.read_text()), p.name
+    return json.loads(p.read_text(encoding="utf-8")), p.name
 
 
 def answer(q, pl, cal):
@@ -332,7 +332,7 @@ def rows_main(argv):
             row["think"] = {k: v for k, v in th.items() if k != "no_think"}
         rows.append(row)
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
-    Path(a.out).write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
+    Path(a.out).write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8")
     s = dict(summary(rows), failed=failed, wall_s=round(time.time() - t0, 1), think_mode=a.think, data=a.data)
     print(json.dumps(s))
     return s

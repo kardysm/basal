@@ -66,7 +66,7 @@ def fix_gguf(raw, outfile, model_dir):
 
     reader = gguf.GGUFReader(raw)
     tokens = reader.fields[gguf.Keys.Tokenizer.LIST].contents()
-    tokenizer_json = json.loads((Path(model_dir) / "tokenizer.json").read_text())
+    tokenizer_json = json.loads((Path(model_dir) / "tokenizer.json").read_text(encoding="utf-8"))
     if any(i >= len(tokens) or tokens[i] != t for t, i in tokenizer_json["model"]["vocab"].items()):
         raise ValueError(f"the vocabulary of {raw} differs from {Path(model_dir) / 'tokenizer.json'}")
     scores, ranked = merge_rank_scores(tokenizer_json, tokens)

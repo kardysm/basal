@@ -115,7 +115,7 @@ def test_mlx_reads_255_format2_codes(tmp_path):
     pytest.importorskip("mlx.core")
     import json
     from pathlib import Path
-    lines = (Path(__file__).parents[1] / "docs/format2_vectors.jsonl").read_text().splitlines()
+    lines = (Path(__file__).parents[1] / "docs/format2_vectors.jsonl").read_text(encoding="utf-8").splitlines()
     vec = next(v for v in map(json.loads, lines) if v["id"] == "en-choice-255")
     codes = vec["prompts"][0]["code_ids"]
     assert len(codes) == 255 and len(set(codes)) == 255

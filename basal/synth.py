@@ -84,7 +84,7 @@ def main():
     ap.add_argument("--long-tokens", dest="long_tokens", type=int, nargs=2, default=(3000, 10000))
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
-    with open(a.out, "w") as f:
+    with open(a.out, "w", encoding="utf-8") as f:
         for it in items(a.n, a.tokens, a.seed, a.options, long_frac=a.long_frac, long_tokens=tuple(a.long_tokens)):
             f.write(json.dumps(it, ensure_ascii=False) + "\n")
 

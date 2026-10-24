@@ -42,12 +42,14 @@ from pathlib import Path
 import torch
 
 from .engine import (ATTN, EAGER_FORWARDS, EagerBackend, ExitGraphBackend, GGUFBackend, GraphBackend, LlamaCppBackend,
-                     MLXBackend, MPSBackend, OllamaBackend, SGLangBackend, VLLM_PRESETS, VLLMBackend, gemma_fast_kernels,
-                     resolve, set_fp8_fast_accum)
+                     MLXBackend, MPSBackend, OllamaBackend, SGLangBackend, VLLM_PRESETS, VLLMBackend, fp8_refused,
+                     gemma_fast_kernels, recurrent_layers, recurrent_refused, resolve, set_fp8_fast_accum)
 from .evidence import Evidence
 from .facts import inject as inject_facts
+from .gdn_graph import default_fast as gdn_default_fast, is_gdn, refused as gdn_refused
 from . import tasks
-from .prompt import (FORMATS, MAX_OPTIONS, RequestError, lang_of, letter_ids, max_options, media_messages, model_format,
+from .prompt import (FORMATS, LAYOUTS, MAX_OPTIONS, RequestError, lang_of, letter_ids, max_options, media_messages,
+                     model_format, model_layout,
                      reads_request, render)
 from .sets import label_set_id
 from .sets import select as select_set
@@ -58,7 +60,7 @@ from .tools import answer as tool_answer
 from .tools import parse as parse_tools
 from .tools import set_answer as tool_set_answer
 
-RELEASE_DATE = "2026-10-19"  # the engine's release date (GET /v1/models), not the served model's
+RELEASE_DATE = "2026-10-22"  # the engine's release date (GET /v1/models), not the served model's
 
 MODES = {
     # mode: (backend, quantisation, compile)
@@ -86,12 +88,18 @@ def default_mode(model=None, revision=None):
     with basal[tpu] installed, else eager. basal-omni (Gemma 4; model: its directory or repo id) gets fast only on the
     GPU classes where its fast configuration passed its gate (gemma_fast_kernels: Hopper with flash_attn_3, Blackwell
     workstation GPUs), eager on other GPUs until they pass theirs (2.2.0 had no working default for it there: fast
-    stopped at "'Gemma4Model' object has no attribute 'layers'")."""
+    stopped at "'Gemma4Model' object has no attribute 'layers'"). A model with recurrent-state layers gets eager on CUDA
+    and Apple Silicon (mps refuses it, mlx is not checked on it), except a Qwen3.5 model (Gated DeltaNet), which gets
+    fast on the GPU class where the graph engine's port passed its gate (gdn_graph.default_fast: Hopper with fla)."""
     if torch.cuda.is_available():
+        if model is not None and _recurrent(model, revision):
+            return "fast" if _gdn(model, revision) and gdn_default_fast() else "eager"
         if model is not None and gemma_fast_kernels() is None and _gemma4(model, revision):
             return "eager"
         return "fast"
     if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        if model is not None and _recurrent(model, revision):
+            return "eager"
         try:
             import mlx.core  # noqa: F401
             import mlx_lm  # noqa: F401
@@ -110,6 +118,24 @@ def _gemma4(model, revision=None):
     try:
         return is_gemma4_dir(resolve(model, revision, metadata_only=True))
     except Exception:  # offline without the model cached, a wrong name: the model load reports it
+        return False
+
+
+def _recurrent(model, revision=None):
+    """The recurrent-state layers of a model (recurrent_layers), from its config.json; None when that cannot be read
+    (the model load reports it)."""
+    try:
+        return recurrent_layers(resolve(model, revision, metadata_only=True))
+    except Exception:
+        return None
+
+
+def _gdn(model, revision=None):
+    """A Qwen3.5 model of Gated DeltaNet and attention layers (gdn_graph.is_gdn: the recurrent models the CUDA graph
+    engine serves), from its config.json; False when that cannot be read."""
+    try:
+        return is_gdn(resolve(model, revision, metadata_only=True))
+    except Exception:
         return False
 
 
@@ -544,7 +570,7 @@ def orders_for(orders, k):
 
 
 def models_payload(name, mode, policies, temperatures=None, prompt_format=None, orders=None, media=(),
-                   calibration_warning=None, vllm_preset=None):
+                   calibration_warning=None, vllm_preset=None, layout=None):
     """GET /v1/models in the official ModelMetadataList shape, plus the serving mode, early-exit levels, the
     temperatures in use ({} = uncalibrated probabilities, what basal-calibrate needs from a running server), the
     model's prompt format, the option orders served, why the --calibration file may not belong to the model and the
@@ -563,7 +589,24 @@ def models_payload(name, mode, policies, temperatures=None, prompt_format=None, 
         entry["calibration_warning"] = calibration_warning
     if vllm_preset:
         entry["vllm_preset"] = vllm_preset
+    if layout not in (None, "canonical"):  # the prompt layout served (2.4.1; basal-calibrate fits its file)
+        entry["layout"] = layout
     return {"models": [entry]}
+
+
+def refuse_layout_caches(layout, a):
+    """--state-cache-gb and --prefix-cache cache the prompt up to the end of the state, which only the canonical layout
+    starts with."""
+    if getattr(a, "state_cache_gb", 0) or getattr(a, "prefix_cache", "off") == "on":
+        raise SystemExit(f"layout {layout}: --state-cache-gb and --prefix-cache need the canonical layout (they cache "
+                         "the prompt up to the end of the state, which only that layout starts with)")
+
+
+def calibration_layout(cal):
+    """The prompt layout a calibration file was fitted on: fitted_on.layout (basal-calibrate --layout), else a top-level
+    "layout" (the training side's files), else canonical."""
+    fitted = cal.get("fitted_on")
+    return (fitted.get("layout") if isinstance(fitted, dict) else None) or cal.get("layout") or "canonical"
 
 
 def calibration_orders(cal):
@@ -599,18 +642,22 @@ def calibration_mismatch(cal, name, md):
     return None
 
 
-def load_calibration(md, kind, path, quant, orders, off=False, preset=None):
+def load_calibration(md, kind, path, quant, orders, off=False, preset=None, layout="canonical"):
     """The calibration basal-serve applies -> (calibration dict, its file, None or why it is unvalidated). A file
     fitted on other option orders than the served ones gives wrong temperatures and thresholds: the file for the
     served orders, CALIBRATION[.<engine>].o<orders>.json, is used when the model ships one; otherwise the file is kept
     for its temperatures without its thresholds, fitted fallback thresholds and task thresholds (max_error defers,
     tasks report automated: null), and the answers are marked unvalidated. An explicit --calibration file is not replaced."""
-    cal = calibration_file(md, kind, path, quant, preset)
-    data = {} if off or not cal.exists() else json.loads(cal.read_text())
+    layout = layout or "canonical"
+    cal = calibration_file(md, kind, path, quant, preset, layout)
+    data = {} if off or not cal.exists() else json.loads(cal.read_text(encoding="utf-8"))
+    if data and calibration_layout(data) != layout:  # another layout's thresholds do not hold here (2.4.1)
+        why = f"{cal.name} was fitted on the {calibration_layout(data)} layout, served with --layout {layout}"
+        return {k: v for k, v in data.items() if k not in ("thresholds", "multi", "task_thresholds")}, cal, why
     fitted = calibration_orders(data)
     alt = cal.with_name(f"{cal.stem}.o{orders}{cal.suffix}")
     if fitted is not None and fitted != orders and not path and alt.exists():
-        cal, data = alt, json.loads(alt.read_text())
+        cal, data = alt, json.loads(alt.read_text(encoding="utf-8"))
         fitted = calibration_orders(data)
     if fitted is None or fitted == orders:
         return data, cal, None
@@ -618,23 +665,29 @@ def load_calibration(md, kind, path, quant, orders, off=False, preset=None):
     return {k: v for k, v in data.items() if k not in ("thresholds", "multi", "task_thresholds")}, cal, why
 
 
-def calibration_file(md, kind, path=None, quant=None, preset=None):
+def calibration_file(md, kind, path=None, quant=None, preset=None, layout="canonical"):
     """The calibration file basal-serve loads: `path` (--calibration), else CALIBRATION.<engine>.json when the model
     ships one for the engine (calibration_name; a --vllm-preset without a file of its own: CALIBRATION.vllm.json),
-    else CALIBRATION.json."""
+    else CALIBRATION.json. Another --layout than canonical: CALIBRATION[.<engine>].<layout>.json first (2.4.1; without
+    one the canonical file is loaded and its thresholds are not applied, load_calibration)."""
     if path:
         return Path(path)
+    layout = layout or "canonical"
     # 1.5: each engine has its own calibration file when shipped (fp8 too); 2.2.1: each vLLM preset
-    for eng in dict.fromkeys((calibration_name(kind, quant, preset), calibration_name(kind, quant))):
-        if eng and (md / f"CALIBRATION.{eng}.json").exists():
-            return md / f"CALIBRATION.{eng}.json"
+    engines = dict.fromkeys((calibration_name(kind, quant, preset), calibration_name(kind, quant)))
+    for sfx in ([f".{layout}"] if layout != "canonical" else []) + [""]:
+        for eng in engines:
+            if eng and (md / f"CALIBRATION.{eng}{sfx}.json").exists():
+                return md / f"CALIBRATION.{eng}{sfx}.json"
+        if sfx and (md / f"CALIBRATION{sfx}.json").exists():
+            return md / f"CALIBRATION{sfx}.json"
     return md / "CALIBRATION.json"
 
 
 def model_context(md):
     """The model's context in tokens (max_position_embeddings in its config.json), None when unknown."""
     try:
-        cfg = json.loads((Path(md) / "config.json").read_text())
+        cfg = json.loads((Path(md) / "config.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     n = cfg.get("max_position_embeddings") or (cfg.get("text_config") or {}).get("max_position_embeddings")
@@ -678,6 +731,8 @@ class Server:
         if getattr(a, "state_cache_gb", 0) and (a.deterministic or kind not in ("graph", "exit")):
             raise SystemExit("--state-cache-gb needs the CUDA graph engine (fast, fast-nocompile, fp8, nvfp4) and is "
                              "not combined with --deterministic (a cached state changes the shapes of the forwards)")
+        if getattr(a, "layout", None) not in (None, "canonical"):
+            refuse_layout_caches(a.layout, a)
         if getattr(a, "prefix_cache", "off") == "on" and (a.deterministic or kind != "graph"):
             raise SystemExit("--prefix-cache needs the CUDA graph engine (fast, fast-nocompile, fp8, nvfp4) and is not "
                              "combined with --deterministic")
@@ -695,11 +750,33 @@ class Server:
             raise SystemExit("--mlx-packed needs --mode mlx (or mlx-q8)")
         if kind == "mps" and a.device == "cuda":
             raise SystemExit("--mode mps runs on Apple Silicon or the CPU (--device mps / cpu); on CUDA: --mode fast")
+        if kind in ("graph", "exit"):  # before the weights are downloaded (mps: MPSBackend, when it shares prefixes)
+            what = _recurrent(a.model, a.revision)
+            gdn = bool(what) and _gdn(a.model, a.revision)
+            if what and (kind == "exit" or not gdn):
+                raise SystemExit(recurrent_refused(a.model, what, gdn))
+            if gdn:  # Qwen3.5 in the graph engine (basal 2.4): bf16, plain and branched rows
+                why = gdn_refused(a.quant or quant, getattr(a, "state_cache_gb", 0),
+                                  getattr(a, "prefix_cache", "off") == "on", getattr(a, "batches", "default"),
+                                  lean_arg(getattr(a, "lean", "off")), getattr(a, "tree", "dense"),
+                                  getattr(a, "readout_layer", "off"), getattr(a, "template_prefix", "off"))
+                if not why and getattr(a, "long_lane", "off") == "on":
+                    why = "--long-lane is not available for Qwen3.5 (Gated DeltaNet) models"
+                if why:
+                    raise SystemExit(f"{a.model}: {why}")
+        if kind in ("graph", "exit") and (a.quant or quant) == "fp8" and fp8_refused():
+            raise SystemExit(fp8_refused())
         # GGUF modes: the engine serves the GGUF weights, so only tokenizer, template and calibration are downloaded
         md = resolve(a.model, a.revision, metadata_only=kind in ("gguf", "ollama", "llamacpp"))
         self.fmt = model_format(md)  # prompt format of the model (basal.json "prompt"; 1 when absent)
         self.max_options = max_options(self.fmt)
         self.orders = default_orders(a.orders, self.fmt)
+        # the prompt layout (prompt.LAYOUTS; 2.4.1): --layout, else the model's basal.json "layout", else canonical
+        self.layout = getattr(a, "layout", None) or model_layout(md)
+        if self.layout != "canonical" and self.fmt != 2:
+            raise SystemExit(f"layout {self.layout} needs a prompt-format-2 model (basal.json \"prompt\": 2)")
+        if self.layout != "canonical":
+            refuse_layout_caches(self.layout, a)
         self.tau, self.band = a.auto_tau, tuple(a.auto_band)
         shared = self.orders != 1 or a.soam == "on"  # prefix sharing: option orders, or the questions of a request
         self.name = a.name or a.model.rstrip("/").split("/")[-1]
@@ -758,7 +835,8 @@ class Server:
         self.md, self.kind = md, kind
         self.context = context_limit(md, self.backend)
         self.cal, cal, self.cal_unvalidated = load_calibration(md, kind, a.calibration, quant, self.orders,
-                                                                a.no_calibration, getattr(a, "vllm_preset", None))
+                                                                a.no_calibration, getattr(a, "vllm_preset", None),
+                                                                self.layout)
         check_calibration(self.cal, self.fmt, cal)
         self.cal_mismatch = calibration_mismatch(self.cal, a.model, md) if a.calibration and not a.no_calibration \
             else None  # a file of your own (--calibration); the files in the model directory belong to it
@@ -769,11 +847,11 @@ class Server:
                   "(refit with basal-calibrate, or --strict-calibration to refuse such a file)", flush=True)
         if self.cal_unvalidated:
             print(f"basal: warning: {self.cal_unvalidated}; its answers are marked \"calibration\": \"unvalidated\" "
-                  "and max_error defers (fit a file for these orders with basal-calibrate, or serve with the file's "
-                  "orders)", flush=True)
+                  "and max_error defers (fit a file for this serving with basal-calibrate, or serve with the file's "
+                  "orders and layout)", flush=True)
         self.temps = self.cal.get("temperature_per_prim", {})
         self.soam = a.soam == "on"
-        self.log = open(a.log_decisions, "a", buffering=1) if a.log_decisions else None
+        self.log = open(a.log_decisions, "a", buffering=1, encoding="utf-8") if a.log_decisions else None
         self.letters = {}
         self.queue, self.max_batch, self.wait = asyncio.Queue(), a.max_batch, a.wait_ms / 1000
         self.window = a.batch_window_ms / 1000
@@ -808,7 +886,8 @@ class Server:
             perms = [list(range(k)), list(range(k))[::-1]][: orders_for(self.orders, k)]
         jobs = []
         for perm in perms:
-            prompt = render(self.tok, q["state"], question, [options[c] for c in perm], q["lang"], self.fmt)
+            prompt = render(self.tok, q["state"], question, [options[c] for c in perm], q["lang"], self.fmt,
+                            getattr(self, "layout", "canonical"))
             jobs.append((perm, prompt, self.code_ids(prompt, k)))
         return jobs
 
@@ -1228,6 +1307,9 @@ class Server:
     async def ask_media(self, qs, branches, m):
         """Position probabilities of every prompt of every branch, with the request's media -> (outs, prompt tokens,
         the longest prompt of each branch, media tokens)."""
+        if getattr(self, "layout", "canonical") != "canonical":
+            raise RequestError(f"images and audio are read in the canonical layout only (this server: --layout "
+                               f"{self.layout})")
         msgs, ids, where = [], [], []
         for j, b in enumerate(branches):
             q = qs[b[0]]
@@ -1384,6 +1466,13 @@ def add_engine_args(ap):
                     help="device for --mode eager (default: BASAL_DEVICE, else cuda, else Apple Silicon mps, else cpu) "
                          "and --mode mps (mps or cpu; default: mps on Apple Silicon, else cpu: a request's state "
                          "computed once for all its prompts, where eager computes it once per prompt)")
+    ap.add_argument("--layout", choices=LAYOUTS, default=None,
+                    help="prompt layout (prompt-format-2 models trained on it): canonical = the "
+                         "state, then the question (questions share the state; state cache); state_twice = the state "
+                         "read twice; qfirst = the question also before the state, one pass per question (the state "
+                         "is read knowing the question: slower with several questions, no state cache). Default: the "
+                         "model's basal.json \"layout\", else canonical. Loads CALIBRATION.<layout>.json when the model "
+                         "ships one")
     ap.add_argument("--orders", type=orders_arg, default=None,
                     help="1 = the option order given; 2 = also the reversed order, averaged (shares the state); auto = "
                          "order 1, and the reversed order only where order 1 is uncertain (--auto-tau, --auto-band); "
@@ -1547,7 +1636,8 @@ def http_app(srv, mode, mcp=None):
     async def models(_):
         return JSONResponse(models_payload(srv.name, mode, getattr(srv.backend, "policies", {}), srv.temps,
                                            srv.fmt, srv.orders, getattr(srv.backend, "media_kinds", ()),
-                                           getattr(srv, "cal_mismatch", None), getattr(srv.backend, "preset", None)))
+                                           getattr(srv, "cal_mismatch", None), getattr(srv.backend, "preset", None),
+                                           getattr(srv, "layout", None)))
 
     async def health(_):
         return JSONResponse({"status": "ok", **srv.load()})

@@ -254,9 +254,9 @@ def test_modelopt_fp8_gemma4_loads_tied_and_runs(tmp_path):
     for f in tmp_path.glob("*.safetensors"):
         f.unlink()
     save_file({k: v.contiguous() for k, v in sd.items()}, str(tmp_path / "model.safetensors"))
-    cfg = json.loads((tmp_path / "config.json").read_text())
+    cfg = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
     cfg["quantization_config"] = {"quant_method": "modelopt", "quant_algo": "FP8"}
-    (tmp_path / "config.json").write_text(json.dumps(cfg))
+    (tmp_path / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
     q = load_modelopt_fp8(tmp_path, "cpu", torch.float32)
     assert q.lm_head.weight.data_ptr() == q.model.embed_tokens.weight.data_ptr()
     assert sum(isinstance(x, FP8Linear) for x in q.modules()) > 0
@@ -286,3 +286,81 @@ def test_chunked_long_states_and_incremental_states_equal_separate(kind):
             assert torch.allclose(torch.tensor(r), e, atol=1e-6)
     s = be.state_cache.stats()
     assert s["prefix_hits"] == 2 and s["entries"] == 2  # the grown state replaced the first
+
+
+def test_warm_captures_largest_first_then_long_pass2():
+    """warm() (Gemma 4, basal 2.3.4): every graph's warm-up calls first, in the grid's order (torch.compile compiles
+    there), then the captures, the most tokens first; the pass-2 graphs over roots longer than LENS after those, each
+    captured as it is warmed up (_warm_long_sfx measures the graph pool as each one is captured). Replays still
+    answer as separate forwards."""
+    from basal.engine import _graph_tokens
+
+    class Replay:  # a captured graph's stand-in: replay() recomputes its output from the static inputs, in place
+        def __init__(self, fn, static):
+            self.fn, self.static = fn, static
+            self.out = fn(*static)
+
+        def replay(self):
+            self.out.copy_(self.fn(*self.static))
+
+    class Order(Stub):
+        def __init__(self, model):
+            super().__init__(model)
+            self.LENS, self.PLAIN_LENS, self.BATCHES, self.TOKEN_BUDGET = [8], [8, 16], [1, 2], 32
+            self.SUFFIX_LENS, self.TREE_ROWS = [4, 8], [1, 2]
+            self._alloc_kv()
+            self.fwd, self.fwd_sfx = self._forward, self._forward_suffix
+            self.events = []
+
+        def _capture(self, key, fn, *static):
+            self.events.append(("request", key))
+            return GraphBackend._capture(self, key, fn, *static)
+
+        def _warm_up(self, fn, static):
+            self.events.append(("warm", None))
+            fn(*static)
+
+        def _record(self, key, fn, static):
+            self.events.append(("capture", key))
+            r = Replay(fn, static)
+            self.graphs[key] = (r, *static, r.out)
+            return self.graphs[key]
+
+    m = tiny("e4b", torch.float32)
+    be = Order(m)
+    be.warm()
+    ev = be.events
+    long = [i for i, (kind, k) in enumerate(ev) if kind == "request" and k[0] == "x" and k[3] > be.LENS[-1]]
+    assert long, "no pass-2 graph over a root beyond LENS"
+    head = ev[: long[0]]
+    kinds = [e[0] for e in head]
+    first = kinds.index("capture")
+    caps = [k for kind, k in head if kind == "capture"]
+    assert "warm" not in kinds[first:] and kinds.count("warm") == len(caps) == len(set(caps)) > 4
+    big = [k for k in caps if k[0] != "x"]  # (#41) plain / compact graphs the largest first, then pass 2 the smallest
+    assert [_graph_tokens(k) for k in big] == sorted(map(_graph_tokens, big), reverse=True)
+    p2 = [k for k in caps if k[0] == "x"]
+    assert caps == big + p2 and [_graph_tokens(k) for k in p2] == sorted(map(_graph_tokens, p2))
+    for i in long:  # each long pass-2 graph: warmed up, then captured at once
+        assert ev[i + 1] == ("warm", None) and ev[i + 2] == ("capture", ev[i][1])
+    state = [1, 5, 9, 11, 3, 4, 6, 12, 13, 14, 15, 16]  # a root of 12 tokens: the pass-2 graphs over roots of 16
+    toks = [state + [20 + q, 21, 30 + o, 31 - o] for q in range(2) for o in range(2)] + [[1, 5, 9, 20, 21]]
+    lids = [[7, 8]] * 4 + [[7, 9]]
+    res = be.run_shared([(toks[:4], lids[:4]), (toks[4:], lids[4:])])
+    for r, e in zip(res[0] + res[1], separate(m, toks, lids)):
+        assert torch.allclose(torch.tensor(r), e, atol=1e-6)
+
+
+@pytest.mark.parametrize("env, want", [(None, True), ("1", True), ("0", False)])
+def test_compiled_layers_in_inductor_deterministic_mode(monkeypatch, env, want):
+    """The compiled layer functions ask Inductor for its deterministic mode per compile (no kernel config chosen by
+    timing, so a cold and a warm compile cache give the same probabilities); TORCHINDUCTOR_DETERMINISTIC=0 turns it
+    off."""
+    seen = []
+    monkeypatch.setattr(torch, "compile", lambda fn, **kw: seen.append(kw) or fn)
+    if env is None:
+        monkeypatch.delenv("TORCHINDUCTOR_DETERMINISTIC", raising=False)
+    else:
+        monkeypatch.setenv("TORCHINDUCTOR_DETERMINISTIC", env)
+    Gemma4Graph(tiny("e4b"), compile=True)
+    assert len(seen) == 3 and all(kw == {"options": {"deterministic": want}} for kw in seen)

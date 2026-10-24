@@ -125,7 +125,7 @@ def test_flex_with_lean_on_refused_before_loading(monkeypatch, tmp_path, entry):
             server_module.main()
         elif entry == "calibrate":
             (tmp_path / "l.jsonl").write_text(json.dumps({"state": "x", "questions": {
-                "q": {"type": "choice", "instructions": "?", "criteria": ["a", "b"], "gold": "a"}}}) + "\n")
+                "q": {"type": "choice", "instructions": "?", "criteria": ["a", "b"], "gold": "a"}}}) + "\n", encoding="utf-8")
             calibrate_module.main([str(tmp_path / "l.jsonl"), *args, "--out", str(tmp_path / "c.json")])
         else:
             think_module.ThinkServer(server_module.parser().parse_args([*args, "--think", "auto"]))

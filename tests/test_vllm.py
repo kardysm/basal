@@ -52,7 +52,7 @@ def fake_vllm(monkeypatch):
 
 
 def test_backend_passes_the_preset_to_vllm(tmp_path, fake_vllm):
-    (tmp_path / "config.json").write_text(json.dumps(E4B))
+    (tmp_path / "config.json").write_text(json.dumps(E4B), encoding="utf-8")
     be = VLLMBackend(tmp_path, max_len=16384, fast_prefill=True)
     assert be.preset == "default" and "quantization" not in fake_vllm and "kv_cache_dtype" not in fake_vllm
     assert fake_vllm["kv_sharing_fast_prefill"] and "language_model_only" not in fake_vllm
@@ -65,7 +65,7 @@ def test_backend_passes_the_preset_to_vllm(tmp_path, fake_vllm):
 
 def test_bench_mode_with_a_preset(tmp_path, fake_vllm):
     from basal.bench import build
-    (tmp_path / "config.json").write_text(json.dumps(TEXT))
+    (tmp_path / "config.json").write_text(json.dumps(TEXT), encoding="utf-8")
     assert build("vllm@deterministic", tmp_path, fmt=2).preset == "deterministic"
     assert fake_vllm["enable_prefix_caching"] is False
     assert fake_vllm["max_logprobs"] == 255
@@ -93,12 +93,12 @@ def test_calibration_file_per_preset(tmp_path):
     assert calibration_name("vllm", None) == "vllm" and calibration_name("vllm", None, "default") == "vllm"
     assert calibration_name("vllm", None, "deterministic") == "vllm.deterministic"
     assert calibration_name("graph", "fp8", "deterministic") == "fp8" and calibration_name("eager", None, "fp8") is None
-    (tmp_path / "CALIBRATION.json").write_text("{}")
+    (tmp_path / "CALIBRATION.json").write_text("{}", encoding="utf-8")
     assert calibration_file(tmp_path, "vllm", preset="deterministic") == tmp_path / "CALIBRATION.json"
-    (tmp_path / "CALIBRATION.vllm.json").write_text("{}")
+    (tmp_path / "CALIBRATION.vllm.json").write_text("{}", encoding="utf-8")
     # a preset without a file of its own: the vLLM file (a -FP8 checkpoint's own fit, or the bf16 vLLM fit)
     assert calibration_file(tmp_path, "vllm", preset="deterministic") == tmp_path / "CALIBRATION.vllm.json"
-    (tmp_path / "CALIBRATION.vllm.deterministic.json").write_text("{}")
+    (tmp_path / "CALIBRATION.vllm.deterministic.json").write_text("{}", encoding="utf-8")
     assert calibration_file(tmp_path, "vllm", preset="deterministic") == tmp_path / "CALIBRATION.vllm.deterministic.json"
     assert calibration_file(tmp_path, "vllm") == tmp_path / "CALIBRATION.vllm.json"
     assert calibration_file(tmp_path, "eager", preset="deterministic") == tmp_path / "CALIBRATION.json"
@@ -106,8 +106,8 @@ def test_calibration_file_per_preset(tmp_path):
 
 
 def test_preset_file_for_the_served_orders(tmp_path):
-    (tmp_path / "CALIBRATION.vllm.deterministic.json").write_text(json.dumps({"orders": 1, "thresholds": {"0.01": {}}}))
-    (tmp_path / "CALIBRATION.vllm.deterministic.o2.json").write_text(json.dumps({"orders": 2, "thresholds": {"0.01": {}}}))
+    (tmp_path / "CALIBRATION.vllm.deterministic.json").write_text(json.dumps({"orders": 1, "thresholds": {"0.01": {}}}), encoding="utf-8")
+    (tmp_path / "CALIBRATION.vllm.deterministic.o2.json").write_text(json.dumps({"orders": 2, "thresholds": {"0.01": {}}}), encoding="utf-8")
     cal, path, why = load_calibration(tmp_path, "vllm", None, None, 2, preset="deterministic")
     assert path.name == "CALIBRATION.vllm.deterministic.o2.json" and why is None and cal["orders"] == 2
     cal, path, why = load_calibration(tmp_path, "vllm", None, None, 1, preset="deterministic")
@@ -128,14 +128,14 @@ def test_media_engine_args():
 
 
 def test_media_needs_an_encoder(tmp_path, fake_vllm):
-    (tmp_path / "config.json").write_text(json.dumps(TEXT))
+    (tmp_path / "config.json").write_text(json.dumps(TEXT), encoding="utf-8")
     with pytest.raises(SystemExit, match="no image or audio encoder"):
         VLLMBackend(tmp_path, media=True)
-    (tmp_path / "config.json").write_text(json.dumps(E4B))
-    (tmp_path / "processor_config.json").write_text(json.dumps({"audio_seq_length": 750, "audio_ms_per_token": 40}))
+    (tmp_path / "config.json").write_text(json.dumps(E4B), encoding="utf-8")
+    (tmp_path / "processor_config.json").write_text(json.dumps({"audio_seq_length": 750, "audio_ms_per_token": 40}), encoding="utf-8")
     be = VLLMBackend(tmp_path, media=True)
     assert be.media_kinds == ("image", "audio") and be.max_audio_s == 30 and fake_vllm["limit_mm_per_prompt"]
-    (tmp_path / "config.json").write_text(json.dumps({**E4B, "architectures": ["Gemma4UnifiedForConditionalGeneration"]}))
+    (tmp_path / "config.json").write_text(json.dumps({**E4B, "architectures": ["Gemma4UnifiedForConditionalGeneration"]}), encoding="utf-8")
     with pytest.raises(SystemExit, match="does not serve Gemma 4 Unified"):  # 1.1-max failed the media gate
         VLLMBackend(tmp_path, media=True)
 

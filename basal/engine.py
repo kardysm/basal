@@ -23,6 +23,7 @@ Backends:
   LlamaCppBackend   llama.cpp server with the GGUF exports (1.5): token-id prompt, `n_probs` log-probabilities
   TPUBackend        (basal/tpu.py, extra basal[tpu]; experimental) the same SOAM packing in JAX / XLA on Google TPU
 """
+import functools
 import json
 import os
 import re
@@ -30,6 +31,7 @@ import threading
 import traceback
 from pathlib import Path
 from types import SimpleNamespace
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -119,14 +121,14 @@ class EagerBackend:
         cls = AutoModelForCausalLM
         if media:
             from .media import audio_window, kinds_of
-            self.media_kinds = kinds_of(json.loads((Path(model_dir) / "config.json").read_text()))
+            self.media_kinds = kinds_of(json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8")))
             if not self.media_kinds:
                 raise SystemExit("--media on: the model has no image or audio encoder (config.json: vision_config, "
                                  "audio_config)")
             from transformers import AutoModelForImageTextToText, AutoProcessor
             cls, self.proc = AutoModelForImageTextToText, AutoProcessor.from_pretrained(model_dir)
             pc = Path(model_dir) / "processor_config.json"
-            self.max_audio_s = audio_window(json.loads(pc.read_text())) if pc.exists() else None
+            self.max_audio_s = audio_window(json.loads(pc.read_text(encoding="utf-8"))) if pc.exists() else None
             _memo_media(self.proc)
         self.lock, self.media_lock = threading.Lock(), threading.Lock()
         self.model = cls.from_pretrained(model_dir, dtype=getattr(torch, dtype))
@@ -138,7 +140,7 @@ class EagerBackend:
         if torch.device(dev).type == "cuda":
             # no cuDNN attention for any model (the graph engine never uses it either): it builds an execution plan for
             # every new prompt length (H100, torch 2.11: 573 ms for a new length, 20 ms for a repeated one), so
-            # basal-2.0-pico and basal-2.0 in eager paid ~0.45 s a request
+            # a Qwen3 model and basal-2.0 in eager paid ~0.45 s a request
             torch.backends.cuda.enable_cudnn_sdp(False)
         from .gemma4 import is_gemma4
         if is_gemma4(self.model):
@@ -344,6 +346,9 @@ def attention_available(impl):
         return None
     if impl == "cudnn":
         return None if torch.backends.cudnn.is_available() else "cuDNN is not available"
+    if impl == "flex":  # Gemma 4's FlexAttention: Inductor generates its kernel with Triton (not in Windows wheels)
+        import importlib.util
+        return None if importlib.util.find_spec("triton") else "FlexAttention needs Triton (the triton package)"
     return f"unknown attention {impl!r} (one of {', '.join(ATTN)})"
 
 
@@ -364,6 +369,8 @@ def gemma_fast_kernels():
     (the math kernel, uncompiled; eager without --mode): fa3 where FlashAttention 3 runs (Hopper; E3, 20 Oct), flex on
     Blackwell workstation GPUs (sm_120: FlexAttention with the smaller tiles of 99 KB of shared memory per block; RTX
     PRO 6000, 20 Oct)."""
+    if attention_available("flex"):  # both run FlexAttention (fa3: in the 512-wide global layers)
+        return None
     if attention_available("fa3") is None:
         return "fa3"
     if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 12:
@@ -422,6 +429,8 @@ def torch_varlen_available(dtype):
         return "needs an sm80+ GPU"
     if dtype not in (torch.bfloat16, torch.float16):
         return "needs bf16 / fp16 activations"
+    if not torch.backends.cuda.is_flash_attention_available():  # Windows wheels: built without USE_FLASH_ATTENTION
+        return "this torch is built without FlashAttention"
     try:
         from torch.nn.attention.varlen import varlen_attn
     except ImportError:
@@ -435,6 +444,81 @@ def torch_varlen_available(dtype):
 def compact_refused(why):
     return ("--batches compact needs FlashAttention 3 (--attn fa3 / auto on Hopper; Gemma 4: --gemma-attn fa3) or "
             f"torch's varlen attention ({why})")
+
+
+# config.json "layer_types" of attention layers; any other kind (Qwen3.5's linear_attention: Gated DeltaNet, Mamba,
+# conv) carries a recurrent state from token to token
+ATTENTION_LAYERS = {"full_attention", "sliding_attention", "chunked_attention"}
+RECURRENT_MODEL_TYPES = ("qwen3_5", "qwen3_next", "mamba", "jamba", "zamba", "bamba", "falcon_h1", "granitemoehybrid",
+                         "nemotron_h", "lfm2", "recurrent_gemma", "rwkv")
+
+
+def recurrent_layers(model_dir):
+    """The recurrent-state layers of a model (Gated DeltaNet / linear attention as in Qwen3.5, Mamba, conv), read from
+    its config.json before any weights are -> e.g. "18 linear_attention layers" or "model_type qwen3_5_text"; None for
+    an attention-only decoder or without a readable config.json."""
+    try:
+        cfg = json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    cfgs = (cfg, cfg.get("text_config") or {})  # multimodal models: the decoder's settings in text_config
+    for c in cfgs:
+        kinds = [k for k in c.get("layer_types") or () if k not in ATTENTION_LAYERS]
+        if kinds:
+            return ", ".join(f"{kinds.count(k)} {k}" for k in sorted(set(kinds))) + " layers"
+    for c in cfgs:
+        if str(c.get("model_type") or "").startswith(RECURRENT_MODEL_TYPES):
+            return f"model_type {c['model_type']}"
+    return None
+
+
+def recurrent_refused(model, what, gdn=False):
+    """The refusal of the shared-prefix engines for a model with recurrent-state layers. Their prefix tries, two passes,
+    compact rows and caches hold attention keys and values only: a Gated DeltaNet layer would restart from zero state
+    below a shared prefix and run across the prompts of a packed row, so the answers would be wrong without any error
+    (v2.3.1 with the 0.8B pico, 21 Oct). Since 2.4 the CUDA graph engine carries the recurrent state of Qwen3.5 decoders
+    (gdn: basal/gdn_graph.py, --mode fast and fast-nocompile); fast-exit and mps still refuse them, and every other
+    recurrent model stays refused by all of them."""
+    if gdn:
+        return (f"{model}: {what} (recurrent state: Gated DeltaNet, Qwen3.5). --mode fast-exit and --mode mps keep "
+                "attention keys and values only and would answer wrongly; serve it with --mode fast (CUDA), --mode "
+                "eager (exact) or --mode vllm")
+    return (f"{model}: {what} (recurrent state: Gated DeltaNet / linear attention, as in Qwen3.5). The CUDA graph "
+            "engine (--mode fast, fast-nocompile, fast-exit, fp8, nvfp4) carries the recurrent state of Qwen3.5 "
+            "decoders only, and --mode mps of none: they would answer wrongly; serve it with --mode eager (exact) or "
+            "--mode vllm (faster), or --mode gguf with a GGUF file")
+
+
+def fp8_refused():
+    """Why torchao FP8 (--mode fp8, --quant fp8) cannot run here, None if it can: its FP8 matrix multiplies need a GPU
+    of compute capability 8.9 or newer (Ada, Hopper, Blackwell); on older GPUs torchao failed only after the model was
+    loaded (RTX 3090, #33)."""
+    if not torch.cuda.is_available():
+        return "--mode fp8 needs a CUDA GPU of compute capability 8.9 or newer (Ada, Hopper, Blackwell)"
+    cc = torch.cuda.get_device_capability()
+    if tuple(cc) < (8, 9):
+        return (f"--mode fp8 needs a GPU of compute capability 8.9 or newer (Ada, Hopper, Blackwell) for its FP8 "
+                f"matrix multiplies; {torch.cuda.get_device_name()} is sm_{cc[0]}{cc[1]}. Serve with --mode fast "
+                "(bf16) on this GPU")
+    return None
+
+
+def _copy_same(dst, src):
+    """dst.copy_(src) for a captured graph's shared output: the same dtype and shape, so the copy is exact."""
+    if dst.dtype != src.dtype or dst.shape != src.shape:
+        raise RuntimeError(f"graph output {tuple(src.shape)} {src.dtype} does not fit its buffer {tuple(dst.shape)} "
+                           f"{dst.dtype}")
+    return dst.copy_(src)
+
+
+def _graph_tokens(key):
+    """A graph's size for the capture order: (tokens it runs, pass 2: query-key pairs). key: ("p", rows, length),
+    ("c", tokens) or ("x", rows, branch length, root length)."""
+    if key[0] == "p":
+        return key[1] * key[2], 0
+    if key[0] == "c":
+        return key[1], 0
+    return key[1] * key[2], key[1] * key[2] * (key[3] + key[2])
 
 
 def _varlen_attention(q, k, v, cu, scale, layer=0, impl="fa3"):
@@ -466,16 +550,25 @@ def _varlen_attention(q, k, v, cu, scale, layer=0, impl="fa3"):
 
 
 def basal_attention(module, query, key, value, attention_mask, dropout=0.0, scaling=None, is_causal=None,
-                    basal_kv=None, basal_prefix=None, basal_cu=None, basal_varlen="fa3", **kwargs):
+                    basal_kv=None, basal_prefix=None, basal_cu=None, basal_varlen="fa3", basal_tree=None, **kwargs):
     """torch SDPA with additions for the two-pass forward of branched units and for compact rows (the kwargs pass
     through the transformers model forward): basal_kv[layer] = (K, V) buffers that receive this layer's keys and
     values (the root pass), basal_prefix[layer] = (K, V) of a computed prefix that the queries also attend to (the
     branch pass), basal_cu = cumulative token counts of prompts packed into one row (each attends to itself only),
-    basal_varlen = the kernel of those rows (_varlen_attention's impl).
+    basal_varlen = the kernel of those rows (_varlen_attention's impl), basal_tree = the branch pass without dense
+    masks: the queries attend to the prefix and, per trie block, to their own ancestors separately, merged by
+    log-sum-exp (no concatenated keys, no [N, P + N] mask); _block_plan's batches on the CPU, a _VarlenTree on CUDA.
     A causal forward without a mask uses the kernel chosen by set_attention (--attn)."""
     from transformers.integrations.sdpa_attention import sdpa_attention_forward
     if basal_cu is not None:
         return _varlen_attention(query, key, value, basal_cu, scaling, module.layer_idx, basal_varlen), None
+    if basal_tree is not None:
+        k, v = basal_prefix[module.layer_idx]
+        if isinstance(basal_tree, _VarlenTree):
+            return _cascade_varlen(query, key, value, k, v, basal_tree, scaling), None
+        o_p, l_p = _attention_lse(query, k, v, scaling)
+        o_b, l_b = _branch_attention(query, key, value, scaling, basal_tree)
+        return _merge_attention(o_p, l_p, o_b, l_b).transpose(1, 2).contiguous(), None
     if basal_kv is not None:
         k, v = basal_kv[module.layer_idx]
         k.copy_(key); v.copy_(value)
@@ -497,6 +590,182 @@ def basal_attention(module, query, key, value, attention_mask, dropout=0.0, scal
         module = SimpleNamespace(num_key_value_groups=1, is_causal=getattr(module, "is_causal", True))
     return sdpa_attention_forward(module, query, key, value, attention_mask, dropout=dropout, scaling=scaling,
                                   is_causal=is_causal, **kwargs)
+
+
+def _attention_lse(q, k, v, scale, mask=None):
+    """Attention and its log-sum-exp on the CPU (SDPA's CPU flash kernel, the one SDPA picks there): q [B, H, S, d],
+    k / v [B, Hkv, L, d], mask bool broadcastable to [B, 1, S, L] or None -> (o [B, H, S, d], lse [B, H, S] fp32).
+    Without a mask the H / Hkv query heads of each key / value head are folded into the query length (grouped-query
+    attention without copying keys)."""
+    flash = torch.ops.aten._scaled_dot_product_flash_attention_for_cpu
+    B, H, S, d = q.shape
+    r = H // k.shape[1]
+    if mask is None:
+        o, lse = flash(q.reshape(B, k.shape[1], r * S, d), k, v, scale=scale)
+        return o.reshape(B, H, S, d), lse.reshape(B, H, S)
+    # finfo.min, not -inf: on a row of -inf only the kernel returns lse 0 instead of -inf (_block_plan gives every row
+    # a key, so this is a guard)
+    add = torch.zeros(mask.shape, dtype=q.dtype, device=q.device).masked_fill(~mask, torch.finfo(q.dtype).min)
+    if r > 1:
+        k, v = k.repeat_interleave(r, 1), v.repeat_interleave(r, 1)
+    return flash(q, k, v, attn_mask=add, scale=scale)
+
+
+def _merge_attention(o1, l1, o2, l2):
+    """Two attentions over disjoint key sets with their log-sum-exp -> the attention over the union: the softmax over
+    all the keys, summed in another order. Weights in fp32; a part that saw no key weighs 0."""
+    lse = torch.logaddexp(l1, l2)
+    w1, w2 = torch.exp(l1 - lse)[..., None], torch.exp(l2 - lse)[..., None]
+    return (torch.where(w1 > 0, o1.float() * w1, 0.0) + torch.where(w2 > 0, o2.float() * w2, 0.0)).to(o1.dtype)
+
+
+def _block_plan(seg, parents, waste=1.5):
+    """The branch pass per trie block, without a trie mask: block b's queries see the tokens of its ancestor blocks
+    below the root and its own earlier tokens, i.e. keys = (ancestors' tokens, b's tokens) with a causal mask aligned at
+    the end. seg: block of every token below the root (0..; each block contiguous, flattened depth first), parents: the
+    parent block of every block (-1 = the root); a slice of whole top-level subtrees works as well. -> [(queries
+    [n, m], keys [n, k], mask bool [n, 1, m, k])]: token indices (len(seg) = padding) of blocks of similar shape
+    batched, padded to the batch's longest, at most `waste` x the real query-key pairs per batch (one block alone may
+    exceed it)."""
+    N = len(seg)
+    span = {}
+    for i, s in enumerate(seg):
+        span[s] = (span.get(s, (i,))[0], i + 1)
+    items = []
+    for blk, (a, b) in span.items():
+        anc, p = [], parents[blk]
+        while p >= 0:
+            anc = list(range(*span[p])) + anc
+            p = parents[p]
+        items.append((list(range(a, b)), anc))
+    items.sort(key=lambda x: (len(x[0]), len(x[1])))
+    plan, cur = [], []
+    for it in items + [None]:
+        if it is not None:
+            nxt = cur + [it]
+            m, k = max(len(q) for q, _ in nxt), max(len(q) + len(an) for q, an in nxt)
+            if not cur or len(nxt) * m * k <= waste * sum(len(q) * (len(q) + len(an)) for q, an in nxt):
+                cur = nxt
+                continue
+        m = max(len(q) for q, _ in cur)
+        k = max(len(q) + len(an) for q, an in cur)
+        qi = torch.full((len(cur), m), N, dtype=torch.long)
+        ki = torch.full((len(cur), k), N, dtype=torch.long)
+        mask = torch.zeros((len(cur), 1, m, k), dtype=torch.bool)
+        i, j = torch.arange(m)[:, None], torch.arange(k)[None]
+        for r, (q, an) in enumerate(cur):
+            qi[r, : len(q)] = torch.tensor(q)
+            ki[r, : len(an) + len(q)] = torch.tensor(an + q)
+            mask[r, 0] = (j <= len(an) + i) & (j < len(an) + len(q))
+            mask[r, 0, len(q):, 0] = True  # padding queries see one key (no row without keys)
+        plan.append((qi, ki, mask))
+        cur = [it] if it is not None else []
+    return plan
+
+
+def attention_only(cfg):
+    """A model whose layers all attend to every earlier key (the Llama-based basal models): no sliding-window or
+    linear-attention layers, so every key a branch token sees is in the root or in its block's ancestors and the branch
+    pass can run as a cascade (_cascade on the CPU, _cascade_varlen on CUDA)."""
+    cfg = cfg.get_text_config() if hasattr(cfg, "get_text_config") else cfg
+    return set(getattr(cfg, "layer_types", None) or ["full_attention"]) == {"full_attention"} \
+        and not getattr(cfg, "sliding_window", None)
+
+
+def cascade_ok(cfg):
+    """The CPU branch pass of _cascade: attention-only models (attention_only); models with sliding-window or
+    linear-attention layers keep the dense pass over the transformers cache, as does a torch without the CPU flash
+    kernel _attention_lse calls (a private aten op; basal pins only torch>=2.11)."""
+    return attention_only(cfg) and hasattr(torch.ops.aten, "_scaled_dot_product_flash_attention_for_cpu")
+
+
+def _branch_attention(q, k, v, scale, plan):
+    """The branch part of the branch pass: q [1, H, N, d], k / v [1, Hkv, N, d] (the tokens below the root) and
+    _block_plan's batches -> (o [1, H, N, d], lse [1, H, N] fp32)."""
+    _, H, N, d = q.shape
+    o = q.new_empty(H, N + 1, d)
+    lse = torch.empty(H, N + 1, dtype=torch.float32, device=q.device)
+    qp, kp, vp = (torch.cat([x[0], x.new_zeros(x.shape[1], 1, d)], 1) for x in (q, k, v))  # [heads, N + 1, d]
+    for qi, ki, mask in plan:
+        ob, lb = _attention_lse(qp[:, qi].transpose(0, 1), kp[:, ki].transpose(0, 1), vp[:, ki].transpose(0, 1),
+                                scale, mask)
+        o[:, qi] = ob.transpose(0, 1)
+        lse[:, qi] = lb.transpose(0, 1)
+    return o[None, :, :N], lse[None, :, :N]
+
+
+class _VarlenTree(NamedTuple):
+    """The branch pass of B rows of S tokens on CUDA (_cascade_varlen), built by _varlen_tree. Root part: every token
+    of row r over the first used[r] keys of its root buffer (cu_qr / cu_kr: S / Lk tokens per row). Branch part: per
+    trie block, its queries (flat indices qi, cu_q) over its ancestors' and own tokens (flat indices ki, cu_k), causal
+    at the end; full: no padding tokens (qi is every token in order)."""
+    cu_qr: torch.Tensor
+    cu_kr: torch.Tensor
+    used: torch.Tensor
+    qi: torch.Tensor
+    ki: torch.Tensor
+    cu_q: torch.Tensor
+    cu_k: torch.Tensor
+    max_q: int
+    max_k: int
+    full: bool
+
+
+def _varlen_tree(seg, parents, roots, Lk, to_dev):
+    """seg [B, S] numpy: the block of every token below the root (0..; contiguous, flattened depth first; -1 =
+    padding), parents: per row the parent block of every block (-1 = the root), roots: the root's tokens per row, Lk:
+    the length of the root key / value buffers -> _VarlenTree on the device (to_dev: host array -> device)."""
+    B, S = seg.shape
+    qi, ki, cq, ck = [], [], [0], [0]
+    for r in range(B):
+        s = seg[r]
+        n = int((s >= 0).sum())
+        starts = np.flatnonzero(np.r_[True, s[1:n] != s[: n - 1]]) if n else np.zeros(0, dtype=np.int64)
+        runs = list(zip(starts.tolist(), np.r_[starts[1:], n].tolist()))
+        span = {int(s[a]): (a, b) for a, b in runs}
+        for a, b in runs:
+            keys, p = [np.arange(a, b)], parents[r][int(s[a])]
+            while p >= 0:
+                keys.insert(0, np.arange(*span[p]))
+                p = parents[r][p]
+            ki.append(r * S + np.concatenate(keys))
+            qi.append(r * S + np.arange(a, b))
+            cq.append(cq[-1] + b - a)
+            ck.append(ck[-1] + len(ki[-1]))
+    qi, ki = np.concatenate(qi), np.concatenate(ki)
+    i32 = lambda x: to_dev(np.asarray(x, dtype=np.int32))  # noqa: E731
+    return _VarlenTree(i32(np.arange(B + 1) * S), i32(np.arange(B + 1) * Lk), i32(roots), to_dev(qi), to_dev(ki),
+                       i32(cq), i32(ck), int(np.diff(cq).max()), int(np.diff(ck).max()), len(qi) == B * S)
+
+
+def _varlen(q, k, v, cu_q, cu_k, max_q, max_k, scale, causal=False, used=None):
+    """torch's varlen attention (FlashAttention 2 on packed sequences, grouped-query) with its log-sum-exp: q [Tq, H,
+    d], k / v [Tk, Hkv, d], cu_q / cu_k cumulative lengths (int32), used: the keys each sequence uses (seqused_k) or
+    None, causal: aligned at the end of each sequence -> (o [Tq, H, d], lse [Tq, H] fp32). The log-sum-exp comes as
+    [H, Tq] (torch 2.13, RTX 4090)."""
+    from torch.nn.attention.varlen import AuxRequest, varlen_attn
+    o, lse = varlen_attn(q, k, v, cu_q, cu_k, max_q, max_k, scale=scale, window_size=(-1, 0) if causal else (-1, -1),
+                         enable_gqa=True, seqused_k=used, return_aux=AuxRequest(lse=True))
+    return o, (lse.transpose(0, 1) if lse.shape == (q.shape[1], q.shape[0]) else lse).float()
+
+
+def _cascade_varlen(q, k, v, kp, vp, tree, scale):
+    """The branch pass on CUDA: q [B, H, S, d], k / v [B, Hkv, S, d] (the rows' own tokens), kp / vp [B, Hkv, Lk, d]
+    (the roots' key / value buffers, row r's root in its first tree.used[r] keys) -> [B, S, H, d]. The root part reads
+    the buffers with no mask and no repeated heads, the branch part only each block's ancestors and own tokens; a
+    padding token sees the root only, as in the dense mask."""
+    B, H, S, d = q.shape
+    Hkv, Lk = kp.shape[1], kp.shape[2]
+    qf = q.transpose(1, 2).reshape(B * S, H, d)
+    o_r, l_r = _varlen(qf, kp.transpose(1, 2).reshape(B * Lk, Hkv, d), vp.transpose(1, 2).reshape(B * Lk, Hkv, d),
+                       tree.cu_qr, tree.cu_kr, S, Lk, scale, used=tree.used)
+    kf, vf = (x.transpose(1, 2).reshape(B * S, Hkv, d) for x in (k, v))
+    o_b, l_b = _varlen(qf if tree.full else qf[tree.qi], kf[tree.ki], vf[tree.ki], tree.cu_q, tree.cu_k, tree.max_q,
+                       tree.max_k, scale, causal=True)
+    if not tree.full:
+        o_b = qf.new_zeros(B * S, H, d).index_copy_(0, tree.qi, o_b)
+        l_b = torch.full((B * S, H), float("-inf"), device=q.device).index_copy_(0, tree.qi, l_b)
+    return _merge_attention(o_r, l_r, o_b, l_b).view(B, S, H, d)
 
 
 def causal_sdpa(model):
@@ -628,7 +897,10 @@ class GraphBackend(EagerBackend):
       from the root, and a block mask lets each branch see the root, its ancestors and itself only. Exactly equivalent
       to separate forwards, the state (usually most of the tokens) is computed once, and the long part runs with the
       flash kernel; pass 2 is short and replays a graph of the normal forward (up to 8 rows x 64 / 128 / 256 branch
-      tokens over roots up to the largest of LENS), or runs as a normal forward for other shapes.
+      tokens over roots up to the largest of LENS), or runs as a normal forward for other shapes. Llama on CUDA, where
+      such a forward's rows hold CASCADE_TOKENS or more tokens (compress, many questions) and torch's varlen attention
+      runs (sm80+, bf16 / fp16, seqused_k; _cascade_why): a cascade instead of the block mask, the roots' keys and
+      values and each block's ancestors in two varlen calls merged by log-sum-exp (_cascade_varlen).
 
     All forwards of a call are launched back to back; host buffers are pinned and copied asynchronously, and each
     forward's readout is copied back behind it, so a group is reported as soon as its forwards are done while later
@@ -641,6 +913,11 @@ class GraphBackend(EagerBackend):
     TOKEN_BUDGET = 12288  # max rows x bucket length per forward
     SUFFIX = 32                   # pass-2 rows without a graph are padded to a multiple of this
     BRANCH_TOKENS = 8192          # most tokens below the root of one packed row (more: split, the root once per part)
+    # Llama on CUDA: a pass 2 without a graph whose longest row has at least this many tokens runs as a cascade
+    # (_cascades). Below it the dense masked call is faster: with the cascade 5-10 questions over 1.5k tokens took
+    # 0.83-0.98x, 40 questions 1.07-1.11x, compress requests 1.15-1.39x (basal-2.0-mini / 4.5B, RTX 4090 and A100,
+    # 22 Oct)
+    CASCADE_TOKENS = 1024
     SUFFIX_LENS = [64, 128, 256]  # pass-2 branch lengths with graphs, for roots up to the largest of LENS
     TREE_ROWS = [1, 2, 4, 8]      # pass-2 graph rows: branched units per forward with such roots
     # --batches fine: more row counts for the plain graphs (less padding of short batches, more graphs at start-up)
@@ -667,10 +944,29 @@ class GraphBackend(EagerBackend):
     state_cache = None            # StateCache: keys / values of request states, reused across requests
     gemma = None                  # basal/gemma4_graph.py: the forward of a Gemma 4 model (basal-omni)
     softcap = None                # the model's final logit softcap (Gemma), applied to the fp32 code logits
+    _out = None                   # Llama graphs: the output buffers their captures share (_shared_out)
+    _side = None                  # the stream the captures warm up on (one: each new stream pins a cuBLAS workspace)
+    _deferred = None              # warm(): graphs warmed up, captured the largest first (_capture_deferred)
+
+    def __new__(cls, model_dir=None, *args, **kwargs):
+        """GraphBackend(model_dir, ...) of a Qwen3.5 model (Gated DeltaNet and attention layers, from its config.json)
+        builds GDNGraphBackend (basal/gdn_graph.py, basal 2.4), which carries the recurrent state through both passes;
+        the subclasses (fast-exit, mps, gguf) keep their own class."""
+        if cls is GraphBackend and model_dir is not None:
+            from .gdn_graph import GDNGraphBackend, is_gdn
+            if is_gdn(model_dir):
+                return super().__new__(GDNGraphBackend)
+        return super().__new__(cls)
 
     def __init__(self, model_dir, dtype="bfloat16", quant=None, compile=False, shared=True, warm=True, attn="auto",
                  merge="auto", lean=False, tree="dense", state_cache_gb=0, prefix=False, batches="default",
                  readout_layer="off", template="off", gemma_attn="auto"):
+        what = recurrent_layers(model_dir)  # before anything is loaded
+        if what:
+            from .gdn_graph import is_gdn
+            raise ValueError(recurrent_refused(model_dir, what, is_gdn(model_dir)))
+        if quant == "fp8" and fp8_refused():
+            raise ValueError(fp8_refused())
         torch.backends.cuda.enable_cudnn_sdp(False)  # before capture: a captured graph keeps its attention kernel
         from . import gemma4_graph
         # every captured graph keeps its own cuBLAS workspace (32 MB on an H100): basal-omni-1.1-max's ~400 graphs held
@@ -688,6 +984,8 @@ class GraphBackend(EagerBackend):
                    else torch_varlen_available(getattr(torch, dtype)))
             if why:
                 raise ValueError(compact_refused(why))
+        if gemma_attn in ("flex", "fa3") and attention_available("flex") and gemma4_graph.is_gemma4_dir(model_dir):
+            raise ValueError(f"--gemma-attn {gemma_attn}: {attention_available('flex')}")  # fa3: flex in global layers
         self.tok = AutoTokenizer.from_pretrained(model_dir)
         self.tok.pad_token = self.tok.pad_token or self.tok.eos_token
         if self.fp8_checkpoint:
@@ -831,6 +1129,9 @@ class GraphBackend(EagerBackend):
             if self.shared else None
 
     PASS2_POOL = 1 << 30  # Gemma 4: the most the pass-2 graphs over roots longer than LENS may add to the GPU memory
+    # pass-2 graphs are captured only while at least this much GPU memory stays free (_capture_deferred): the forwards
+    # without a graph (states beyond the grid, pass 2 of other shapes) need room at run time
+    PASS2_RESERVE = 3 << 29  # 1.5 GiB
     KV_SHARE = 0.15  # Gemma 4: the most of the free GPU memory (after the weights) its key / value buffers may take
 
     def _fit_grid(self):
@@ -853,11 +1154,41 @@ class GraphBackend(EagerBackend):
             self.COMPACT_LENS = [x for x in self.COMPACT_LENS if x <= self.TOKEN_BUDGET]
 
     def _kv_tokens(self):
-        """Tokens of the key / value buffer: the largest plain graph and the largest pass-2 graph's rows over the
-        longest root (Gemma 4: within TOKEN_BUDGET, see _fit_grid)."""
+        """Tokens of the key / value buffer: the largest plain graph and the largest captured pass-2 graph's rows over
+        its root (_pass2_ok; Gemma 4: within TOKEN_BUDGET, see _fit_grid)."""
         if self.gemma is not None:
             return max(self.TOKEN_BUDGET, self.PLAIN_LENS[-1])
-        return max(self.TOKEN_BUDGET, self.PLAIN_LENS[-1], self.TREE_ROWS[-1] * self.LENS[-1])
+        n = [self.TOKEN_BUDGET, self.PLAIN_LENS[-1]]
+        n += [b * L for b in self.TREE_ROWS for L in self.LENS if self._pass2_ok(b, L)]
+        if self.prefix:
+            n += [b * L for L in self.LENS if L <= self.PREFIX_ROOT for S in self.PREFIX_SFX for b in self.PREFIX_ROWS
+                  if b * S <= self.TOKEN_BUDGET]
+        return max(n)
+
+    def _pass2_ok(self, b, L):
+        """Whether pass 1 can produce a batch for the pass-2 graph of b rows over roots of length L: that graph (b =
+        TREE_ROWS[i]) serves TREE_ROWS[i - 1] + 1 to b units, whose roots pass 1 runs padded to BATCHES rows x L
+        within TOKEN_BUDGET (_chunks; units with cached roots are chunked the same way). Llama: 12 of the 276 default
+        pass-2 graphs (8 rows over roots of 2,304-3,072 tokens) could never run, and the key / value buffer held
+        24,576 tokens for them instead of 16,384. Gemma 4: rows x root within TOKEN_BUDGET (_fit_grid)."""
+        if self.gemma is not None:
+            return b * L <= self.TOKEN_BUDGET
+        prev = ([0] + self.TREE_ROWS)[self.TREE_ROWS.index(b)]
+        return self._bucket(prev + 1, self.BATCHES) * L <= self.TOKEN_BUDGET
+
+    def _shared_out(self, name, n, dtype):
+        """A flat buffer of at least n elements shared by the captures of one graph family (Llama): a captured graph's
+        output stays allocated in the graph pool for as long as the graph lives, so 169 plain graphs kept 169 hidden
+        state tensors [b, L, D] (and 276 pass-2 graphs their outputs and masks) although every forward's readout is
+        copied out right after its replay, under _launch, on the same stream. RTX 4090, 21 Oct, with the one warm-up
+        stream and _pass2_ok: basal-2.0-mini 12.7 -> 10.0 GB after warm-up, basal-2.0-4.5B 24.1 -> 20.5 GB, the
+        probabilities bit-identical (420 of 420 readouts each), the same decisions per second."""
+        if self._out is None:
+            self._out = {}
+        buf = self._out.get(name)
+        if buf is None or buf.numel() < n or buf.dtype != dtype:
+            buf = self._out[name] = torch.zeros(n, dtype=dtype, device=self.dev)
+        return buf
 
     def _kv_new(self, L):
         """Fresh per-layer (K, V) buffers [1, kv heads, L, head size] (a root longer than the largest graph). Gemma 4:
@@ -923,7 +1254,11 @@ class GraphBackend(EagerBackend):
 
     def warm(self):
         """Capture every plain graph of the grid, and with `shared` the pass-2 graphs for roots up to the largest of
-        LENS (Gemma 4: of PLAIN_LENS, _warm_long_sfx)."""
+        LENS (Gemma 4: of PLAIN_LENS, _warm_long_sfx). Every graph is warmed up here in this order and captured
+        afterwards (_capture_deferred): the plain and compact graphs the largest first, then the pass-2 graphs the
+        smallest first while PASS2_RESERVE stays free; Gemma 4's pass-2 graphs over the longer roots after those, one at
+        a time, as _warm_long_sfx keeps the pool growth they add within PASS2_POOL and the reserve free."""
+        self._deferred = {}  # key -> (function, static inputs), in warm-up order
         if self.compact:  # plain graphs only for pass 1 of branched units (at most TREE_ROWS[-1] roots)
             for T in self.COMPACT_LENS:
                 self._graph_c(T)
@@ -934,7 +1269,7 @@ class GraphBackend(EagerBackend):
             for b in self.TREE_ROWS:
                 for L in self.LENS:
                     for S in self.SUFFIX_LENS:
-                        if b * S <= self.TOKEN_BUDGET and (self.gemma is None or b * L <= self.TOKEN_BUDGET):
+                        if b * S <= self.TOKEN_BUDGET and self._pass2_ok(b, L):
                             self._graph_sfx(b, S, L)
             if self.prefix:  # pass 2 of short requests over a cached template prefix
                 for L in (x for x in self.LENS if x <= self.PREFIX_ROOT):
@@ -943,7 +1278,10 @@ class GraphBackend(EagerBackend):
                             if b * S <= self.TOKEN_BUDGET:
                                 self._graph_sfx(b, S, L)
             if self.gemma is not None:
+                self._capture_deferred()
                 self._warm_long_sfx()
+        if self._deferred is not None:
+            self._capture_deferred()
         # beyond the largest graph the forwards run uncompiled; their first use sets up kernels and memory for long
         # shapes (3 s of the first long request on an H100), so a long prompt and a long branched unit run here once
         n = self.PLAIN_LENS[-1] + 64
@@ -964,9 +1302,10 @@ class GraphBackend(EagerBackend):
         for L in (x for x in self.PLAIN_LENS if x > self.LENS[-1]):
             for b in (x for x in self.TREE_ROWS if x * L <= self.TOKEN_BUDGET):
                 for S in self.SUFFIX_LENS:
-                    if self.dev.type == "cuda" and torch.cuda.memory_reserved(self.dev) - r0 > self.PASS2_POOL:
+                    if (self.dev.type == "cuda" and torch.cuda.memory_reserved(self.dev) - r0 > self.PASS2_POOL
+                            or not self._room()):
                         return
-                    self._graph_sfx(b, S, L)
+                    self._measured(self._graph_sfx, b, S, L)
 
     def _warm_pass2(self, n):
         """Gemma 4: pass 2 without a graph calls one compiled flex_attention, which compiles anew for each shape class
@@ -1070,6 +1409,36 @@ class GraphBackend(EagerBackend):
             return self.gemma.forward_suffix(ids, mask, pos, prefix, ro, compiled=False, kv=kv)
         return self.model.model(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=False,
                                 basal_prefix=prefix, basal_kv=kv).last_hidden_state
+
+    @torch.no_grad()
+    def _forward_cascade(self, ids, pos, prefix, tree):
+        """Pass 2 as a cascade (_cascade_varlen): ids / pos [rows, length] host arrays, prefix: the roots' per-layer
+        (K, V) [rows, kv heads, Lk, head dim], tree: _varlen_tree of the rows -> hidden states [rows, length, D]."""
+        return self.model.model(input_ids=self._to_dev(ids), position_ids=self._to_dev(pos), use_cache=False,
+                                basal_prefix=prefix, basal_tree=tree).last_hidden_state
+
+    def _cascades(self, n):
+        """Whether a pass 2 without a graph whose longest row has n tokens runs as a cascade (_cascade_varlen):
+        CASCADE_TOKENS or more, where _cascade_why has no objection."""
+        return n >= self.CASCADE_TOKENS and self._cascade_why is None
+
+    @functools.cached_property
+    def _cascade_why(self):
+        """None if pass 2 can run as a cascade here, else why not: CUDA, a Llama-style model with attention layers
+        only (attention_only; the CPU flash op that cascade_ok also asks for plays no part here), torch's varlen
+        attention with grouped-query heads and per-sequence key counts in this dtype, the transformers forward (not
+        --lean, which has its own pass 2)."""
+        if self.dev.type != "cuda" or self.gemma is not None or self.lean is not None:
+            return "CUDA graph engine, Llama, without --lean"
+        if not attention_only(self.model.config):
+            return "sliding-window or linear-attention layers"
+        why = torch_varlen_available(self._dtype)
+        if why is None:
+            import inspect
+            from torch.nn.attention.varlen import varlen_attn
+            if "seqused_k" not in inspect.signature(varlen_attn).parameters:
+                why = "this torch's varlen_attn has no seqused_k"
+        return why
 
     one_forward = 0  # tokens of the longest state run as one forward (_one_forward_tokens; 0: every one in chunks)
     # of the free memory after warm-up a state beyond the largest graph may take in one forward (else in chunks; one
@@ -1212,17 +1581,83 @@ class GraphBackend(EagerBackend):
                       use_cache=False, basal_kv=kv)
         return m.norm(h)
 
-    def _capture(self, key, fn, *static, warmup=3):
-        st = torch.cuda.Stream(); st.wait_stream(torch.cuda.current_stream())
+    def _capture(self, key, fn, *static):
+        """Warm fn up and capture it as graph `key`; in warm() the capture waits for _capture_deferred, and a key
+        already waiting is not warmed up again (with --prefix-cache the two pass-2 families share some shapes)."""
+        if self._deferred is not None:
+            if key not in self._deferred:
+                self._warm_up(fn, static)
+                self._deferred[key] = (fn, static)
+            return None
+        self._warm_up(fn, static)
+        return self._record(key, fn, static)
+
+    def _warm_up(self, fn, static):
+        """One call of fn on the side stream before its capture: what a capture cannot do happens at a forward's first
+        call (torch.compile compiles, or recompiles for a shape its guards reject; cuBLAS sets up its handle and
+        workspace; Triton loads its kernels). The second and third calls (plain graphs 3, pass-2 graphs 2 before) ran
+        the same kernels again and only took start-up time: RTX 4060 Ti, 22 Oct, warm() 468 -> 323 s on basal-2.0-mini
+        and 1,094 -> 680 s on basal-2.0-4.5B, the probabilities bit-identical (420 readouts each)."""
+        if self._side is None:
+            self._side = torch.cuda.Stream()
+        st = self._side; st.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(st):
-            for _ in range(warmup):
-                fn(*static)
+            fn(*static)
         torch.cuda.current_stream().wait_stream(st)
+
+    def _record(self, key, fn, static):
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g, pool=self.pool):
             out = fn(*static)
         self.graphs[key] = (g, *static, out)
         return self.graphs[key]
+
+    def _capture_deferred(self):
+        """warm(): capture the graphs warmed up so far, the one with the most tokens first. Every graph's memory stays
+        in the shared pool; what a graph frees at the end of its capture, a later capture reuses, but only in blocks no
+        larger than the freed ones, so captured from the smallest up (the grid's order: compact graphs of 16, 32, ...
+        12,288 tokens) each larger graph allocated new blocks and the pool grew to many times the largest graph's
+        working set. torch.compile still sees the shapes in the grid's order (the warm-up calls in _capture), so the
+        compiled kernels are those of capturing in that order. RTX 4090, basal-2.0-mini, --batches compact, 21 Oct:
+        graph pool 9.0 -> 1.0 GiB, 17.6 -> 9.4 GB after warm-up, the probabilities bit-identical.
+
+        The pass-2 graphs come last, the smallest (the commonest shapes) first, and only while PASS2_RESERVE of GPU
+        memory stays free after the capture (_room: free memory less what the last capture took): each keeps 10-20 MB
+        outside the pool for its kernels (basal-2.0-mini / 4.5B, RTX 4090), 264 of them about 5 GB on basal-2.0-4.5B,
+        which therefore did not start on a 16 GB card. A pass 2 without its graph runs uncompiled, as one beyond the
+        grid does (_tree_hidden); the plain and compact graphs, which a forward cannot do without, are all captured."""
+        deferred, self._deferred = self._deferred, None
+        keys = sorted(deferred, key=_graph_tokens, reverse=True)
+        for key in (k for k in keys if k[0] != "x"):
+            self._measured(self._record, key, *deferred[key])
+        pass2 = [k for k in reversed(keys) if k[0] == "x"]
+        if pass2 and self.dev.type == "cuda":
+            torch.cuda.empty_cache()  # (blocks the warm-up calls left cached are no graph's)
+        for n, key in enumerate(pass2):
+            if not self._room():
+                print(f"basal: {n} of {len(pass2)} pass-2 graphs captured, {self.PASS2_RESERVE >> 20} MiB of GPU "
+                      "memory kept free; the other shapes run pass 2 without a graph", flush=True)
+                break
+            self._measured(self._record, key, *deferred[key])
+
+    _capture_cost = 0  # the GPU memory the last measured capture took (_measured): the estimate for the next one
+
+    def _room(self):
+        """Whether one more pass-2 graph fits: the free GPU memory less what the last capture took stays at or above
+        PASS2_RESERVE (always off CUDA)."""
+        free = self._free_memory()
+        return free is None or free - self._capture_cost >= self.PASS2_RESERVE
+
+    def _measured(self, capture, *args):
+        """capture(*args), keeping the GPU memory it took as _capture_cost."""
+        before = self._free_memory()
+        capture(*args)
+        if before is not None:
+            self._capture_cost = max(before - self._free_memory(), 0)
+
+    def _free_memory(self):
+        """Free GPU memory in bytes (None off CUDA: no budget)."""
+        return torch.cuda.mem_get_info(self.dev)[0] if self.dev.type == "cuda" else None
 
     def _graph(self, b, L):
         """Plain graph (b rows, length L): (graph, ids, kv buffers or None, hidden states [b, L, D]); Gemma 4: (graph,
@@ -1234,7 +1669,13 @@ class GraphBackend(EagerBackend):
         if self.gemma is not None:
             ro = torch.zeros((b, 1), dtype=torch.long, device=self.dev)
             return self._capture(key, self.fwd, ids, self._kv_views(b, L), ro)
-        return self._capture(key, self.fwd, ids, self._kv_views(b, L))
+        out = self._shared_out("plain", max(b * L for b, L in self.grid(self.PLAIN_LENS)) * self._hidden_size,
+                               self._dtype)[: b * L * self._hidden_size].view(b, L, -1)
+        fwd = self.fwd
+
+        def plain(i, kv):  # the output in the buffer every plain graph shares (_shared_out)
+            return _copy_same(out, fwd(i, kv))
+        return self._capture(key, plain, ids, self._kv_views(b, L))
 
     def _graph_c(self, T):
         """Compact graph of T tokens: (graph, ids, positions, cumulative counts, hidden states)."""
@@ -1251,8 +1692,22 @@ class GraphBackend(EagerBackend):
             cu_k = cu.clone()
             gather = torch.zeros(T + self.COMPACT_SEQS * self.template_max, dtype=torch.long, device=self.dev)
             gather[:T] = self.template_tokens + torch.arange(T, device=self.dev)
-            return self._capture(key, self.fwd_c, ids, pos, cu, ro, cu_k, gather)
-        return self._capture(key, self.fwd_c, ids, pos, cu, *([ro] if ro is not None else []))
+            return self._capture(key, self._compact_out(T, ro), ids, pos, cu, ro, cu_k, gather)
+        return self._capture(key, self._compact_out(T, ro), ids, pos, cu, *([ro] if ro is not None else []))
+
+    def _compact_out(self, T, ro):
+        """The compact forward of T tokens, its hidden states [1, T, D] in the buffer every compact graph shares
+        (_shared_out; 104 graphs of up to 12,288 tokens kept 0.8 GB on basal-2.0-mini). With readout positions it
+        returns [COMPACT_SEQS, D] (a few KB per graph) as it is."""
+        if ro is not None or self.gemma is not None:
+            return self.fwd_c
+        D = self._hidden_size
+        out = self._shared_out("compact", max(self.COMPACT_LENS) * D, self._dtype)[: T * D].view(1, T, D)
+        fwd = self.fwd_c
+
+        def compact(*s):
+            return _copy_same(out, fwd(*s))
+        return compact
 
     def _graph_sfx(self, b, S, L):
         """Pass-2 graph (b rows of S tokens over root keys / values of length L, the layout of the plain graphs):
@@ -1268,9 +1723,33 @@ class GraphBackend(EagerBackend):
             mask = TreeMask(torch.zeros(b, dtype=torch.long, device=self.dev),
                             torch.full((b, S), S, dtype=torch.long, device=self.dev),
                             torch.zeros((b, S + 1, S + 1), dtype=torch.bool, device=self.dev))
-        else:
+        elif self.gemma is not None:
             mask = torch.zeros((b, 1, S, L + S), dtype=dt, device=self.dev)
-        return self._capture(key, self.fwd_sfx, ids, mask, pos, self._kv_views(b, L), warmup=2)
+        else:  # the mask is written whole before every replay: one buffer for every pass-2 graph (_shared_out)
+            mask = self._shared_out("pass2 mask", self._pass2_max(lambda b, S, L: b * S * (L + S)), dt)[
+                : b * S * (L + S)].view(b, 1, S, L + S)
+        if self.gemma is not None or self.flex:
+            return self._capture(key, self.fwd_sfx, ids, mask, pos, self._kv_views(b, L))
+        out = self._shared_out("pass2", self._pass2_max(lambda b, S, L: b * S) * self._hidden_size, dt)[
+            : b * S * self._hidden_size].view(b, S, -1)
+        fwd = self.fwd_sfx
+
+        def suffix(i, m, p, kv):
+            return _copy_same(out, fwd(i, m, p, kv))
+        return self._capture(key, suffix, ids, mask, pos, self._kv_views(b, L))
+
+    @property
+    def _hidden_size(self):
+        return self.model.config.hidden_size
+
+    def _pass2_max(self, size):
+        """The largest size(b, S, L) over the pass-2 graphs warm captures (Llama)."""
+        shapes = [(b, S, L) for b in self.TREE_ROWS for L in self.LENS for S in self.SUFFIX_LENS
+                  if b * S <= self.TOKEN_BUDGET and self._pass2_ok(b, L)]
+        if self.prefix:
+            shapes += [(b, S, L) for L in self.LENS if L <= self.PREFIX_ROOT for S in self.PREFIX_SFX
+                       for b in self.PREFIX_ROWS if b * S <= self.TOKEN_BUDGET]
+        return max(size(*s) for s in shapes)
 
     def _tree_mask(self, seg, parents, roots, S):
         """The trie of pass-2 rows as a TreeMask (basal/lean.py): root tokens per row, block per token (S: padding),
@@ -1619,6 +2098,8 @@ class GraphBackend(EagerBackend):
                 for dst, src in zip(s_mask, tm):
                     dst.copy_(src)
                 g2.replay()
+        elif graph is None and self._cascades(n2):
+            h2 = self._forward_cascade(ids2, pos2, kv, _varlen_tree(seg2, par2, P, kv[0][0].shape[2], self._to_dev))
         else:
             m2 = self._mask_from_seg(self._to_dev(seg2), par2)                             # [B, 1, S, S]
             Pr = self._to_dev(torch.tensor(P + [0] * (B - b)))
@@ -1673,7 +2154,8 @@ class GraphBackend(EagerBackend):
     def _tree_cache(self, pack):
         """A branched unit in two eager passes over a transformers KV cache (the MPS and early-exit backends, whose
         attention has no key / value buffers): the root with causal attention, then every other block as one packed
-        row over that cache with the trie mask. -> hidden states at the readout positions."""
+        row over that cache with the trie mask; on the CPU the branch pass of _cascade instead. -> hidden states at the
+        readout positions."""
         t, pp, sg, last, par = pack
         P = sg.index(1) if 1 in sg else len(t)  # block 0 (the root) comes first and is contiguous
         out = self.model.model(input_ids=self._to_dev(torch.tensor([t[:P]])), use_cache=True)
@@ -1682,7 +2164,10 @@ class GraphBackend(EagerBackend):
             if i < P:  # a prompt that ends inside the root (a duplicate of the shared prefix)
                 h[m] = out.last_hidden_state[0, i]
         rest = [m for m, i in enumerate(last) if i >= P]
-        if rest:
+        if rest and self.dev.type == "cpu" and cascade_ok(self.model.config):
+            h2 = self._cascade(t[P:], pp[P:], [s - 1 for s in sg[P:]], [-1 if q <= 0 else q - 1 for q in par[1:]],
+                               out.past_key_values)
+        elif rest:
             N = len(t) - P
             seg2 = torch.tensor([[s - 1 for s in sg[P:]]])  # blocks 1.. -> 0..; their trie without the root
             par2 = [[-1 if q <= 0 else q - 1 for q in par[1:]]]
@@ -1691,9 +2176,43 @@ class GraphBackend(EagerBackend):
             h2 = self.model.model(input_ids=self._to_dev(torch.tensor([t[P:]])), attention_mask=m2,
                                   position_ids=self._to_dev(torch.tensor([pp[P:]])), past_key_values=out.past_key_values,
                                   use_cache=True).last_hidden_state[0]
-            for m in rest:
-                h[m] = h2[last[m] - P]
+        for m in rest:
+            h[m] = h2[last[m] - P]
         return torch.stack(h)
+
+    def _cascade(self, toks, pos, seg, parents, cache):
+        """The branch pass of _tree_cache on the CPU: the tokens below the root (toks, their positions pos, their blocks
+        seg 0.., the blocks' parents with -1 = the root) attend to the root's keys / values in the KV cache as they are
+        and, per trie block, to their own ancestors (basal_attention's basal_tree), merged by log-sum-exp: no copied
+        keys and no [N, P + N] mask, so a unit need not be split (_oversize) and the root runs once. Parts of whole
+        top-level subtrees (each sees only the root and itself) of at most BRANCH_TOKENS tokens (one larger subtree:
+        a part of its own) bound the activations. -> hidden states of the tokens below the root [N, D]."""
+        from transformers import AttentionInterface
+        AttentionInterface.register("basal_sdpa", basal_attention)
+        prefix = [(layer.keys, layer.values) for layer in cache.layers]
+        top = []  # the top-level subtree of every block (a block comes after its parent)
+        for b, p in enumerate(parents):
+            top.append(b if p < 0 else top[p])
+        runs, a = [], 0  # top-level subtrees: contiguous runs of tokens (the trie is flattened depth first)
+        for i in range(1, len(seg) + 1):
+            if i == len(seg) or top[seg[i]] != top[seg[i - 1]]:
+                runs.append((a, i))
+                a = i
+        parts = [list(runs[0])]
+        for a, b in runs[1:]:
+            if b - parts[-1][0] > self.BRANCH_TOKENS:
+                parts.append([a, b])
+            else:
+                parts[-1][1] = b
+        cfg = self.model.config  # basal_attention for this pass only (the MPS backend runs one call at a time)
+        impl, cfg._attn_implementation = cfg._attn_implementation, "basal_sdpa"
+        try:
+            return torch.cat([self.model.model(input_ids=self._to_dev(torch.tensor([toks[a:b]])),
+                                               position_ids=self._to_dev(torch.tensor([pos[a:b]])), use_cache=False,
+                                               basal_prefix=prefix, basal_tree=_block_plan(seg[a:b], parents)
+                                               ).last_hidden_state[0] for a, b in parts])
+        finally:
+            cfg._attn_implementation = impl
 
     def _long(self, pack, lids):
         """Readout of a unit longer than the largest graph: one forward without a mask (a single prompt) or the two
@@ -1743,7 +2262,10 @@ class GraphBackend(EagerBackend):
     # -- public calls --------------------------------------------------------------------------------------------
     streams = True  # run_shared(..., done=callback) reports every group as soon as its forwards are read out
     inflight = 2    # calls the server may run at once: one call's host work overlaps the other's forwards
-    _launch = threading.Lock()  # a forward's input copies, replay and readout are enqueued by one call at a time
+    # a forward's input copies, replay and readout are enqueued by one call at a time, all on the device's default
+    # stream (every thread's current stream; nothing here sets another), so the graphs' static inputs, the key / value
+    # buffer and the shared graph outputs (_shared_out) are reused only after the previous call's reads, in launch order
+    _launch = threading.Lock()
 
     @torch.no_grad()
     def run(self, prompts, ids_list):
@@ -1870,11 +2392,15 @@ class GraphBackend(EagerBackend):
             if key is not None and self.state_cache is not None:
                 self.state_cache.put(key, [(k[0].clone(), v[0].clone()) for k, v in kv], tokens=t[:P])
         n = len(t) - P
-        m2 = self._mask_from_seg(self._to_dev(torch.tensor([[x - 1 for x in sg[P:]]])),
-                                 [[-1 if q <= 0 else q - 1 for q in par[1:]]])                 # [1, 1, n, n]
-        m2 = torch.cat([torch.zeros((1, 1, n, P), dtype=m2.dtype, device=self.dev), m2], -1)   # the root: visible
-        h2 = self._forward_suffix(self._to_dev(torch.tensor([t[P:]])), m2, self._to_dev(torch.tensor([pp[P:]])),
-                                  kv)[0]
+        seg2, par2 = np.array([[x - 1 for x in sg[P:]]]), [[-1 if q <= 0 else q - 1 for q in par[1:]]]
+        if self._cascades(n):
+            h2 = self._forward_cascade(np.array([t[P:]]), np.array([pp[P:]]), kv,
+                                       _varlen_tree(seg2, par2, [P], kv[0][0].shape[2], self._to_dev))[0]
+        else:
+            m2 = self._mask_from_seg(self._to_dev(torch.from_numpy(seg2)), par2)                # [1, 1, n, n]
+            m2 = torch.cat([torch.zeros((1, 1, n, P), dtype=m2.dtype, device=self.dev), m2], -1)  # the root: visible
+            h2 = self._forward_suffix(self._to_dev(torch.tensor([t[P:]])), m2, self._to_dev(torch.tensor([pp[P:]])),
+                                      kv)[0]
         assert h1 is not None or min(last) >= P, "a readout inside a cached root"
         return torch.stack([h1[i] if i < P else h2[i - P] for i in last])
 
@@ -1923,7 +2449,7 @@ class ExitGraphBackend(GraphBackend):
         super().__init__(model_dir, dtype, quant, compile=False, shared=True, warm=False, attn=attn, merge=merge)
         hd = Path(heads_dir) if heads_dir else Path(model_dir) / "exit_heads"
         ck = torch.load(hd / "heads.pt", map_location="cpu")
-        th = json.loads((hd / "thresholds.json").read_text())
+        th = json.loads((hd / "thresholds.json").read_text(encoding="utf-8"))
         self.policies = {k: {int(L): t for L, t in v["taus"].items() if t <= 1.0} for k, v in th["levels"].items()}
         self.policies["off"] = {}
         self.default_policy = default_policy
@@ -2040,12 +2566,31 @@ class MPSBackend(GraphBackend):
     streams, inflight = False, 1  # its own run_shared: no early readouts, one call at a time
 
     def __init__(self, model_dir, dtype="bfloat16", shared=True, device=None):
+        what = recurrent_layers(model_dir) if shared else None  # without sharing: EagerBackend's forwards (exact)
+        if what:
+            from .gdn_graph import is_gdn
+            raise ValueError(recurrent_refused(model_dir, what, is_gdn(model_dir)))
         mps = getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available()
         device = device or ("mps" if mps else "cpu")
         EagerBackend.__init__(self, model_dir, dtype, device)
         self.dev = torch.device(device)
         self.shared = shared
         self._wrows = {}
+
+    def _oversize(self, pack, n):
+        """On the CPU (cascade_ok models) the branch pass runs in parts of whole top-level subtrees over one root
+        (_cascade): a unit is split only when its prompts have no common root or one top-level subtree (a question with
+        its option orders, ...) holds more than BRANCH_TOKENS tokens; splitting then moves its shared block into the
+        root of the smaller units."""
+        if self.dev.type != "cpu" or not cascade_ok(self.model.config):
+            return GraphBackend._oversize(self, pack, n)
+        top, size = [], {}  # the top-level subtree of every block (block 0 = the root); its tokens
+        for b, p in enumerate(pack[4]):
+            top.append(b if p <= 0 else top[p])
+        for s in pack[2]:
+            if s > 0:
+                size[top[s]] = size.get(top[s], 0) + 1
+        return pack[4].count(-1) > 1 or max(size.values(), default=0) > self.BRANCH_TOKENS
 
     @torch.no_grad()
     def run(self, prompts, ids_list):
@@ -2132,7 +2677,7 @@ class VLLMBackend:
     def __init__(self, model_dir, dtype="bfloat16", mem=0.6, max_len=4096, max_options=10, preset="default",
                  fast_prefill=True, media=False):
         cfg_file = Path(model_dir) / "config.json"
-        cfg = json.loads(cfg_file.read_text()) if cfg_file.exists() else {}
+        cfg = json.loads(cfg_file.read_text(encoding="utf-8")) if cfg_file.exists() else {}
         kw, env = vllm_args(cfg, preset, media=media, fast_prefill=fast_prefill)
         if media:  # --media on: the media the model takes (basal/media.py), as EagerBackend
             from .media import audio_window, kinds_of
@@ -2147,7 +2692,7 @@ class VLLMBackend:
                                  "vLLM 0.31 reads their images and audio differently from the model's processor; use "
                                  "--mode eager --media on")
             pc = Path(model_dir) / "processor_config.json"
-            self.max_audio_s = audio_window(json.loads(pc.read_text())) if pc.exists() else None
+            self.max_audio_s = audio_window(json.loads(pc.read_text(encoding="utf-8"))) if pc.exists() else None
         os.environ.update(env)  # before vLLM starts its engine process, which reads it
         self.tok = AutoTokenizer.from_pretrained(model_dir)
         self.prefill = PREFILL
@@ -2332,7 +2877,7 @@ class MLXBackend:
         import mlx.core as mx
         from mlx_lm.utils import load_model
         self.mx = mx
-        cfg = json.loads((md / "config.json").read_text())
+        cfg = json.loads((md / "config.json").read_text(encoding="utf-8"))
         if quant not in (None, "q8"):
             raise ValueError(f"unknown MLX quantisation {quant!r} (q8)")
         # lazy for q8: the weights are materialised once, after quantisation (never the full bf16 copy)
@@ -2559,13 +3104,23 @@ class GGUFBackend(GraphBackend):
     GraphBackend: the state once, every question and option order after it) becomes llama.cpp sequences: every readout
     has its own sequence and every token belongs to the sequences of all readouts below its block, so a shared prefix
     is computed once and each readout sees its own prompt only. All rows of a chunk go through one llama_decode
-    (unified KV cache, cleared per chunk)."""
+    (unified KV cache, cleared per chunk).
+
+    Hybrid and recurrent architectures (Qwen3.5's Gated DeltaNet layers: GGUF architecture qwen35; Mamba, RWKV) keep
+    a recurrent state per sequence, which a token shared by several sequences cannot have; on the CPU llama.cpp
+    returned non-finite logits whenever several sequences shared one llama_decode (the 0.8B pico's Q8_0: 300 of 300
+    held-out prompts at 16 per decode, 0 of 300 at one; llama-cpp-python 0.3.36, 22 Oct). Such a model decodes one prompt
+    per llama_decode, from its first token (N_SEQ = 1: every group is split into single prompts), so a request's
+    state is computed once per question and option order."""
 
     streams, inflight = False, 1  # its own run_shared: no early readouts, one call at a time
 
     N_CTX = 16384  # KV cells per chunk: room for a single long prompt
     context, context_reason = N_CTX, f"the in-process llama.cpp context ({N_CTX} cells)"
     N_SEQ = 64     # readouts (sequences) per chunk
+    # GGUF architectures with recurrent-state layers (beside llama.cpp's own is_recurrent / is_hybrid flags)
+    RECURRENT_ARCHS = ("qwen35", "qwen3next", "mamba", "rwkv", "jamba", "falcon-h1", "plamo2", "granitehybrid",
+                       "nemotron_h", "lfm2", "kimi-linear")
 
     def __init__(self, model_dir, gguf, n_gpu_layers=-1):
         import logging
@@ -2582,10 +3137,16 @@ class GGUFBackend(GraphBackend):
         self.cmodel = C.llama_model_load_from_file(str(gguf).encode(), mp)
         if not self.cmodel:
             raise ValueError(f"llama.cpp could not load {gguf}")
+        self.arch = self._meta("general.architecture") or ""
+        self.recurrent = bool(C.llama_model_is_recurrent(self.cmodel) or C.llama_model_is_hybrid(self.cmodel)
+                              or self.arch.startswith(self.RECURRENT_ARCHS)
+                              or self._meta(f"{self.arch}.ssm.state_size"))
+        if self.recurrent:
+            self.N_SEQ = 1
         # a full model directory: its architecture must match the GGUF file; the -GGUF repositories carry tokenizer and
         # calibration without config.json (their .gguf files belong to them)
         cp = Path(model_dir) / "config.json"
-        cfg = json.loads(cp.read_text()) if cp.exists() else {}
+        cfg = json.loads(cp.read_text(encoding="utf-8")) if cp.exists() else {}
         cfg = cfg.get("text_config") or cfg  # Gemma 4 (basal-omni): the decoder's settings are in text_config
         for name, llama_name in (("num_hidden_layers", "llama_model_n_layer"), ("hidden_size", "llama_model_n_embd")):
             if not cfg:
@@ -2617,6 +3178,13 @@ class GGUFBackend(GraphBackend):
         if not self.ctx:
             raise ValueError("llama.cpp could not create a context")
         self.batch = C.llama_batch_init(self.N_CTX, 0, self.N_SEQ)  # a prefix token belongs to every readout below it
+
+    def _meta(self, key):
+        """A metadata value of the GGUF file as a string, None if absent."""
+        import ctypes
+        buf = ctypes.create_string_buffer(256)
+        n = self.C.llama_model_meta_val_str(self.cmodel, key.encode(), buf, ctypes.sizeof(buf))
+        return buf.value.decode() if n >= 0 else None
 
     def __del__(self):
         C = getattr(self, "C", None)
@@ -2840,7 +3408,7 @@ def modelopt_fp8(model_dir):
     """True for a ModelOpt FP8 checkpoint (the -FP8 repositories): FP8 linear weights with static per-tensor weight and
     input scales."""
     p = Path(model_dir) / "config.json"
-    q = (json.loads(p.read_text()).get("quantization_config") or {}) if p.exists() else {}
+    q = (json.loads(p.read_text(encoding="utf-8")).get("quantization_config") or {}) if p.exists() else {}
     return q.get("quant_method") == "modelopt" and q.get("quant_algo") == "FP8"
 
 

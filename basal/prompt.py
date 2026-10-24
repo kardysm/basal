@@ -72,6 +72,30 @@ assert len(CODES) == 255 and len(set(CODES)) == 255
 
 FORMATS = {1: dict(templates=TEMPLATES, codes=tuple(LETTERS)), 2: dict(templates=TEMPLATES_2, codes=CODES)}
 
+# Layouts of a format-2 prompt (2.4.1): the user turn around the same state, question and coded options, the same
+# system prompt, codes and prefill. "canonical" is the format above (the state first: SOAM shares it across questions,
+# the state cache keys it); a model trained on another layout is served in it with --layout (or its basal.json):
+#   state_twice   the state, then the state again (the second copy is read knowing the whole state)
+#   qfirst        the question before the state too (the state is read knowing the question): one pass per question
+LAYOUTS = ("canonical", "state_twice", "qfirst")
+LAYOUT_USER = {
+    "state_twice": dict(pl="Stan:\n{state}\n\nStan (ponownie):\n{state}\n\nPytanie: {q}\nOpcje:\n{opts}",
+                        en="State:\n{state}\n\nState (again):\n{state}\n\nQuestion: {q}\nOptions:\n{opts}"),
+    "qfirst": dict(pl="Pytanie: {q}\n\nStan:\n{state}\n\nPytanie: {q}\nOpcje:\n{opts}",
+                   en="Question: {q}\n\nState:\n{state}\n\nQuestion: {q}\nOptions:\n{opts}"),
+}
+
+
+def user_template(fmt, lang, layout="canonical"):
+    """The user turn's template ({state}, {q}, {opts}) of a format, language and layout."""
+    if layout == "canonical":
+        return FORMATS[fmt]["templates"][lang]["user"]
+    if layout not in LAYOUT_USER:
+        raise ValueError(f"unknown layout {layout!r} (one of {', '.join(LAYOUTS)})")
+    if fmt != 2:
+        raise ValueError(f"layout {layout} needs prompt format 2 (the model's basal.json \"prompt\")")
+    return LAYOUT_USER[layout][lang]
+
 
 def max_options(fmt=1):
     """Most options per question in a prompt format (format 1: 10, format 2: 255)."""
@@ -81,10 +105,19 @@ def max_options(fmt=1):
 def model_format(model_dir):
     """Prompt format of a model directory: `"prompt"` in its basal.json (1 when absent or without basal.json)."""
     p = Path(model_dir) / "basal.json"
-    fmt = json.loads(p.read_text()).get("prompt", 1) if p.exists() else 1
+    fmt = json.loads(p.read_text(encoding="utf-8")).get("prompt", 1) if p.exists() else 1
     if fmt not in FORMATS:
         raise ValueError(f"{p}: unknown prompt format {fmt!r} (supported: {sorted(FORMATS)})")
     return fmt
+
+
+def model_layout(model_dir):
+    """The prompt layout a model is served in by default: `"layout"` in its basal.json (canonical when absent)."""
+    p = Path(model_dir) / "basal.json"
+    layout = json.loads(p.read_text(encoding="utf-8")).get("layout", "canonical") if p.exists() else "canonical"
+    if layout not in LAYOUTS:
+        raise ValueError(f"{p}: unknown prompt layout {layout!r} (supported: {', '.join(LAYOUTS)})")
+    return layout
 
 
 def lang_of(text):
@@ -92,15 +125,17 @@ def lang_of(text):
     return "pl" if any(c in PL_CHARS for c in text) else "en"
 
 
-def render(tok, state, question, options, lang=None, fmt=1):
-    """Full prompt (chat template + answer prefill) for one option order."""
+def render(tok, state, question, options, lang=None, fmt=1, layout="canonical"):
+    """Full prompt (chat template + answer prefill) for one option order, in a layout (LAYOUTS; format 2)."""
     f = FORMATS[fmt]
     if fmt != 1 and not 2 <= len(options) <= len(f["codes"]):
         raise ValueError(f"{len(options)} options (supported: 2..{len(f['codes'])})")
-    t = f["templates"][lang or lang_of(state + question)]
+    lang = lang or lang_of(state + question)
+    t = f["templates"][lang]
     opts = "\n".join(f"{f['codes'][k]}. {o}" for k, o in enumerate(options))
+    user = user_template(fmt, lang, layout)
     msgs = [{"role": "system", "content": t["system"]},
-            {"role": "user", "content": t["user"].format(state=state, q=question, opts=opts)}]
+            {"role": "user", "content": user.format(state=state, q=question, opts=opts)}]
     text = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
     return text + PREFILL
 

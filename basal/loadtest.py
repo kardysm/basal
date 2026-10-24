@@ -73,7 +73,7 @@ async def run(a):
                    questions_per_s=len(ok) * a.questions_per_request / wall)
     print(json.dumps({k: round(v, 2) if isinstance(v, float) else v for k, v in out.items()}))
     if a.out:
-        Path(a.out).write_text(json.dumps(out, indent=1))
+        Path(a.out).write_text(json.dumps(out, indent=1), encoding="utf-8")
 
 
 async def determinism(a, bodies):
@@ -101,7 +101,7 @@ async def determinism(a, bodies):
                                            decision_flips=flips, concurrency=a.concurrency))
     print(json.dumps(out))
     if a.out:
-        Path(a.out).write_text(json.dumps(out, indent=1))
+        Path(a.out).write_text(json.dumps(out, indent=1), encoding="utf-8")
 
 
 def main():

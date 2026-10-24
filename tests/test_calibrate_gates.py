@@ -182,7 +182,7 @@ class StubBackend:
 def engine(tmp_path, monkeypatch):
     md = tmp_path / "model"
     md.mkdir()
-    (md / "CALIBRATION.json").write_text(json.dumps({"temperature_per_prim": {"noul": 1.0}}))
+    (md / "CALIBRATION.json").write_text(json.dumps({"temperature_per_prim": {"noul": 1.0}}), encoding="utf-8")
     monkeypatch.setattr(server_module, "resolve", lambda *_, **__: md)
     monkeypatch.setattr(server_module, "EagerBackend", StubBackend)
     return md
@@ -192,7 +192,7 @@ def labelled(path, n=1500, seed=0):
     """Yes/no questions of three families (two over-confident, one calibrated) and multi questions with a fallback."""
     rng = np.random.default_rng(seed)
     crit = {"d": "Damage", "r": "Refund", "i": "Invoice", "g": "General"}
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         for i in range(n):
             fam = ("late", "covered", "signed")[i % 3]
             q = float(rng.uniform(0.02, 0.98))
@@ -217,7 +217,7 @@ def test_end_to_end_gates_strict_and_multi(tmp_path, engine, capsys):
     main(argv + ["--reference"])
     printed = capsys.readouterr().out
     assert "LOFO ECE on CERT" in printed and "automated on CERT" in printed and "multi fallback" in printed
-    cal = json.loads(out.read_text())
+    cal = json.loads(out.read_text(encoding="utf-8"))
     lf = cal["gates"]["ece_lofo"]["noul"]
     assert lf["n_families"] == 3 and lf["worst_family"] == "signed" and lf["reference"] == 0.062
     assert cal["gates"]["ece_reference"].startswith("basal-1.5") and cal["fitted_on"]["multi"] == 750
@@ -231,9 +231,9 @@ def test_end_to_end_gates_strict_and_multi(tmp_path, engine, capsys):
             main(strict)
         assert e.value.code == 1
     ref = tmp_path / "ref.json"
-    ref.write_text(json.dumps({"gates": {"ece_lofo": {"noul": {"mean": 0.9}}}}))
+    ref.write_text(json.dumps({"gates": {"ece_lofo": {"noul": {"mean": 0.9}}}}), encoding="utf-8")
     main(argv + ["--strict", "--reference", str(ref)])                 # far above: no regression, exit 0
-    ref.write_text(json.dumps({"gates": {"ece_lofo": {"noul": {"mean": 0.0}}}}))
+    ref.write_text(json.dumps({"gates": {"ece_lofo": {"noul": {"mean": 0.0}}}}), encoding="utf-8")
     with pytest.raises(SystemExit) as e:
         main(argv + ["--strict", "--reference", str(ref)])
     assert e.value.code == 1 and "above the reference for noul" in capsys.readouterr().err
@@ -369,7 +369,7 @@ def test_saved_rows_refit_without_an_engine(tmp_path, engine):
             "--save-rows", str(tmp_path / "rows.jsonl")]
     main(argv)
     main([str(tmp_path / "rows.jsonl"), "--from-rows", "--out", str(tmp_path / "b.json")])
-    a, b = json.loads((tmp_path / "a.json").read_text()), json.loads((tmp_path / "b.json").read_text())
+    a, b = json.loads((tmp_path / "a.json").read_text(encoding="utf-8")), json.loads((tmp_path / "b.json").read_text(encoding="utf-8"))
     for k in ("temperature_per_prim", "thresholds", "gates", "multi"):
         assert a[k] == b[k], k
     with pytest.raises(SystemExit, match="not a file written by"):

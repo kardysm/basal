@@ -44,7 +44,9 @@ def test_gemma4_attention_at_the_issue_lengths(L, d, H, Hkv, W):
     g = Gemma4Graph.__new__(Gemma4Graph)
     g.window = W or 1
     t = "sliding_attention" if W else "full_attention"
-    masks = {"math": allow[None, None], "flex": g._plain_block(L, t, "cuda")}
+    masks = {"math": allow[None, None]}
+    if attention_available("flex") is None:
+        masks["flex"] = g._plain_block(L, t, "cuda")
     if W and attention_available("fa3") is None:
         masks["fa3"] = ("fa3", W)
     for kernel, m in masks.items():

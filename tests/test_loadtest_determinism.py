@@ -23,7 +23,7 @@ def test_flips_and_differences(monkeypatch, tmp_path):
     bodies = [{"state": s, "questions": {}} for s in ("a", "b", "c", "d")]
     a = argparse.Namespace(determinism=2, url="http://test/v1/systemone", concurrency=2, out=str(tmp_path / "d.json"))
     asyncio.run(loadtest.determinism(a, bodies))
-    d = json.loads((tmp_path / "d.json").read_text())["determinism"]
+    d = json.loads((tmp_path / "d.json").read_text(encoding="utf-8"))["determinism"]
     assert d["requests"] == 2 and d["identical"] == 1 and d["decision_flips"] == 1
     assert abs(d["max_abs_diff"] - 0.2) < 1e-9
 

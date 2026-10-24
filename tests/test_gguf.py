@@ -33,7 +33,7 @@ def model(tmp_path_factory):
     model_dir.mkdir()
     (model_dir / "config.json").write_text(json.dumps({
         "model_type": "llama", "num_hidden_layers": L, "hidden_size": H, "vocab_size": V,
-    }))
+    }), encoding="utf-8")
     w = gguf.GGUFWriter(str(path), "llama")
     w.add_context_length(256); w.add_embedding_length(H); w.add_block_count(L); w.add_feed_forward_length(F)
     w.add_head_count(NH); w.add_head_count_kv(NKV); w.add_rope_freq_base(1e6); w.add_layer_norm_rms_eps(1e-6)
@@ -77,7 +77,7 @@ def test_mismatched_architecture_fails_before_context_creation(model, tmp_path, 
     model_dir.mkdir()
     (model_dir / "config.json").write_text(json.dumps({
         "model_type": "llama", "num_hidden_layers": L + 1, "hidden_size": H, "vocab_size": V,
-    }))
+    }), encoding="utf-8")
     monkeypatch.setattr("basal.engine.AutoTokenizer.from_pretrained", lambda _: Tok())
     monkeypatch.setattr(C, "llama_init_from_model",
                         lambda *args: pytest.fail("context creation must follow architecture validation"))
@@ -177,7 +177,7 @@ def test_multimodal_config_is_checked_on_its_text_config(model, tmp_path, monkey
         model_dir = tmp_path / name
         model_dir.mkdir()
         (model_dir / "config.json").write_text(json.dumps({"model_type": "gemma4", "text_config": {
-            "model_type": "gemma4_text", "num_hidden_layers": layers, "hidden_size": H, "vocab_size": V}}))
+            "model_type": "gemma4_text", "num_hidden_layers": layers, "hidden_size": H, "vocab_size": V}}), encoding="utf-8")
         if ok:
             assert GGUFBackend(model_dir, gguf_path, n_gpu_layers=0).n_vocab == V
         else:

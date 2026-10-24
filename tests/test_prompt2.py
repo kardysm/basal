@@ -1,14 +1,7 @@
-"""Prompt format 2 (models whose basal.json says "prompt": 2): up to 255 single-token option codes; format 1 unchanged.
-
-The cross-repo test renders the same synthetic inputs with this engine and with the training side's copy of the format
-(not part of this repository; found through JEVPL_DIR) in the Bielik v3 tokenizers, and requires identical strings
-and code ids. It is skipped when the training-side copy or the tokenizers are missing.
-"""
+"""Prompt format 2 (models whose basal.json says "prompt": 2): up to 255 single-token option codes; format 1 unchanged."""
 import asyncio
 import hashlib
-import importlib.util
 import json
-import os
 import re
 import sys
 from pathlib import Path
@@ -67,11 +60,11 @@ def test_format2_render_and_codes():
 
 def test_model_format_from_basal_json(tmp_path):
     assert P.model_format(tmp_path) == 1  # no basal.json
-    (tmp_path / "basal.json").write_text(json.dumps({"name": "x", "version": "1.5"}))
+    (tmp_path / "basal.json").write_text(json.dumps({"name": "x", "version": "1.5"}), encoding="utf-8")
     assert P.model_format(tmp_path) == 1
-    (tmp_path / "basal.json").write_text(json.dumps({"name": "x", "prompt": 2}))
+    (tmp_path / "basal.json").write_text(json.dumps({"name": "x", "prompt": 2}), encoding="utf-8")
     assert P.model_format(tmp_path) == 2
-    (tmp_path / "basal.json").write_text(json.dumps({"prompt": 3}))
+    (tmp_path / "basal.json").write_text(json.dumps({"prompt": 3}), encoding="utf-8")
     with pytest.raises(ValueError, match="unknown prompt format"):
         P.model_format(tmp_path)
 
@@ -149,58 +142,3 @@ def test_backend_limits_for_255_codes(monkeypatch):
     a, b = SamplingParams.made
     assert a["logprob_token_ids"] == list(range(10, 130)) and b["logprob_token_ids"] is None  # vLLM accepts <= 128
     assert b["logprobs"] == 130 and b["allowed_token_ids"] == list(range(10, 140))
-
-
-# -- cross-repo identity with the training side --------------------------------------------------------------------
-TOKENIZERS = ["speakleash/Bielik-1.5B-v3.0-Instruct", "speakleash/Bielik-4.5B-v3.0-Instruct",
-              "speakleash/Bielik-11B-v3.0-Instruct"]
-
-
-def prompt16():
-    d = Path(os.environ.get("JEVPL_DIR") or Path(__file__).resolve().parents[2] / "jev-pl")
-    f = d / "jevpl" / "prompt16.py"
-    if not f.exists():
-        pytest.skip(f"training-side prompt16.py not found ({f}; set JEVPL_DIR)")
-    spec = importlib.util.spec_from_file_location("prompt16", f)
-    m = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(m)
-    return m
-
-
-def tokenizer(name):
-    from transformers import AutoTokenizer
-    try:
-        return AutoTokenizer.from_pretrained(name, local_files_only=True)
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        return AutoTokenizer.from_pretrained(name)
-    except Exception as e:  # noqa: BLE001  (no cache and no network)
-        pytest.skip(f"tokenizer {name} unavailable: {type(e).__name__}")
-
-
-STATES = {"pl": "Historia zgłoszeń klienta: 3 marca zgłosił uszkodzoną przesyłkę, 5 marca zażądał zwrotu 129,00 zł.",
-          "en": "Customer ticket history: on 3 March a damaged parcel was reported, on 5 March a refund of 129.00 EUR."}
-QUESTIONS = {"pl": "Który dział powinien obsłużyć zgłoszenie?", "en": "Which department should handle the ticket?"}
-
-
-def test_constants_match_training_side():
-    p16 = prompt16()
-    assert tuple(p16.CODES) == P.CODES and p16.PREFILL == P.PREFILL and p16.TEMPLATES == P.TEMPLATES_2
-    assert p16.PL_CHARS == P.PL_CHARS
-
-
-@pytest.mark.parametrize("name", TOKENIZERS)
-def test_render_and_code_ids_identical_to_training_side(name):
-    p16 = prompt16()
-    tok = tokenizer(name)
-    for lang in ("pl", "en"):
-        for k in (2, 10, 26, 27, 151, 255):
-            opts = [f"{'Dział' if lang == 'pl' else 'Department'} {i}: {'obsługa' if lang == 'pl' else 'handles'} "
-                    f"case type {i}" for i in range(k)]
-            mine = P.render(tok, STATES[lang], QUESTIONS[lang], opts, fmt=2)
-            theirs = p16.render(tok, STATES[lang], QUESTIONS[lang], opts)
-            assert mine == theirs, (lang, k)
-            assert P.lang_of(STATES[lang] + QUESTIONS[lang]) == p16.lang_of(STATES[lang] + QUESTIONS[lang]) == lang
-            ids = P.code_ids(tok, mine, k, fmt=2)
-            assert ids is not None and ids == p16.code_ids(tok, theirs, k), (lang, k)

@@ -85,7 +85,7 @@ import torch
 from . import __version__
 from . import tasks as task_types
 from .engine import resolve
-from .prompt import max_options, model_format
+from .prompt import max_options, model_format, model_layout
 from .server import (MODES, Server, _text, add_engine_args, calibration_file, calibration_name, calibration_orders,
                      certified, default_mode, load_calibration, model_identity, refuse_lean_flex, temper, temperature,
                      to_items)
@@ -924,16 +924,16 @@ def fit(rows, baseline, targets, min_per_type=50, fmt=1, min_family=30, referenc
     return dict(temperature_per_prim=temps, temperature_source=source, thresholds=thresholds, **extra), report
 
 
-def compared(md, kind, path, quant, orders, off, preset=None):
+def compared(md, kind, path, quant, orders, off, preset=None, layout="canonical"):
     """The calibration to compare with and keep, as basal-serve would apply it with these option orders
     (server.load_calibration: the model's file for those orders when it ships one; a file fitted on other orders
     without its thresholds) -> (calibration, its file or None)."""
     if off or (md is None and not path):
         return {}, None
     if orders is None:  # a server that does not report its orders: the file as it is
-        f = calibration_file(md, kind, path, quant, preset)
-        return (json.loads(f.read_text()) if f.exists() else {}), f
-    data, f, why = load_calibration(md, kind, path, quant, orders, preset=preset)
+        f = calibration_file(md, kind, path, quant, preset, layout)
+        return (json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}), f
+    data, f, why = load_calibration(md, kind, path, quant, orders, preset=preset, layout=layout)
     if why:
         print(f"warning: {why}: its thresholds are not compared or kept (as in basal-serve)", file=sys.stderr)
     return data, f if f.exists() else None
@@ -1011,7 +1011,7 @@ def reference_values(ref):
     p = Path(ref)
     if not p.exists():
         raise SystemExit(f"--reference {ref}: not {' or '.join(REFERENCE)} and no such file")
-    lf = (json.loads(p.read_text()).get("gates") or {}).get("ece_lofo") or {}
+    lf = (json.loads(p.read_text(encoding="utf-8")).get("gates") or {}).get("ece_lofo") or {}
     vals = {t: v["mean"] for t, v in lf.items() if isinstance(v, dict) and v.get("mean") is not None}
     if not vals:
         raise SystemExit(f"--reference {ref}: the file has no gates.ece_lofo means")
@@ -1207,7 +1207,7 @@ def refit(a, targets, reference, reference_name):
     for w in small:
         print(f"warning: {w}", file=sys.stderr)
     base_file = Path(a.calibration) if a.calibration else (Path(head["baseline"]) if head.get("baseline") else None)
-    baseline = json.loads(base_file.read_text()) if base_file is not None and base_file.exists() else {}
+    baseline = json.loads(base_file.read_text(encoding="utf-8")) if base_file is not None and base_file.exists() else {}
     fo = calibration_orders(baseline)
     if baseline and fo is not None and head.get("orders") is not None and fo != head["orders"]:  # as basal-serve
         print(f"warning: {base_file.name} was fitted on {fo} option order(s), the rows on {head['orders']}: its "
@@ -1233,7 +1233,7 @@ def refit(a, targets, reference, reference_name):
     if a.report_only:
         print("\n--report-only: no file written")
     else:
-        Path(a.out).write_text(json.dumps(cal, indent=1, ensure_ascii=False) + "\n")
+        Path(a.out).write_text(json.dumps(cal, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
         print(f"\nwrote {a.out} (calibration file {head['fmt']}, engine {cal['engine']}, refitted from {a.input})")
     summary(small + cert_notes(report, None, targets))
     if a.strict:
@@ -1347,7 +1347,10 @@ def main(argv=None):
         md = resolve(a.model, a.revision, metadata_only=True) if a.model else None
         revision = model_identity(a.model, md)[1] if md is not None else None
         fmt = entry.get("prompt_format") or (model_format(md) if md is not None else 1)
-        baseline, base_file = compared(md, kind, a.calibration, quant, orders, a.no_calibration, preset)
+        # the layout the server reads prompts in (servers before 2.4.1 and canonical ones do not say)
+        a.layout = getattr(a, "layout", None) or entry.get("layout") or (model_layout(md) if md is not None
+                                                                          else "canonical")
+        baseline, base_file = compared(md, kind, a.calibration, quant, orders, a.no_calibration, preset, a.layout)
         settle(asyncio.run(over_http(base + "/v1/systemone", bodies, a.concurrency)) if bodies else [])
         task_responses = []
     else:
@@ -1358,7 +1361,9 @@ def main(argv=None):
                                            "no_calibration": True, "log_decisions": None}))
         kind, quant, fmt, orders = srv.kind, a.quant or MODES[mode][1], srv.fmt, srv.orders
         preset = getattr(srv.backend, "preset", None)
-        baseline, base_file = compared(srv.md, srv.kind, a.calibration, quant, orders, a.no_calibration, preset)
+        a.layout = srv.layout  # --layout, else the model's basal.json "layout"
+        baseline, base_file = compared(srv.md, srv.kind, a.calibration, quant, orders, a.no_calibration, preset,
+                                       a.layout)
         model, revision = a.model, model_identity(a.model, srv.md)[1]
         engine = mode + (f" --quant {a.quant}" if a.quant else "") + (f" --gguf {Path(a.gguf).name}" if a.gguf else "") \
             + (f" --vllm-preset {preset}" if preset not in (None, "default") else "")
@@ -1384,7 +1389,7 @@ def main(argv=None):
         head = dict(basal_calibrate_rows=1, fmt=fmt, kind=kind, quant=quant, vllm_preset=preset, model=str(model),
                     engine=engine, data=Path(a.input).name, requests=len(bodies) - len(failed),
                     baseline=str(base_file) if baseline else None, orders=orders)
-        with open(a.save_rows, "w") as f:
+        with open(a.save_rows, "w", encoding="utf-8") as f:
             for x in [head] + rows:
                 f.write(json.dumps(x, ensure_ascii=False) + "\n")
     cal["engine"] = engine_name(kind, quant, preset)
@@ -1402,6 +1407,8 @@ def main(argv=None):
         cal["fitted_on"]["task_requests"] = len(task_bodies) - len(tfailed)
     if orders is not None:  # basal-serve applies the file only to these orders (or loads CALIBRATION.o<N>.json)
         cal["fitted_on"]["orders"] = orders
+    if getattr(a, "layout", None) not in (None, "canonical"):  # basal-serve applies it only in this layout (2.4.1)
+        cal["fitted_on"]["layout"] = a.layout
     cal["certified_on"] = "CERT split of fitted_on.data (30% by group)"
     cal["baseline"] = (str(a.calibration or f"{a.model}/{base_file.name}") if baseline else "none") + \
         (f" ({baseline['source_tag']})" if baseline.get("source_tag") else "")
@@ -1419,7 +1426,7 @@ def main(argv=None):
     if a.report_only:
         print("\n--report-only: no file written")
     else:
-        Path(a.out).write_text(json.dumps(cal, indent=1, ensure_ascii=False) + "\n")
+        Path(a.out).write_text(json.dumps(cal, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
         print(f"\nwrote {a.out} (calibration file {fmt}, engine {cal['engine']})\n"
               f"  basal-serve --model {a.model or '<model>'} --mode {mode} --calibration {a.out}")
     summary(small + cert_notes(report, task_report, targets))

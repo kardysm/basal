@@ -209,7 +209,7 @@ def main(argv=None):
             raise SystemExit(f"--against {a.against}: a different tokenizer")
     qs = None
     if a.questions:
-        qs = [json.loads(x) for x in Path(a.questions).read_text().splitlines() if x.strip()]
+        qs = [json.loads(x) for x in Path(a.questions).read_text(encoding="utf-8").splitlines() if x.strip()]
         qs = [q for q in qs if "options" in q and 2 <= len(q["options"]) <= (255 if fmt == 2 else 10)][: a.n_questions]
     single, multi, long = build(ref_be.tok, fmt, a.n_single, a.n_multi, a.n_long, a.seed, qs)
     rnd = random.Random(a.seed)
@@ -273,5 +273,5 @@ def main(argv=None):
                                                tree="flex" if be.flex else "dense",
                                                reference=a.reference, against=a.against,
                                                questions=a.questions and len(qs), rows=rows),
-                                          indent=1))
+                                          indent=1), encoding="utf-8")
     return rows

@@ -13,16 +13,16 @@ CAL = {"prompt": 2, "temperature_per_prim": {"choice": 1.2, "noul": 1.5},
 
 
 def write(d, name, orders, **extra):
-    (d / name).write_text(json.dumps(dict(CAL, fitted_on={"orders": orders}, **extra)))
+    (d / name).write_text(json.dumps(dict(CAL, fitted_on={"orders": orders}, **extra)), encoding="utf-8")
 
 
 def test_shipped_file_shapes_load(tmp_path):
     """A basal-1.5 file (fitted_on a text) loads unchanged; a training-side package fitted on two orders is
     unvalidated at one order."""
-    (tmp_path / "CALIBRATION.json").write_text(json.dumps(dict(CAL, fitted_on="calib FIT split (70% by twin group)")))
+    (tmp_path / "CALIBRATION.json").write_text(json.dumps(dict(CAL, fitted_on="calib FIT split (70% by twin group)")), encoding="utf-8")
     cal, _, why = load_calibration(tmp_path, "graph", None, None, 2)
     assert why is None and cal["thresholds"]
-    (tmp_path / "CALIBRATION.json").write_text(json.dumps(dict(CAL, fitted_on="calibration FIT split", orders=2)))
+    (tmp_path / "CALIBRATION.json").write_text(json.dumps(dict(CAL, fitted_on="calibration FIT split", orders=2)), encoding="utf-8")
     assert load_calibration(tmp_path, "graph", None, None, 1)[2] == ("CALIBRATION.json was fitted on 2 option "
                                                                       "order(s), served with 1")
 
@@ -48,7 +48,7 @@ def test_other_orders_without_their_file_are_unvalidated(tmp_path):
     explicit = load_calibration(tmp_path, "graph", str(tmp_path / "CALIBRATION.json"), None, 1)
     assert explicit[2] is not None                                                # --calibration is not replaced
     assert load_calibration(tmp_path, "graph", None, None, "auto")[2] is not None  # auto is its own order setting
-    (tmp_path / "CALIBRATION.json").write_text(json.dumps(CAL))                   # a file that does not say
+    (tmp_path / "CALIBRATION.json").write_text(json.dumps(CAL), encoding="utf-8")                   # a file that does not say
     assert load_calibration(tmp_path, "graph", None, None, 1)[2] is None
     assert load_calibration(tmp_path, "graph", None, None, 1, off=True)[0] == {}
 

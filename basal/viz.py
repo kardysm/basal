@@ -186,7 +186,7 @@ def compare_served(res, served):
 def examples():
     out = []
     for f in sorted(EXAMPLES.glob("*.jsonl")):
-        for n, line in enumerate(f.read_text().splitlines()):
+        for n, line in enumerate(f.read_text(encoding="utf-8").splitlines()):
             if not line.strip():
                 continue
             item = json.loads(line)

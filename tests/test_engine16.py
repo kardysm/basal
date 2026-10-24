@@ -1,8 +1,10 @@
 """Fast path routing on CPU (graphs replaced by eager replays of the same static buffers): single prompts in plain
 graphs or a plain long forward, branched units in masked graphs or the two passes over the root's KV cache, all units
 of all groups batched together and read out at once. Every readout equals a separate forward of its own prompt."""
+import contextlib
 import random
 
+import pytest
 import torch
 
 from basal.engine import GraphBackend, causal_sdpa
@@ -10,11 +12,13 @@ from tests.test_engine import separate, tiny
 
 
 class Replay:
-    """Stand-in for a captured CUDA graph: replay() recomputes the output from the static inputs, in place."""
+    """Stand-in for a captured CUDA graph: replay() recomputes the output from the static inputs, in place. Its output
+    is the tensor the function returned at capture, as on the GPU: for Llama graphs a view of the buffer every graph
+    of its family writes (_shared_out)."""
 
     def __init__(self, fn, static):
         self.fn, self.static = fn, static
-        self.out = fn(*static).clone()
+        self.out = fn(*static)
 
     def replay(self):
         self.out.copy_(self.fn(*self.static))
@@ -31,7 +35,7 @@ class Stub(GraphBackend):
         self._alloc_kv()
         self.replays = []
 
-    def _capture(self, key, fn, *static, warmup=3):
+    def _capture(self, key, fn, *static):
         r = Replay(fn, static)
         self.graphs[key] = (r, *static, r.out)
         return self.graphs[key]
@@ -67,9 +71,11 @@ def groups(rnd):
 def check(be, gs):
     m = be.model
     res = be.run_shared(gs)
+    assert len(res) == len(gs)
     for (toks, lids, *_), got in zip(gs, res):
-        for r, e in zip(got, separate(m, toks, lids)):
-            assert torch.allclose(torch.tensor(r), e, atol=1e-5)
+        assert len(got) == len(toks)
+        for r, e, ids in zip(got, separate(m, toks, lids), lids):
+            assert len(r) == len(ids) and torch.allclose(torch.tensor(r), e, atol=1e-5)
     return res
 
 
@@ -143,6 +149,68 @@ def test_prompt_that_ends_at_the_root():
     assert [r[0] for r in be.replays] == ["tree"]
 
 
+def ref_varlen(q, k, v, cu_q, cu_k, max_q, max_k, scale, causal=False, used=None):
+    """basal.engine._varlen (torch's varlen attention) written out: per packed sequence, grouped-query heads, causal
+    aligned at the end, the first used[i] keys of sequence i -> (o [Tq, H, d], lse [Tq, H] fp32)."""
+    cu_q, cu_k = cu_q.tolist(), cu_k.tolist()
+    used = used.tolist() if used is not None else None
+    r = q.shape[1] // k.shape[1]
+    o, lse = torch.zeros_like(q), torch.zeros(q.shape[:2])
+    for i in range(len(cu_q) - 1):
+        a, b, c = cu_q[i], cu_q[i + 1], cu_k[i]
+        e = c + used[i] if used is not None else cu_k[i + 1]
+        assert b - a <= max_q and e - c <= max_k
+        s = torch.einsum("qhd,khd->hqk", q[a:b].float(), k[c:e].float().repeat_interleave(r, 1)) * scale
+        if causal:
+            s = s.masked_fill(torch.ones(b - a, e - c, dtype=torch.bool).triu(e - c - (b - a) + 1), float("-inf"))
+        lse[a:b] = s.logsumexp(-1).transpose(0, 1)
+        o[a:b] = torch.einsum("hqk,khd->qhd", s.softmax(-1), v[c:e].float().repeat_interleave(r, 1)).to(q.dtype)
+    return o, lse
+
+
+def test_cascade_pass2_equals_separate(monkeypatch):
+    """The CUDA cascade pass 2 (_varlen_tree, _cascade_varlen: the root's keys with per-row key counts, each trie block
+    over its ancestors, merged by log-sum-exp) on the CPU, torch's varlen attention written out (ref_varlen): every
+    readout equals its prompt run alone. Several units per forward with different root and branch lengths (padding,
+    stale buffer keys past each root), nested option orders, readouts inside the root; below CASCADE_TOKENS the dense
+    pass 2 runs."""
+    import basal.engine as E
+    calls = []
+    monkeypatch.setattr(E, "_varlen", lambda *a, **k: calls.append(k.get("causal", False)) or ref_varlen(*a, **k))
+    be = Stub(tiny())
+    be._cascade_why, be.CASCADE_TOKENS = None, 0
+    rnd = random.Random(8)
+    s = [1] + [rnd.randrange(3, 50) for _ in range(12)]
+    gs = groups(rnd) + [([s, s + [10, 11], s + [11, 10]], [[7, 8], [10, 11], [10, 11]])] + groups(rnd)
+    check(be, gs)
+    assert {True, False} <= set(calls) and any(r[0] == "tree" and r[1] > 1 for r in be.replays)
+    calls.clear()
+    be.CASCADE_TOKENS = 1 << 30
+    check(be, gs)
+    assert not calls
+
+
+def test_cascade_why(monkeypatch):
+    """The cascade pass 2 needs CUDA, a model with attention layers only and no --lean; the CPU flash op that the CPU
+    cascade needs (cascade_ok) plays no part on CUDA."""
+    import basal.engine as E
+    be = Stub(tiny())
+    assert be._cascade_why is not None  # the CPU
+    be = Stub(tiny())
+    be.dev, be.lean = torch.device("cuda"), object()
+    assert "lean" in be._cascade_why
+
+    class NoFlash:
+        def __getattr__(self, name):
+            raise AttributeError(name)
+    pytest.importorskip("torch.nn.attention.varlen")  # (its first import reads torch.ops.aten)
+    monkeypatch.setattr(E.torch.ops, "aten", NoFlash())
+    monkeypatch.setattr(E, "torch_varlen_available", lambda dtype: None)
+    be = Stub(tiny())
+    be.dev = torch.device("cuda")
+    assert be._cascade_why is None and not E.cascade_ok(be.model.config)
+
+
 def test_pass2_graphs():
     """With the pass-2 graphs captured (warm), short branch rows replay a graph; longer ones run without one."""
     class Warm(Stub):
@@ -159,6 +227,220 @@ def test_pass2_graphs():
     gs.append(([s + list(range(3, 30)), s + list(range(30, 3, -1))], [[7, 8], [7, 8]]))  # 27-token branches: no graph
     check(be, gs)
     assert used and all(k[2] in (8, 16) for k in used)
+
+
+def test_shared_graph_outputs_keep_every_readout():
+    """Llama graphs share one output buffer per family (plain / pass 2) and one pass-2 mask buffer: a unit read out
+    both inside its root (pass 1's buffer) and below it (a pass-2 graph's), in one call with plain prompts and other
+    units, still reads its own forward's values, and the captured graphs keep no output of their own."""
+    class Warm(Stub):
+        SUFFIX_LENS = [8, 16]
+    rnd = random.Random(6)
+    be = Warm(tiny())
+    be.warm()
+    used = []
+    for key, g in be.graphs.items():
+        if key[0] == "x":
+            g[0].replay = (lambda r, k: lambda: (used.append(k), Replay.replay(r)))(g[0], key)
+    s = [1] + [rnd.randrange(3, 50) for _ in range(12)]
+    q = prompt(rnd, s, 8)  # rows of 10 tokens below the root: a pass-2 graph of 16 that covers the root's 13
+    check(be, [([s, q + [10, 11], q + [11, 10]], [[7, 8], [10, 11], [10, 11]]),  # readouts in the root and below
+               ([prompt(rnd, s, 5)], [[7, 8, 9]])])
+    assert used == [("x", 1, 16, 16)] and ("tree", 1, 13) in be.replays
+    check(be, groups(rnd))
+    for fam in "px":
+        assert len({g[-1].untyped_storage().data_ptr() for k, g in be.graphs.items() if k[0] == fam}) == 1
+    assert len({g[2].untyped_storage().data_ptr() for k, g in be.graphs.items() if k[0] == "x"}) == 1
+
+
+def test_each_graph_warmed_up_once_before_its_capture(monkeypatch):
+    """The engine's _capture / _warm_up (torch.cuda's stream calls as no-ops on the CPU): a graph's function runs once
+    before its capture, the first call that compiles and sets up what the capture cannot. 3 calls per plain graph
+    (2 per pass-2 graph) cost 414 s of basal-2.0-4.5B's 1,094 s warm-up on an RTX 4060 Ti."""
+    class Stream:
+        def wait_stream(self, other):
+            pass
+    monkeypatch.setattr(torch.cuda, "Stream", Stream)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *a: Stream())
+    monkeypatch.setattr(torch.cuda, "stream", lambda s: contextlib.nullcontext())
+    calls, recorded = [], []
+    be = GraphBackend.__new__(GraphBackend)
+    be._side, be._deferred = None, {}
+    be._record = lambda key, fn, static: recorded.append(key)
+    for key in (("p", 2, 16), ("x", 1, 8, 16), ("p", 2, 16)):  # the last one waits already: not warmed up again
+        GraphBackend._capture(be, key, lambda *s, k=key: calls.append((k, s)), "static")
+    assert calls == [(("p", 2, 16), ("static",)), (("x", 1, 8, 16), ("static",))] and not recorded
+    be._deferred = None  # outside warm(): warmed up once, then captured
+    GraphBackend._capture(be, ("c", 64), lambda *s: calls.append((("c", 64), s)), "static")
+    assert calls[2:] == [(("c", 64), ("static",))] and recorded == [("c", 64)]
+
+
+@pytest.mark.parametrize("prefix", [False, True])
+def test_warm_captures_largest_first_after_every_warm_up(prefix):
+    """warm() (Llama) runs every graph's warm-up calls first, in the grid's order (torch.compile compiles there, so
+    the compiled kernels do not change), then captures the plain graphs, the most tokens first, so each capture can
+    reuse the pool blocks a larger one freed, then the pass-2 graphs, the smallest first (_capture_deferred's memory
+    budget keeps the commonest); replays still answer as separate forwards. With --prefix-cache the two pass-2
+    families share shapes: each graph is still warmed up and captured once."""
+    from basal.engine import _graph_tokens
+
+    class Order(Stub):
+        SUFFIX_LENS = PREFIX_SFX = [8, 16]
+        PREFIX_ROWS = [1, 2, 4]
+
+        def _capture(self, key, fn, *static):  # the engine's _capture, its two steps observed
+            self.events.append(("request", key))
+            return GraphBackend._capture(self, key, fn, *static)
+
+        def _warm_up(self, fn, static):
+            self.events.append(("warm", None))
+            fn(*static)
+
+        def _record(self, key, fn, static):
+            self.events.append(("capture", key))
+            r = Replay(fn, static)
+            self.graphs[key] = (r, *static, r.out)
+            return self.graphs[key]
+
+    Order.prefix = prefix
+    be = Order(tiny())
+    be.events = []
+    be.warm()
+    kinds = [e[0] for e in be.events]
+    first = kinds.index("capture")
+    caps = [k for kind, k in be.events if kind == "capture"]
+    requests = [k for kind, k in be.events if kind == "request"]
+    assert "warm" not in kinds[first:] and kinds.count("warm") == len(caps) == len(set(caps)) == len(set(requests)) > 20
+    assert (len(requests) > len(set(requests))) == prefix  # the shared shapes asked for twice
+    plain, pass2 = [k for k in caps if k[0] != "x"], [k for k in caps if k[0] == "x"]
+    assert caps == plain + pass2 and plain and pass2
+    assert [_graph_tokens(k) for k in plain] == sorted(map(_graph_tokens, plain), reverse=True)
+    assert [_graph_tokens(k) for k in pass2] == sorted(map(_graph_tokens, pass2))
+    check(be, groups(random.Random(7)))
+
+
+@pytest.mark.parametrize("card", [24, 1000])
+def test_pass2_graphs_captured_while_memory_stays_free(card):
+    """With little GPU memory (simulated: every captured graph takes one unit of a `card`-unit GPU, PASS2_RESERVE 10)
+    every plain graph is captured, then the pass-2 graphs, the smallest first, while PASS2_RESERVE stays free; a
+    pass 2 whose graph was not captured runs without one, and every readout equals its prompt run alone. With room
+    for all of them, all are captured."""
+    from basal.engine import _graph_tokens
+
+    class Tight(Stub):
+        SUFFIX_LENS, PASS2_RESERVE = [8, 16], 10
+        _capture = GraphBackend._capture
+
+        def _warm_up(self, fn, static):
+            fn(*static)
+
+        def _record(self, key, fn, static):
+            r = Replay(fn, static)
+            self.graphs[key] = (r, *static, r.out)
+            return self.graphs[key]
+
+        def _free_memory(self):
+            return card - len(self.graphs)
+
+    be = Tight(tiny())
+    be.warm()
+    every = [("x", b, S, L) for b in be.TREE_ROWS for L in be.LENS for S in be.SUFFIX_LENS if be._pass2_ok(b, L)]
+    plain = [k for k in be.graphs if k[0] == "p"]
+    kept = sorted((k for k in be.graphs if k[0] == "x"), key=_graph_tokens)
+    assert len(plain) == len(be.grid(be.PLAIN_LENS))
+    assert kept == sorted(every, key=_graph_tokens)[: len(kept)]
+    assert len(kept) == (card - len(plain) - be.PASS2_RESERVE if card < 100 else len(every))
+    assert card - len(be.graphs) >= be.PASS2_RESERVE  # the reserve stays free after the last capture
+    rnd = random.Random(9)
+    roots = [[1] + [rnd.randrange(3, 50) for _ in range(11)] for _ in range(4)]
+    four = [([r + [10, 11], r + [11, 10]], [[10, 11], [10, 11]]) for r in roots]  # 4 units, 4 tokens below 12
+    assert (("x", 4, 8, 16) in be.graphs) == (card >= 100)
+    check(be, four + groups(rnd))
+
+
+def test_gemma_long_root_graphs_keep_the_reserve():
+    """Gemma 4's pass-2 graphs over roots longer than LENS (_warm_long_sfx) also stop where PASS2_RESERVE would no
+    longer stay free (simulated: one unit per graph), not only at PASS2_POOL, which counts the pool and not the
+    memory a graph keeps for its kernels."""
+    from types import SimpleNamespace
+
+    class Gemma(GraphBackend):
+        LENS, PLAIN_LENS, BATCHES, TOKEN_BUDGET = [16, 32], [16, 32, 64], [1, 2, 4], 128
+        SUFFIX_LENS, TREE_ROWS, PASS2_RESERVE = [8, 16], [1, 2], 10
+
+    be = Gemma.__new__(Gemma)
+    be.gemma, be.compact, be.shared, be.prefix, be.dev = object(), False, True, False, torch.device("cpu")
+    be.model, be.graphs = SimpleNamespace(config=SimpleNamespace(max_position_embeddings=0)), {}
+    be._graph = lambda b, L: be._capture(("p", b, L), lambda: None)
+    be._graph_sfx = lambda b, S, L: be._capture(("x", b, S, L), lambda: None)
+    be._warm_up = lambda fn, static: None
+    be._record = lambda key, fn, static: be.graphs.setdefault(key, key)
+    grid = len(be.grid(be.PLAIN_LENS)) + 2 * 2 * 2  # plain (b <= 4) + pass 2 within LENS: all fit on this card
+    be._free_memory = lambda: grid + 2 + be.PASS2_RESERVE - len(be.graphs)  # room for two more graphs
+    be.warm()
+    long = [k for k in be.graphs if k[0] == "x" and k[3] > be.LENS[-1]]
+    assert len(be.graphs) == grid + 2 and len(long) == 2
+    assert grid + 2 + be.PASS2_RESERVE - len(be.graphs) >= be.PASS2_RESERVE
+
+
+
+def test_gemma_warm_captures_largest_first_then_the_long_roots():
+    """Gemma 4 (basal-omni): every graph of the grid, compact graphs included, is warmed up first, then the compact
+    and plain graphs are captured the largest first and the pass-2 graphs within LENS the smallest first; then the
+    pass-2 graphs over roots longer than LENS (_warm_long_sfx), each captured right after its warm-up, so the
+    PASS2_POOL budget measures only what they add. The graph builders only record."""
+    from types import SimpleNamespace
+
+    from basal.engine import _graph_tokens
+
+    class Gemma(GraphBackend):
+        LENS, PLAIN_LENS, BATCHES, TOKEN_BUDGET = [16, 32], [16, 32, 64], [1, 2, 4], 128
+        SUFFIX_LENS, TREE_ROWS, COMPACT_LENS = [8, 16], [1, 2], [16, 32, 64, 128]
+
+    be, ev = Gemma.__new__(Gemma), []
+    be.gemma, be.compact, be.shared, be.prefix, be.dev = object(), True, True, False, torch.device("cpu")
+    be.model, be.graphs = SimpleNamespace(config=SimpleNamespace(max_position_embeddings=0)), {}
+    be._graph_c = lambda T: be._capture(("c", T), lambda: None)
+    be._graph = lambda b, L: be._capture(("p", b, L), lambda: None)
+    be._graph_sfx = lambda b, S, L: be._capture(("x", b, S, L), lambda: None)
+    be._warm_up = lambda fn, static: ev.append(("warm", None))
+    be._record = lambda key, fn, static: ev.append(("capture", key))
+    be.warm()
+    first = next(i for i, (kind, k) in enumerate(ev) if kind == "capture" and k[0] == "x" and k[3] > be.LENS[-1])
+    grid, long = ev[:first - 1], ev[first - 1:]
+    caps = [k for kind, k in grid if kind == "capture"]
+    assert [kind for kind, _ in grid] == ["warm"] * len(caps) + ["capture"] * len(caps)
+    plain, pass2 = [k for k in caps if k[0] != "x"], [k for k in caps if k[0] == "x"]
+    assert caps == plain + pass2
+    assert [_graph_tokens(k) for k in plain] == sorted(map(_graph_tokens, plain), reverse=True)
+    assert [_graph_tokens(k) for k in pass2] == sorted(map(_graph_tokens, pass2))
+    want = {("c", T) for T in (16, 32, 64, 128)}  # compact rows: plain graphs of at most TREE_ROWS[-1] rows
+    want |= {("p", b, L) for L in (16, 32, 64) for b in (1, 2) if b * L <= 128 or b == 1}
+    want |= {("x", b, S, L) for b in (1, 2) for L in (16, 32) for S in (8, 16)}  # rows x root within the budget
+    assert len(caps) == len(set(caps)) and set(caps) == want
+    assert [kind for kind, _ in long] == ["warm", "capture"] * (len(long) // 2)
+    assert {k for kind, k in long if kind == "capture"} == {("x", b, S, 64) for b in (1, 2) for S in (8, 16)}
+
+
+
+def test_pass2_graphs_are_the_reachable_shapes():
+    """warm() captures pass-2 graphs (rows, root length) exactly for the batches pass 1 can form (_chunks; state-cached
+    roots are chunked the same way), and the key / value buffer holds the largest of those, not TREE_ROWS[-1] x
+    LENS[-1]. The default grid; the graph builders only record what warm() asks for."""
+    from types import SimpleNamespace
+    be = GraphBackend.__new__(GraphBackend)
+    be.shared, be.model, asked = True, SimpleNamespace(config=SimpleNamespace(max_position_embeddings=0)), set()
+    be._graph = lambda b, L: None
+    be._graph_sfx = lambda b, S, L: asked.add((b, L))
+    be.warm()
+    reach = set()
+    for L in be.LENS:
+        for n in range(1, be.TREE_ROWS[-1] + 1):
+            for idx in be._chunks([L] * n, be.PLAIN_LENS, [8] * n, be.TREE_ROWS[-1]):
+                reach.add((be._bucket(len(idx), be.TREE_ROWS), L))
+    assert asked == reach
+    assert be._kv_tokens() == max(be.TOKEN_BUDGET, be.PLAIN_LENS[-1], max(b * L for b, L in reach))
+    assert be._kv_tokens() < be.TREE_ROWS[-1] * be.LENS[-1]
 
 
 def test_layered_forward_is_the_forward():

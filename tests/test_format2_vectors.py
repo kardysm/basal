@@ -34,7 +34,7 @@ def prompts(tok, rec):
 
 
 def records():
-    return [json.loads(line) for line in VECTORS.read_text().splitlines()]
+    return [json.loads(line) for line in VECTORS.read_text(encoding="utf-8").splitlines()]
 
 
 def test_prompts_are_the_engines():

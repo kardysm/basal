@@ -7,7 +7,7 @@ question. They are trained on text; with `--media on` the server also takes imag
 ## Serve
 
 ```bash
-uv pip install "basal[media] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.1.tar.gz"
+uv pip install "basal[media] @ https://github.com/rkinas/basal/archive/refs/tags/v2.4.1.tar.gz"
 basal-serve --model Remek/basal-omni-1.0-max --mode eager --media on --port 8000    # or Remek/basal-omni-1.0-mini
 ```
 
@@ -257,6 +257,25 @@ with 2-10 options). One question takes 525 ms; long prompts can run out of GPU m
 For comparison on the same GPU: eager bf16 985 s (mini) and 2,157 s (max) for the 10,606 decisions at 8 in flight, vLLM
 bf16 415 s and 840 s; GGUF Q8_0 646 s and 1,186 s at 16. Use Q8_0 (or Q6_K where memory is short); Q5_K_M and Q4_K_M
 move too many close decisions.
+
+**Speed on an Apple M5 Pro (20-core GPU, 64 GB)**, measured by Kamil
+([@kamilrosa](https://github.com/kamilrosa), [#36](https://github.com/rkinas/basal/issues/36)), basal v2.3.1, the 44
+bundled examples with `basal-bench` (two repetitions), and `basal-serve` + `basal-loadtest` over HTTP (0 errors).
+Nothing ran out of memory at 64 GB, including bf16 max on 1.5k-token prompts.
+
+| model | mode | `basal-bench` 2 orders / 1 order (ms) | GB | HTTP short, 32 clients (dec/s, p50 ms) | HTTP 1.5k tokens, 16 clients (dec/s, p50 ms) |
+|---|---|---|---|---|---|
+| omni-1.0-mini | `mps` (bf16) | 84 / 71 | 18.0 | **19.0**, 59 | **1.69**, 509 |
+| | `mlx` (bf16) | 77 / 68 | 14.1 | | |
+| | `-MLX` port | 111 / 68 | 8.3 | 17.4, 70 | 1.43, 665 |
+| omni-1.0-max | `mps` (bf16) | **190** / 161 | 26.2 | 4.26, 167 | 0.38, 2,239 |
+| | `mlx` (bf16) | 270 / 177 | 22.4 | | |
+| | `-MLX` port | 317 / 181 | 13.0 | **6.07**, 177 | **0.51**, 1,874 |
+| omni-1.1-max | `-MLX` port | 319 / 182 | 13.0 | 6.03, 179 | 0.51, 1,884 |
+
+For omni-mini `mps` bf16 is the faster route; for omni-max the 8-bit `-MLX` port serves more decisions under load
+with half the memory, while `mps` is faster for a single decision. Mixed load (30% long prompts, 8 clients) raises
+p95 to 5.2 s (mini) and 13.8 s (max), because short requests queue behind long ones.
 
 ## Images and audio (`--media on`)
 

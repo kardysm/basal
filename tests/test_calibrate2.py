@@ -80,8 +80,8 @@ class StubBackend:
 def engine2(tmp_path, monkeypatch):
     md = tmp_path / "model"
     md.mkdir()
-    (md / "basal.json").write_text(json.dumps({"name": "stub", "prompt": 2}))
-    (md / "CALIBRATION.json").write_text(json.dumps({"prompt": 2, "temperature_per_prim": {"choice": 1.0}}))
+    (md / "basal.json").write_text(json.dumps({"name": "stub", "prompt": 2}), encoding="utf-8")
+    (md / "CALIBRATION.json").write_text(json.dumps({"prompt": 2, "temperature_per_prim": {"choice": 1.0}}), encoding="utf-8")
     monkeypatch.setattr(server_module, "resolve", lambda *_, **__: md)
     monkeypatch.setattr(server_module, "EagerBackend", StubBackend)
     return md
@@ -90,7 +90,7 @@ def engine2(tmp_path, monkeypatch):
 def labelled(path, n=1200, seed=0):
     """Choice requests with 3 options (sharpened 1.5x) and 15 options (2.5x), and yes/no questions."""
     rng = np.random.default_rng(seed)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         for i in range(n):
             k, sharpen = ((3, 1.5), (15, 2.5), (2, 2.0))[i % 3]
             q = rng.dirichlet([0.3] * k)
@@ -113,7 +113,7 @@ def test_end_to_end_writes_file_2_and_the_server_applies_the_buckets(tmp_path, e
     out = tmp_path / "CALIBRATION.custom.json"
     main([str(tmp_path / "l.jsonl"), "--mode", "eager", "--model", "stub", "--out", str(out)])
     assert "calibration file 2, engine eager" in capsys.readouterr().out
-    cal = json.loads(out.read_text())
+    cal = json.loads(out.read_text(encoding="utf-8"))
     assert cal["prompt"] == 2 and cal["engine"] == "eager" and cal["fitted_on"]["orders"] == 1  # format 2: one order
     b = cal["temperature_per_bucket"]["choice"]
     assert 1.1 < b["2-10"] < 2.0 and 1.9 < b["11-26"] < 3.2 and "27-255" not in b

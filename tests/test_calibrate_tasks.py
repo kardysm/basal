@@ -21,7 +21,7 @@ SHIPPED = {"temperature_per_prim": {"choice": 1.5, "noul": 1.2, "score": 1.0},
 def engine(tmp_path, monkeypatch):
     md = tmp_path / "model"
     md.mkdir()
-    (md / "CALIBRATION.json").write_text(json.dumps(SHIPPED))
+    (md / "CALIBRATION.json").write_text(json.dumps(SHIPPED), encoding="utf-8")
     monkeypatch.setattr(server_module, "resolve", lambda *_, **__: md)
     monkeypatch.setattr(server_module, "EagerBackend", StubBackend)
     return md
@@ -44,7 +44,7 @@ def classify_lines(n=1000, sharpen=2.0, seed=1):
 
 
 def write(path, lines):
-    path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    path.write_text("".join(json.dumps(x) + "\n" for x in lines), encoding="utf-8")
 
 
 def test_task_gold_forms_and_errors(tmp_path):
@@ -129,7 +129,7 @@ def test_task_only_input_keeps_the_decision_calibration(tmp_path, engine, capsys
     out = tmp_path / "C.json"
     main([str(tmp_path / "t.jsonl"), "--mode", "eager", "--model", "stub", "--out", str(out), "--targets", "0.05"])
     printed = capsys.readouterr().out
-    cal = json.loads(out.read_text())
+    cal = json.loads(out.read_text(encoding="utf-8"))
     assert cal["temperature_per_prim"] == SHIPPED["temperature_per_prim"]
     assert cal["thresholds"] == SHIPPED["thresholds"] and cal["decision_calibration"].startswith("kept from")
     assert cal["task_thresholds"]["verify"] == {"0.05": 0.9}            # shipped, temperatures unchanged: kept
@@ -156,12 +156,12 @@ def test_task_only_input_keeps_the_decision_calibration(tmp_path, engine, capsys
 
 def test_mixed_input_certifies_tasks_with_the_fitted_temperatures(tmp_path, engine, capsys):
     synthetic(tmp_path / "d.jsonl", n=600)
-    lines = [json.loads(x) for x in (tmp_path / "d.jsonl").read_text().splitlines()] + classify_lines()
+    lines = [json.loads(x) for x in (tmp_path / "d.jsonl").read_text(encoding="utf-8").splitlines()] + classify_lines()
     write(tmp_path / "m.jsonl", lines)
     out = tmp_path / "C.json"
     main([str(tmp_path / "m.jsonl"), "--mode", "eager", "--model", "stub", "--out", str(out), "--targets", "0.05"])
     printed = capsys.readouterr().out
-    cal = json.loads(out.read_text())
+    cal = json.loads(out.read_text(encoding="utf-8"))
     assert cal["temperature_source"]["choice"].startswith("fitted") and "decision_calibration" not in cal
     assert set(cal["task_thresholds"]) == {"classify"}                  # the shipped verify threshold is dropped
     assert "verify: the shipped task threshold" in printed
@@ -196,7 +196,7 @@ def test_model_identity_and_mismatch(tmp_path):
 
 def test_server_warns_or_refuses_a_file_of_another_model(tmp_path, engine, capsys):
     f = tmp_path / "C.json"
-    f.write_text(json.dumps(dict(SHIPPED, fitted_on={"model": "Remek/basal-omni-1.0-max"})))
+    f.write_text(json.dumps(dict(SHIPPED, fitted_on={"model": "Remek/basal-omni-1.0-max"})), encoding="utf-8")
     srv = Server(parser().parse_args(["--mode", "eager", "--model", "Remek/basal-omni-1.1-max", "--calibration",
                                       str(f)]))
     assert "fitted on Remek/basal-omni-1.0-max" in srv.cal_mismatch and "warning: C.json" in capsys.readouterr().out
@@ -250,22 +250,22 @@ def test_other_option_orders_drop_task_thresholds_too(tmp_path):
     """A file fitted on other option orders keeps its temperatures only: no decision, fallback or task thresholds."""
     md = tmp_path / "m"
     md.mkdir()
-    (md / "CALIBRATION.json").write_text(json.dumps(dict(SHIPPED, orders=1)))
+    (md / "CALIBRATION.json").write_text(json.dumps(dict(SHIPPED, orders=1)), encoding="utf-8")
     data, f, why = load_calibration(md, "eager", None, None, 2)
     assert why and "task_thresholds" not in data and "thresholds" not in data and data["temperature_per_prim"]
-    (md / "CALIBRATION.o2.json").write_text(json.dumps(dict(SHIPPED, orders=2)))
+    (md / "CALIBRATION.o2.json").write_text(json.dumps(dict(SHIPPED, orders=2)), encoding="utf-8")
     data, f, why = load_calibration(md, "eager", None, None, 2)
     assert why is None and f.name == "CALIBRATION.o2.json" and data["task_thresholds"]
 
 
 def test_calibrate_compares_the_file_basal_serve_loads_for_its_orders(tmp_path, engine, capsys):
-    (engine / "CALIBRATION.json").write_text(json.dumps(dict(SHIPPED, orders=1)))
+    (engine / "CALIBRATION.json").write_text(json.dumps(dict(SHIPPED, orders=1)), encoding="utf-8")
     o2 = dict(SHIPPED, orders=2, task_thresholds={"verify": {"0.05": 0.95}})
-    (engine / "CALIBRATION.o2.json").write_text(json.dumps(o2))
+    (engine / "CALIBRATION.o2.json").write_text(json.dumps(o2), encoding="utf-8")
     write(tmp_path / "t.jsonl", classify_lines(n=200))
     out = tmp_path / "C.json"
     main([str(tmp_path / "t.jsonl"), "--mode", "eager", "--model", "stub", "--orders", "2", "--out", str(out)])
-    cal = json.loads(out.read_text())
+    cal = json.loads(out.read_text(encoding="utf-8"))
     assert cal["baseline"] == "stub/CALIBRATION.o2.json" and cal["task_thresholds"]["verify"] == {"0.05": 0.95}
     assert cal["fitted_on"]["orders"] == 2
 
