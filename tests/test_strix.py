@@ -243,8 +243,11 @@ def test_warmup_compiles_every_kernel_copy():
     timed pass of S with 1 question and of M with 2 in the request matrix, before the warmup covered them). Three
     layers: the warmup forwards skip the middle one, and the forwards below run all three."""
     from basal import strix
-    if not hasattr(triton, "knobs"):
+    runtime = getattr(getattr(triton, "knobs", None), "runtime", None)
+    if not hasattr(runtime, "jit_cache_hook"):
         pytest.skip("Triton without knobs.runtime.jit_cache_hook")
+    # The hook runs at every miss of a kernel's in-process cache, before Triton looks in its disk cache, so a copy the
+    # disk cache holds counts as built too.
     for k in (strix._attn_fwd, strix._swiglu_mm, strix._linear, strix._rmsnorm, strix._rope):
         k.device_caches.clear()  # the copies other tests compiled in this process
     be = make(tiny(layers=3), warm=True)
@@ -255,15 +258,15 @@ def test_warmup_compiles_every_kernel_copy():
         built.append(repr)
         return False  # compile as usual
 
-    old, triton.knobs.runtime.jit_cache_hook = triton.knobs.runtime.jit_cache_hook, hook
+    old, runtime.jit_cache_hook = runtime.jit_cache_hook, hook
     try:
-        for L in (20, 48, 208, 512, 513, 720, 1536, 1537, 2160, 2304, 2305, 2320, 4609, 5000):
+        for L in (1, 20, 48, 208, 512, 513, 720, 1536, 1537, 2160, 2304, 2305, 2320, 4609, 5000):
             for nq in (1, 2, 7, 16, 48, 513, 528):
                 if nq <= L:
                     be.forward(*be._warm_row(L, nq))
         be._wait()
     finally:
-        triton.knobs.runtime.jit_cache_hook = old
+        runtime.jit_cache_hook = old
     assert built == []
 
 

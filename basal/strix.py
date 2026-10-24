@@ -297,9 +297,10 @@ class StrixHaloFastBackend(GraphBackend):
             self._warm_shapes()
 
     # Start-up forwards for attention and rotary (one tile config each): sequence lengths other and a multiple of 16,
-    # each against readout rows 1, other and a multiple of 16 (the last layer's attention takes both counts). They run
-    # the first layer and the last only: every layer between needs the copies the first one compiles.
-    WARM_FORWARDS = ((17, 1), (32, 1), (17, 3), (32, 3), (17, 16), (32, 16))
+    # each against readout rows 1, other and a multiple of 16 (the last layer's attention takes both counts), and a
+    # sequence of one token (a request that packs to one). They run the first layer and the last only: every layer
+    # between needs the copies the first one compiles.
+    WARM_FORWARDS = ((1, 1), (17, 1), (32, 1), (17, 3), (32, 3), (17, 16), (32, 16))
 
     @staticmethod
     def warm_rows(cfgs):

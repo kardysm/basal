@@ -234,9 +234,10 @@ projections for every row-count config and row chunk, with and without the resid
 stock layer), the interval mask against the block mask it replaces, the whole backend on a tiny random Llama with
 biases against separate bf16 forwards of every prompt (1–8 questions over one state, several requests in one sequence
 and the same request alone, several forwards per call with a request bisected, determinism), and the start-up warm-up
-(after it, no row count of 20–5,000 tokens with 1–528 readout rows compiles a kernel), plus the mode dispatch of
-`basal-serve` and `basal-bench`. Full suite on this machine: 76 passed, 3 skipped (MLX / Apple only); on engine 2.0.0,
-511 passed, 19 skipped (MLX and the extras not installed).
+(after it, no row count of 1–5,000 tokens with 1–528 readout rows compiles a kernel), plus the mode dispatch of
+`basal-serve` and `basal-bench`. Full suite on this machine in the run from when `--mode strix` was added (before the
+warm-up test): 76 passed, 3 skipped (MLX / Apple only); on engine 2.0.0, 511 passed, 19 skipped (MLX and the extras
+not installed).
 
 ## Raw results (summary)
 
