@@ -72,9 +72,9 @@ reaches 16–19 useful TFLOPS at every request size. GPU time by operation, from
   was a multiple of 16 in a range waited: in the request matrix, the first timed pass of S with 1 question (208 tokens)
   and of M with 2 (720 tokens), on both machines. With an empty Triton cache those passes took 1.82 and 2.30 s against
   0.18 and 0.33 s for the next pass. Now no request compiles a kernel. The warm-up's short forwards run the first layer
-  and the last only (the layers between need the same copies), so start-up takes no longer once Triton's disk cache
-  holds the copies (6.0–6.1 against 6.0–6.2 s) and about 5 s longer at the first start on a machine (13.4–13.6 against
-  8.7–8.8 s).
+  and the last only (the layers between need the same copies). `basal-serve` with basal-2.0-4.5B reaches its first
+  `/health` about as fast once Triton's disk cache holds the copies (5.6 against 5.4–5.5 s, two runs each) and about
+  5 s later at the first start on a machine (12.7–12.8 against 7.7–7.8 s).
 
 ## Results against `gguf`: basal-2.0
 
@@ -235,9 +235,12 @@ stock layer), the interval mask against the block mask it replaces, the whole ba
 biases against separate bf16 forwards of every prompt (1–8 questions over one state, several requests in one sequence
 and the same request alone, several forwards per call with a request bisected, determinism), and the start-up warm-up
 (after it, no row count of 1–5,000 tokens with 1–528 readout rows compiles a kernel), plus the mode dispatch of
-`basal-serve` and `basal-bench`. Full suite on this machine in the run from when `--mode strix` was added (before the
-warm-up test): 76 passed, 3 skipped (MLX / Apple only); on engine 2.0.0, 511 passed, 19 skipped (MLX and the extras
-not installed).
+`basal-serve` and `basal-bench`. All 31 pass, with Triton's disk cache filled and empty. Full suite on this machine
+(engine 2.4.1 with the warm-up above): 834 passed, 7 failed, 25 skipped (MLX and the extras not installed). The 7 fail
+on engine 2.4.1 without the warm-up too, in PyTorch's attention on ROCm rather than in `--mode strix`: 4 `test_gemma4`
+cases need its efficient attention (experimental on ROCm, and only up to head size 256), 2 `test_cascade_cuda` tests
+need varlen flash-attention features ROCm lacks (`seqused_k`, the packed log-sum-exp layout), and the bottom-right
+causal case of `test_compact_varlen` differs from the reference.
 
 ## Raw results (summary)
 
