@@ -231,9 +231,10 @@ Reproduce: the scripts, the commands and the raw results (basal-1.5 in `results/
 `tests/test_strix.py`: every Triton kernel against its stock counterpart (attention against a dense masked softmax over
 packed rows of several requests, readout-only queries included; rotary bit-identical to the Hugging Face rotary;
 projections for every row-count config and row chunk, with and without the residual; FFN input and RMSNorm against the
-stock layer), the interval mask against the block mask it replaces, and the whole backend on a tiny random Llama with
+stock layer), the interval mask against the block mask it replaces, the whole backend on a tiny random Llama with
 biases against separate bf16 forwards of every prompt (1–8 questions over one state, several requests in one sequence
-and the same request alone, several forwards per call with a request bisected, determinism), plus the mode dispatch of
+and the same request alone, several forwards per call with a request bisected, determinism), and the start-up warm-up
+(after it, no row count of 20–5,000 tokens with 1–528 readout rows compiles a kernel), plus the mode dispatch of
 `basal-serve` and `basal-bench`. Full suite on this machine: 76 passed, 3 skipped (MLX / Apple only); on engine 2.0.0,
 511 passed, 19 skipped (MLX and the extras not installed).
 
