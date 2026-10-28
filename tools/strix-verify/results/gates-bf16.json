@@ -1,0 +1,19 @@
+{
+ "ref": "eager.jsonl",
+ "dir": "/home/kardysm/strix-verify",
+ "files": {},
+ "G2": {
+  "strix-c8.jsonl": {
+   "decisions": 2000,
+   "decision_diffs": [],
+   "probability_diffs": [],
+   "passed": true
+  },
+  "strix-det-c8.jsonl": {
+   "decisions": 2000,
+   "decision_diffs": [],
+   "probability_diffs": [],
+   "passed": true
+  }
+ }
+}
