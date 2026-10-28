@@ -19,8 +19,12 @@ The last layer runs attention, o and the FFN for the readout rows only. q, k and
 concatenated at start-up; the Hugging Face modules keep views of them, so the evidence head still runs the stock
 model). Rounding follows the Hugging Face bf16 forward step by step (RMSNorm in fp32 then the weight in bf16, rotary as
 round(q cos) + round(rot(q) sin), silu(gate) and its product with up rounded to bf16, bias then residual each rounded),
-so answers match the other bf16 engines. Every packed row of a chunk is one sequence (no padding, no shapes, no
-graphs): rows of different requests are separate trees of the same interval mask."""
+so answers match the other bf16 engines. Every packed row of a chunk is one sequence (no shapes, no graphs): rows of
+different requests are separate trees of the same interval mask. Every unit fills whole key blocks of the attention
+kernel (it starts on a block boundary and padding follows it up to the next one), so in every full-length layer its
+rows are computed from the same data in the same blocks alone or next to other requests. In the last layer its readout
+rows can share a query tile with another unit's; the blocks that adds or drops are fully masked for them. Its answers
+do not depend on what else shares the forward (docs/benchmarks/STRIX_HALO.md)."""
 import math
 import time
 
@@ -191,7 +195,8 @@ class StrixHaloFastBackend(GraphBackend):
     """`--mode strix` (see the module docstring). Rows of one chunk are concatenated into a single sequence of at
     most TOKEN_BUDGET tokens; a packed row longer than that is bisected like in GraphBackend (exact). A single prompt
     longer than that runs alone in one forward, as GraphBackend runs one past its largest graph (the server keeps
-    prompts within the model's context; activations grow linearly, attention memory does not grow with length)."""
+    prompts within the model's context; activations grow linearly, attention memory does not grow with length). Every
+    unit fills whole key blocks of the attention kernel (see `_pack_chunk`)."""
 
     streams, inflight = False, 1  # its own run_shared: no early readouts, one call at a time
     TOKEN_BUDGET = 16384  # tokens per forward (the GGUF context): ~0.4 GB of FFN activations
@@ -352,14 +357,37 @@ class StrixHaloFastBackend(GraphBackend):
         return len(pack[0]) > self.TOKEN_BUDGET
 
     def _chunks_tok(self, units):
-        """Units sorted by length, cut into chunks of at most TOKEN_BUDGET tokens."""
+        """Units sorted by length, cut into chunks of at most TOKEN_BUDGET tokens, each unit counted with the padding
+        that rounds it up to whole key blocks (see _pack_chunk)."""
+        bn = self.ATTN["BN"]
         out, cur, n = [], [], 0
         for k in sorted(range(len(units)), key=lambda k: len(units[k][0][0])):
-            t = len(units[k][0][0])
+            t = -(-len(units[k][0][0]) // bn) * bn
             if cur and n + t > self.TOKEN_BUDGET:
                 out.append(cur); cur, n = [], 0
             cur.append(k); n += t
         return out + ([cur] if cur else [])
+
+    @staticmethod
+    def _pack_chunk(units, idx, bn, pad_id):
+        """Units -> one packed sequence: ids, positions, sub_end per token, readout rows. Every unit fills whole blocks
+        of bn tokens, the attention kernel's key-block size: it starts on a multiple of bn and up to bn - 1 pad tokens
+        follow it, after the last unit too. In every full-length layer its rows then see the same keys in the same
+        blocks, next to the same padding, alone or with others. Padding only between units is not enough: a unit that
+        ends the sequence has its last blocks cut at the end, and its last rows came out one bf16 step apart from the
+        same unit followed by padding (8060S, Triton 3.7). Pad tokens sit at position 0, each visible only to itself
+        (sub_end = its own index + 1, so its softmax is not empty), and are never read out."""
+        ids, pos, sub, reads, off = [], [], [], [], 0
+        for k in idx:
+            t, pp, sg, last, par = pk = units[k][0]
+            ids += t; pos += pp; sub += StrixHaloFastBackend._sub_end(pk, off); reads += [off + i for i in last]
+            off += len(t)
+            n = -off % bn
+            ids += [pad_id] * n
+            pos += [0] * n
+            sub += [off + i + 1 for i in range(n)]
+            off += n
+        return ids, pos, sub, reads
 
     @staticmethod
     def _sub_end(pack, off):
@@ -475,11 +503,7 @@ class StrixHaloFastBackend(GraphBackend):
         units = self._units(groups)
         probs = [None] * len(units)
         for idx in self._chunks_tok(units):
-            ids, pos, sub, reads, off = [], [], [], [], 0
-            for k in idx:
-                t, pp, sg, last, par = pk = units[k][0]
-                ids += t; pos += pp; sub += self._sub_end(pk, off); reads += [off + i for i in last]
-                off += len(t)
+            ids, pos, sub, reads = self._pack_chunk(units, idx, self.ATTN["BN"], self.tok.pad_token_id)
             if max(pos) >= self.cos.shape[0]:
                 raise ValueError(f"prompt too long for --mode strix: position {max(pos)}, the model has "
                                  f"{self.cos.shape[0]}")
