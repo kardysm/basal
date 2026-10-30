@@ -191,6 +191,41 @@ reference (one does not fit in 32 GB): `strix` and `gguf` 142 of 144 decisions e
 - Llama models with silu, a power-of-two hidden size and an FFN size divisible by 64 (checked at start-up); bf16 only.
   Tile configs were tuned on the 8060S; the mode has not been run on other GPUs.
 
+## Agreement with `--mode eager` bf16, and `--near-ties eager`
+
+Public test split of `LocalLLaMA/typed-decisions` (400 cases, 2,000 decisions), basal-2.0-4.5B, engine 2.4.1, one
+request at a time; references `--mode eager` bf16 and fp32, each with every prompt alone (`--soam off --max-batch 1`):
+
+| engine | vs eager bf16 | vs eager fp32 |
+|---|---|---|
+| eager bf16, default packing | 0.9910 (18 flips) | 0.9935 (13) |
+| eager fp32 | 0.9905 (19) | reference |
+| `strix` | 0.9900 (20) | 0.9935 (13) |
+| `strix --near-ties eager` | **0.9990** (2) | 0.9915 (17) |
+
+Every bf16 forward of the model is as far from every other as from fp32 (largest probability change per decision:
+median 0.004–0.005, 99th percentile 0.034–0.039), eager against itself in another packing included, and the flips are
+the near-ties that this noise tips. Without an error of its own, a forward agrees with eager bf16 as often as fp32 does
+(0.9905), so no kernel change brings `strix` to 99.5% against eager bf16; every flip has a reference top-two margin
+under 0.05.
+
+`--near-ties eager` answers near-ties as eager bf16 does. A question (each label of a `multi`) whose calibrated
+top-two margin under `strix` is below `--near-tie-margin` (default 0.05) is computed again by the transformers forward
+on the same weights, alone as `--mode eager --soam off --max-batch 1` computes it, and answered from it; the other
+questions keep `strix`'s answers. On the test split:
+
+- 114 of 2,000 decisions (5.7%, in 104 of 400 requests) were computed again; the 2 flips left are decisions with a
+  `strix` margin of 0.059 and 0.090.
+- With `--near-tie-margin 1.01` every decision is computed again, and all 2,000 equal the eager bf16 reference with
+  every probability: the questions it computes again get exactly eager's answer.
+- 8 requests in flight give the same answers as one at a time, every probability.
+- Cost: eager takes 7.4× `strix`'s time per decision, so the server time grows 1.42× (1.39× with 8 in flight); a
+  request with a near tie waits 0.48 s longer (median; at most 1.2 s), the median request 9 ms. No second copy of the
+  weights: the stock modules share `strix`'s.
+- Against fp32 it agrees less (0.9915 vs 0.9935): the near-ties now carry eager bf16's own rounding.
+
+Off by default. It exists for checks against `--mode eager` bf16; against fp32, plain `strix` is closer.
+
 ## Method
 
 **Request matrix** (`bench_matrix.py`, in the fork): four states built from the bundled examples, S / M / L / XL ≈ 100 /

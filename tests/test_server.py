@@ -291,6 +291,71 @@ def test_soam_one_entry_per_request_same_answers():
     assert ra["answers"] == rb["answers"] and ra["usage"]["branches"] == 4
 
 
+class TieEngine:
+    """The eager backend of --near-ties: records its calls, answers 0.3 / 0.7 for every prompt."""
+    def __init__(self):
+        self.calls = []
+
+    def run_shared(self, groups, policy=None):
+        self.calls.append(groups)
+        return [[[0.3, 0.7] for _ in g[0]] for g in groups]
+
+
+NEAR_TIE_BODY = {"state": "Paczka dotarła uszkodzona.", "questions": {
+    "dept": {"type": "choice", "instructions": "Dział?", "criteria": {"zwroty": "Zwroty", "it": "IT", "hr": "HR"}},
+    "dmg": {"type": "noul", "instructions": "TIE uszkodzona?"},
+    "tags": {"type": "multi", "instructions": "Kategorie?", "criteria": {"d": "TIE uszkodzenie", "r": "Zwrot"}}}}
+
+
+def _near_tie_engine(prompt, ids):
+    """Engine stand-in: 0.52 / 0.48 (a top-two margin of 0.04) for the prompts that mention TIE, clear answers else."""
+    if "TIE" in "".join(map(chr, prompt)):
+        return [0.52, 0.48]
+    return [0.6, 0.3, 0.1] if len(ids) == 3 else [0.9, 0.1]
+
+
+@pytest.mark.parametrize("soam", [True, False])
+def test_near_ties_recomputes_near_ties_alone(soam):
+    """--near-ties eager: each branch whose calibrated top-two margin is under --near-tie-margin (the noul question, one
+    label of the multi question) is computed again by the eager backend, one branch per call with that branch's
+    prompts, and answered from it; the clear branches keep the engine's answers."""
+    srv = FakeServer(_near_tie_engine, soam=soam)
+    srv.orders, srv.ties, srv.tie_margin = 1, TieEngine(), 0.05
+    r = asyncio.run(srv._run(NEAR_TIE_BODY))
+    assert [len(c) for c in srv.ties.calls] == [1, 1]                          # two branches, one per call
+    assert all(len(c[0][0]) == len(c[0][1]) == 1 for c in srv.ties.calls)    # one option order: one prompt
+    assert all("TIE" in "".join(map(chr, c[0][0][0])) for c in srv.ties.calls)
+    a = r["answers"]
+    assert a["dmg"]["probabilities"] == pytest.approx({"true": 0.3, "false": 0.7})
+    assert a["tags"]["probabilities"] == pytest.approx({"d": 0.3, "r": 0.9})
+    assert a["dept"]["probabilities"] == pytest.approx({"zwroty": 0.6, "it": 0.3, "hr": 0.1})
+    assert r["usage"]["near_ties"] == 2
+
+
+def test_near_ties_margin_and_off():
+    """Under the margin only: at 0.03 the 0.04 margins are not near ties; without --near-ties usage has no count."""
+    srv = FakeServer(_near_tie_engine)
+    srv.orders, srv.ties, srv.tie_margin = 1, TieEngine(), 0.03
+    r = asyncio.run(srv._run(NEAR_TIE_BODY))
+    assert srv.ties.calls == [] and r["usage"]["near_ties"] == 0
+    assert r["answers"]["dmg"]["probabilities"] == pytest.approx({"true": 0.52, "false": 0.48})
+    off = FakeServer(_near_tie_engine)
+    off.orders = 1
+    assert "near_ties" not in asyncio.run(off._run(NEAR_TIE_BODY))["usage"]
+
+
+@pytest.mark.parametrize("flags, message", [
+    (["--mode", "eager"], "needs --mode strix"),
+    (["--mode", "strix", "--orders", "auto"], "--orders auto"),
+    (["--mode", "strix", "--near-tie-margin", "0"], "above 0"),
+])
+def test_near_ties_refused_before_loading(monkeypatch, flags, message):
+    monkeypatch.setattr(server_module, "resolve", lambda *_, **__: pytest.fail("loaded before refusing"))
+    a = parser().parse_args(["--near-ties", "eager"] + flags)
+    with pytest.raises(SystemExit, match=message):
+        Server(a)
+
+
 def test_act_minimum_expected_cost_and_defer():
     q = {"type": "act", "instructions": "Czy zwrot przysługuje?", "criteria": {"true": "Przysługuje", "false": "Nie"},
          "actions": {"approve": "", "reject": "", "human": ""},

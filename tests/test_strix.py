@@ -359,6 +359,29 @@ def test_deterministic(be):
 
 
 @gpu
+def test_near_ties_eager_on_strix_weights_equals_an_eager_server():
+    """--near-ties eager: the eager backend around strix's model (q / k / v are views into strix's fused weights)
+    answers a branch as an eager server with its own copy of the weights does, bit for bit: one prompt alone, and
+    both option orders of a branch in one call (left-padded), as --mode eager --soam off --max-batch 1 runs them."""
+    import copy
+
+    from basal.engine import EagerBackend
+    m = tiny()
+    own = copy.deepcopy(m)
+    with pytest.MonkeyPatch.context() as mp:  # the eager server's backend, through its constructor
+        mp.setattr("basal.engine.AutoTokenizer.from_pretrained", lambda _: Tok())
+        mp.setattr("basal.engine.AutoModelForCausalLM.from_pretrained", lambda _, dtype: own.to(dtype))
+        server = EagerBackend("tiny", device="cuda")
+    ties = EagerBackend.around(make(m).model, Tok())
+    toks, lids = request([1] + list(range(2, 60)), 3)
+    groups = [([t], [i]) for t, i in zip(toks, lids)] + [(toks[2 * q: 2 * q + 2], lids[2 * q: 2 * q + 2])
+                                                         for q in range(3)]
+    groups.append(([toks[0], toks[1] + [5, 6, 7]], lids[:2]))  # orders of different lengths: one is left-padded
+    for g in groups:
+        assert ties.run_shared([g]) == server.run_shared([g])
+
+
+@gpu
 def test_deterministic_algorithms(be):
     """--deterministic: nothing the backend runs is refused under torch's deterministic algorithms, and the answers do
     not change (torch.empty is then filled with NaN, so an output element no kernel writes would show)."""
