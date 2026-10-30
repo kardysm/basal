@@ -172,7 +172,7 @@ run_one() {  # name, split
         echo "   $out exists, skipping (FORCE=1 to redo)"
         return 0
     fi
-    say "$name ($split split, ${CONC} in flight)"
+    say "$name ($(basename "$cases"), ${CONC} in flight)"
     start_server "$name-$split" "${FLAGS[@]}" || die "server failed for $name"
     if [ "$DRY" = 1 ]; then
         echo "   [dry] PYTHONPATH=$REPO $PY -P -c 'from basal.run import main; main()' --input $cases --output $out --url $URL/v1/systemone --concurrency $CONC"
