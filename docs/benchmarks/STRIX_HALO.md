@@ -214,8 +214,9 @@ request at a time; references `--mode eager` bf16 and fp32, each with every prom
 Every bf16 forward of the model is as far from every other as from fp32 (largest probability change per decision:
 median 0.004–0.005, 99th percentile 0.034–0.039), eager against itself in another packing included, and the flips are
 the near-ties that this noise tips. Without an error of its own, a forward agrees with eager bf16 as often as fp32 does
-(0.9905), so no kernel change brings `strix` to 99.5% against eager bf16; every flip has a reference top-two margin
-under 0.05. Two measurements show why:
+(0.9905), so no kernel change brings `strix` to 99.5% against eager bf16. Every flip of `strix` and of eager-packed has
+a reference top-two margin under 0.05 (largest 0.046 and 0.040); eager fp32 has one at 0.089. Two measurements show
+why:
 
 - **Most of `strix` already computes what eager does, bit for bit.** On basal-2.0's layer weights, its qkv, o and
   down matmuls, residual adds, FFN input and RMSNorm give the same outputs as the stock ops at 300, 700 and 2,000 rows,
