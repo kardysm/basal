@@ -1,15 +1,316 @@
 {
  "ref": "eager.jsonl",
  "dir": "/home/kardysm/strix-verify",
- "files": {},
+ "files": {
+  "eager-packed.jsonl": {
+   "decisions": 2000,
+   "flips": 18,
+   "agreement": 0.991,
+   "agreement_ci": [
+    0.9858178431626362,
+    0.99429954735366
+   ],
+   "flip_rate": 0.009,
+   "p_pass_1000": 0.1145950215244131,
+   "failed_cases": 0,
+   "bands": {
+    ">=0.10": {
+     "agree": 1769,
+     "of": 1769
+    },
+    "0.02-0.05": {
+     "agree": 63,
+     "of": 68
+    },
+    "0.05-0.10": {
+     "agree": 119,
+     "of": 119
+    },
+    "<0.02": {
+     "agree": 31,
+     "of": 44
+    }
+   },
+   "flip_ids": [
+    "agent_trace_observability_000003/risk",
+    "agent_trace_observability_000043/risk",
+    "agent_trace_observability_000054/needs_review",
+    "agent_trace_observability_000076/outcome",
+    "customer_service_000016/action",
+    "customer_service_000056/action",
+    "customer_service_000069/urgency",
+    "customer_service_000070/action",
+    "customer_service_000094/action",
+    "invoice_processing_000003/discrepancy_severity",
+    "invoice_processing_000004/discrepancy_severity",
+    "invoice_processing_000019/urgency",
+    "invoice_processing_000061/disposition",
+    "security_incidents_000021/urgency",
+    "security_incidents_000045/severity",
+    "security_incidents_000091/true_positive",
+    "security_incidents_000092/true_positive",
+    "security_incidents_000018/severity"
+   ]
+  },
+  "strix.jsonl": {
+   "decisions": 2000,
+   "flips": 20,
+   "agreement": 0.99,
+   "agreement_ci": [
+    0.9846039417177715,
+    0.9935172830337258
+   ],
+   "flip_rate": 0.01,
+   "p_pass_1000": 0.0661395116072514,
+   "failed_cases": 0,
+   "bands": {
+    ">=0.10": {
+     "agree": 1769,
+     "of": 1769
+    },
+    "0.02-0.05": {
+     "agree": 61,
+     "of": 68
+    },
+    "0.05-0.10": {
+     "agree": 119,
+     "of": 119
+    },
+    "<0.02": {
+     "agree": 31,
+     "of": 44
+    }
+   },
+   "flip_ids": [
+    "agent_trace_observability_000000/risk",
+    "agent_trace_observability_000003/risk",
+    "agent_trace_observability_000026/outcome",
+    "agent_trace_observability_000033/urgency",
+    "agent_trace_observability_000043/risk",
+    "agent_trace_observability_000052/action",
+    "customer_service_000004/urgency",
+    "customer_service_000016/action",
+    "customer_service_000056/action",
+    "customer_service_000091/urgency",
+    "invoice_processing_000004/discrepancy_severity",
+    "invoice_processing_000056/disposition",
+    "invoice_processing_000061/disposition",
+    "invoice_processing_000075/urgency",
+    "invoice_processing_000084/discrepancy_severity",
+    "security_incidents_000021/urgency",
+    "security_incidents_000022/disposition",
+    "security_incidents_000068/severity",
+    "security_incidents_000091/true_positive",
+    "security_incidents_000092/true_positive"
+   ]
+  },
+  "strix-c8.jsonl": {
+   "decisions": 2000,
+   "flips": 20,
+   "agreement": 0.99,
+   "agreement_ci": [
+    0.9846039417177715,
+    0.9935172830337258
+   ],
+   "flip_rate": 0.01,
+   "p_pass_1000": 0.0661395116072514,
+   "failed_cases": 0,
+   "bands": {
+    ">=0.10": {
+     "agree": 1769,
+     "of": 1769
+    },
+    "0.02-0.05": {
+     "agree": 61,
+     "of": 68
+    },
+    "0.05-0.10": {
+     "agree": 119,
+     "of": 119
+    },
+    "<0.02": {
+     "agree": 31,
+     "of": 44
+    }
+   },
+   "flip_ids": [
+    "agent_trace_observability_000000/risk",
+    "agent_trace_observability_000003/risk",
+    "agent_trace_observability_000026/outcome",
+    "agent_trace_observability_000033/urgency",
+    "agent_trace_observability_000043/risk",
+    "agent_trace_observability_000052/action",
+    "customer_service_000004/urgency",
+    "customer_service_000016/action",
+    "customer_service_000056/action",
+    "customer_service_000091/urgency",
+    "invoice_processing_000004/discrepancy_severity",
+    "invoice_processing_000056/disposition",
+    "invoice_processing_000061/disposition",
+    "invoice_processing_000075/urgency",
+    "invoice_processing_000084/discrepancy_severity",
+    "security_incidents_000021/urgency",
+    "security_incidents_000022/disposition",
+    "security_incidents_000068/severity",
+    "security_incidents_000091/true_positive",
+    "security_incidents_000092/true_positive"
+   ]
+  },
+  "strix-det-c8.jsonl": {
+   "decisions": 2000,
+   "flips": 20,
+   "agreement": 0.99,
+   "agreement_ci": [
+    0.9846039417177715,
+    0.9935172830337258
+   ],
+   "flip_rate": 0.01,
+   "p_pass_1000": 0.0661395116072514,
+   "failed_cases": 0,
+   "bands": {
+    ">=0.10": {
+     "agree": 1769,
+     "of": 1769
+    },
+    "0.02-0.05": {
+     "agree": 61,
+     "of": 68
+    },
+    "0.05-0.10": {
+     "agree": 119,
+     "of": 119
+    },
+    "<0.02": {
+     "agree": 31,
+     "of": 44
+    }
+   },
+   "flip_ids": [
+    "agent_trace_observability_000000/risk",
+    "agent_trace_observability_000003/risk",
+    "agent_trace_observability_000026/outcome",
+    "agent_trace_observability_000033/urgency",
+    "agent_trace_observability_000043/risk",
+    "agent_trace_observability_000052/action",
+    "customer_service_000004/urgency",
+    "customer_service_000016/action",
+    "customer_service_000056/action",
+    "customer_service_000091/urgency",
+    "invoice_processing_000004/discrepancy_severity",
+    "invoice_processing_000056/disposition",
+    "invoice_processing_000061/disposition",
+    "invoice_processing_000075/urgency",
+    "invoice_processing_000084/discrepancy_severity",
+    "security_incidents_000021/urgency",
+    "security_incidents_000022/disposition",
+    "security_incidents_000068/severity",
+    "security_incidents_000091/true_positive",
+    "security_incidents_000092/true_positive"
+   ]
+  },
+  "strix-ties.jsonl": {
+   "decisions": 2000,
+   "flips": 2,
+   "agreement": 0.999,
+   "agreement_ci": [
+    0.9963609898107715,
+    0.9997257268239166
+   ],
+   "flip_rate": 0.001,
+   "p_pass_1000": 0.9994119298982361,
+   "failed_cases": 0,
+   "bands": {
+    ">=0.10": {
+     "agree": 1769,
+     "of": 1769
+    },
+    "0.02-0.05": {
+     "agree": 66,
+     "of": 68
+    },
+    "0.05-0.10": {
+     "agree": 119,
+     "of": 119
+    },
+    "<0.02": {
+     "agree": 44,
+     "of": 44
+    }
+   },
+   "flip_ids": [
+    "customer_service_000056/action",
+    "invoice_processing_000004/discrepancy_severity"
+   ]
+  },
+  "strix-ties-c8.jsonl": {
+   "decisions": 2000,
+   "flips": 2,
+   "agreement": 0.999,
+   "agreement_ci": [
+    0.9963609898107715,
+    0.9997257268239166
+   ],
+   "flip_rate": 0.001,
+   "p_pass_1000": 0.9994119298982361,
+   "failed_cases": 0,
+   "bands": {
+    ">=0.10": {
+     "agree": 1769,
+     "of": 1769
+    },
+    "0.02-0.05": {
+     "agree": 66,
+     "of": 68
+    },
+    "0.05-0.10": {
+     "agree": 119,
+     "of": 119
+    },
+    "<0.02": {
+     "agree": 44,
+     "of": 44
+    }
+   },
+   "flip_ids": [
+    "customer_service_000056/action",
+    "invoice_processing_000004/discrepancy_severity"
+   ]
+  }
+ },
+ "decisions": 2000,
+ "cases": 400,
+ "G1": {
+  "F": 0.009,
+  "S": 0.01,
+  "verdict": "the bar is at or below the bf16 floor on this set: no packed bf16 engine passes reliably -> phase 2, then phase 5 (evidence)",
+  "p_pass_1000": 0.0661395116072514
+ },
  "G2": {
   "strix-c8.jsonl": {
+   "base": "strix.jsonl",
    "decisions": 2000,
    "decision_diffs": [],
    "probability_diffs": [],
    "passed": true
   },
   "strix-det-c8.jsonl": {
+   "base": "strix.jsonl",
+   "decisions": 2000,
+   "decision_diffs": [],
+   "probability_diffs": [],
+   "passed": true
+  },
+  "strix-ties-c8.jsonl": {
+   "base": "strix-ties.jsonl",
+   "decisions": 2000,
+   "decision_diffs": [],
+   "probability_diffs": [],
+   "passed": true
+  }
+ },
+ "EXACT": {
+  "strix-ties-all.jsonl": {
+   "base": "eager.jsonl",
    "decisions": 2000,
    "decision_diffs": [],
    "probability_diffs": [],

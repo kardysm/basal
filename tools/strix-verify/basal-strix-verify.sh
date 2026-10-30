@@ -8,6 +8,8 @@
 #   ./basal-strix-verify.sh setup          # phase 0: parity.py from the fork branch, cases-test.jsonl / cases-train.jsonl
 #   ./basal-strix-verify.sh all            # phase 1 on the test split: six configs, ~20-40 min of machine time
 #   TRAIN=1 ./basal-strix-verify.sh all    # adds the four train-split runs
+#   ./basal-strix-verify.sh ties           # --near-ties eager: strix-ties, strix-ties-c8 (8 in flight) and
+#                                          #   strix-ties-all (every decision through eager: must equal eager.jsonl)
 #   ./basal-strix-verify.sh gates          # pairwise.py (if present) + G1 / G2 from the answer files
 #   ./basal-strix-verify.sh status         # what is in $WORK
 #   ./basal-strix-verify.sh sdpa           # which SDPA kernel the eager reference really runs (one profiled forward)
@@ -110,6 +112,9 @@ set_conf() {  # name -> FLAGS, CONC
         strix)        CONC=1; FLAGS=(--mode strix) ;;
         strix-c8)     CONC=8; FLAGS=(--mode strix --wait-ms 2) ;;  # 2 ms: every forward holds several requests
         strix-det-c8) CONC=8; FLAGS=(--mode strix --deterministic) ;;
+        strix-ties)     CONC=1; FLAGS=(--mode strix --near-ties eager) ;;
+        strix-ties-c8)  CONC=8; FLAGS=(--mode strix --near-ties eager --wait-ms 2) ;;
+        strix-ties-all) CONC=1; FLAGS=(--mode strix --near-ties eager --near-tie-margin 1.01) ;;  # every decision
         *) return 1 ;;
     esac
 }
@@ -180,7 +185,7 @@ run_one() {  # name, split
 }
 
 cmd_run() {
-    [ $# -eq 1 ] || die "usage: $0 run eager|eager-fp32|eager-packed|strix|strix-c8|strix-det-c8"
+    [ $# -eq 1 ] || die "usage: $0 run eager|eager-fp32|eager-packed|strix|strix-c8|strix-det-c8|strix-ties|strix-ties-c8|strix-ties-all"
     check_env
     mkdir -p "$WORK/logs"
     run_one "$1" test
@@ -197,6 +202,14 @@ cmd_all() {
     say "answer files in $WORK -- now: $0 gates"
 }
 
+cmd_ties() {  # --near-ties eager on the test split
+    check_env
+    mkdir -p "$WORK/logs"
+    local n
+    for n in strix-ties strix-ties-c8 strix-ties-all; do run_one "$n" test; done
+    say "answer files in $WORK -- now: $0 gates"
+}
+
 # -- gates -------------------------------------------------------------------------------------------------------
 cmd_gates() {
     [ -x "$PY3" ] || die "need python3 for the gate tables"
@@ -205,11 +218,12 @@ cmd_gates() {
     local use_train=0
     if [ -s "$WORK/eager-train.jsonl" ]; then use_train=1; fi
     "$PY3" "$GATES" --dir "$WORK" --ref eager.jsonl \
-        eager-packed.jsonl strix.jsonl strix-c8.jsonl strix-det-c8.jsonl --json "$WORK/gates-bf16.json" || true
+        eager-packed.jsonl strix.jsonl strix-c8.jsonl strix-det-c8.jsonl strix-ties.jsonl strix-ties-c8.jsonl \
+        --json "$WORK/gates-bf16.json" || true
     if [ -s "$WORK/eager-fp32.jsonl" ]; then
         echo
         "$PY3" "$GATES" --dir "$WORK" --ref eager-fp32.jsonl \
-            eager.jsonl eager-packed.jsonl strix.jsonl --json "$WORK/gates-fp32.json" || true
+            eager.jsonl eager-packed.jsonl strix.jsonl strix-ties.jsonl --json "$WORK/gates-fp32.json" || true
     fi
     if [ "$use_train" = 1 ]; then
         echo
@@ -289,11 +303,12 @@ case "${1:-help}" in
     setup)  cmd_setup ;;
     run)    shift; cmd_run "$@" ;;
     all)    cmd_all ;;
+    ties)   cmd_ties ;;
     gates)  cmd_gates ;;
     status) cmd_status ;;
     sdpa)   cmd_sdpa ;;
     help|-h|--help)
         awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "${BASH_SOURCE[0]}" 
         ;;
-    *) die "unknown command $1 (check, setup, run <name>, all, gates, status, sdpa)" ;;
+    *) die "unknown command $1 (check, setup, run <name>, all, ties, gates, status, sdpa)" ;;
 esac

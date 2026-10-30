@@ -154,22 +154,26 @@ def main():
     else:
         print("G1  needs eager.jsonl, eager-packed.jsonl and strix.jsonl")
 
-    if (d / "strix.jsonl").exists():
-        base, bfail, _ = load(d / "strix.jsonl")
-        for name in ("strix-c8.jsonl", "strix-det-c8.jsonl"):
-            if not (d / name).exists():
-                continue
-            other, ofail, _ = load(d / name)
-            keys, dflips, pflips = compare(base, other)
-            ok = not dflips and not pflips and not bfail and not ofail and len(keys) == len(base) == len(other)
-            print(f"G2  {name} vs strix.jsonl: {len(keys)} decisions, {len(dflips)} answers differ, "
-                  f"{len(pflips)} same answer with different probabilities"
-                  + (f", failed cases {len(bfail)} / {len(ofail)}" if bfail or ofail else "")
-                  + f" -> {'PASS' if ok else 'FAIL'}")
-            out.setdefault("G2", {})[name] = dict(decisions=len(keys), decision_diffs=[label(k) for k in dflips[:50]],
-                                                  probability_diffs=[label(k) for k in pflips[:50]], passed=ok)
-    else:
+    if not (d / "strix.jsonl").exists():
         print("G2  needs strix.jsonl")
+    # identity checks, every probability equal: G2 = batched vs one at a time; EXACT = --near-ties eager with every
+    # decision computed again (--near-tie-margin 1.01) vs the eager reference
+    for tag, base_name, name in (("G2", "strix.jsonl", "strix-c8.jsonl"), ("G2", "strix.jsonl", "strix-det-c8.jsonl"),
+                                 ("G2", "strix-ties.jsonl", "strix-ties-c8.jsonl"),
+                                 ("EXACT", "eager.jsonl", "strix-ties-all.jsonl")):
+        if not ((d / base_name).exists() and (d / name).exists()):
+            continue
+        base, bfail, _ = load(d / base_name)
+        other, ofail, _ = load(d / name)
+        keys, dflips, pflips = compare(base, other)
+        ok = not dflips and not pflips and not bfail and not ofail and len(keys) == len(base) == len(other)
+        print(f"{tag:5s} {name} vs {base_name}: {len(keys)} decisions, {len(dflips)} answers differ, "
+              f"{len(pflips)} same answer with different probabilities"
+              + (f", failed cases {len(bfail)} / {len(ofail)}" if bfail or ofail else "")
+              + f" -> {'PASS' if ok else 'FAIL'}")
+        out.setdefault(tag, {})[name] = dict(base=base_name, decisions=len(keys),
+                                             decision_diffs=[label(k) for k in dflips[:50]],
+                                             probability_diffs=[label(k) for k in pflips[:50]], passed=ok)
 
     if a.json:
         Path(a.json).write_text(json.dumps(out, indent=1), encoding="utf-8")
