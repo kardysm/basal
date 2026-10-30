@@ -215,7 +215,20 @@ Every bf16 forward of the model is as far from every other as from fp32 (largest
 median 0.004–0.005, 99th percentile 0.034–0.039), eager against itself in another packing included, and the flips are
 the near-ties that this noise tips. Without an error of its own, a forward agrees with eager bf16 as often as fp32 does
 (0.9905), so no kernel change brings `strix` to 99.5% against eager bf16; every flip has a reference top-two margin
-under 0.05.
+under 0.05. Two measurements show why:
+
+- **Most of `strix` already computes what eager does, bit for bit.** On basal-2.0's layer weights, its qkv, o and
+  down matmuls, residual adds, FFN input and RMSNorm give the same outputs as the stock ops at 300, 700 and 2,000 rows,
+  except 0.01–0.21% of the outputs at some row counts (where hipBLASLt picks another kernel). Its attention differs in
+  36–39% (flash attention with bf16 weights against PyTorch's math kernel in fp32).
+- **Any difference grows to the full noise.** Moving one value by one bf16 step (element 0 of the first token after
+  the embedding) changes 17 of 2,000 decisions of `strix` against itself, as far as it is from eager bf16 (median
+  largest probability change 0.0044 against 0.0046).
+
+So `strix` would agree with eager bf16 beyond the floor only if every value of every layer were bit-identical to
+eager's: attention in fp32 the way the math kernel computes it, the state computed again for each question at each
+prompt's length (hipBLASLt's kernel changes with the row count), and the same PyTorch / ROCm build. That is eager's
+speed.
 
 `--near-ties eager` answers near-ties as eager bf16 does. A question (each label of a `multi`) whose calibrated
 top-two margin under `strix` is below `--near-tie-margin` (default 0.05) is computed again by the transformers forward
