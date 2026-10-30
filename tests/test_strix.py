@@ -59,15 +59,16 @@ def request(state, n_q, first=20):
 
 
 def packed(be, groups):
-    """Units of groups concatenated as one sequence: ids, positions, sub_end, and the ancestor mask of the packed
-    tries (GraphBackend's block mask, rows of different units see nothing of each other)."""
-    ids, pos, sub, seg_g, par_g, unit = [], [], [], [], [], []
+    """Units of groups concatenated as one sequence: ids, positions, sub_end, the ancestor mask of the packed
+    tries (GraphBackend's block mask, rows of different units see nothing of each other), and each unit's span."""
+    ids, pos, sub, seg_g, par_g, spans = [], [], [], [], [], []
     off = nb = 0
     for u, (pk, *_rest) in enumerate(be._units(groups)):
         t, pp, sg, last, par = pk
         ids += t; pos += pp; sub += be._sub_end(pk, off)
         seg_g += [nb + s for s in sg]
         par_g += [nb + p if p >= 0 else -1 for p in par]
+        spans.append((off, off + len(t)))
         off += len(t); nb += len(par)
     anc = torch.zeros(nb, nb, dtype=torch.bool)
     for b, p in enumerate(par_g):
@@ -77,7 +78,7 @@ def packed(be, groups):
     s = torch.tensor(seg_g)
     L = len(ids)
     mask = anc[s[:, None], s[None, :]] & torch.ones(L, L, dtype=torch.bool).tril()
-    return ids, pos, sub, mask
+    return ids, pos, sub, mask, spans
 
 
 def groups_mixed():
@@ -90,7 +91,7 @@ def groups_mixed():
 @gpu
 def test_interval_mask_is_the_block_mask(be):
     """k <= q < sub_end[k] (one lookup per key) equals the ancestor mask of the packed prefix tries."""
-    ids, pos, sub, mask = packed(be, groups_mixed())
+    ids, pos, sub, mask, _ = packed(be, groups_mixed())
     L = len(ids)
     q, k = torch.arange(L)[:, None], torch.arange(L)[None, :]
     assert torch.equal((k <= q) & (q < torch.tensor(sub)[None, :]), mask)
@@ -98,23 +99,24 @@ def test_interval_mask_is_the_block_mask(be):
 
 @gpu
 def test_attention_kernel_matches_masked_softmax(be):
-    ids, pos, sub, mask = packed(be, groups_mixed())
+    ids, pos, sub, mask, spans = packed(be, groups_mixed())
     L, H, KV, D = len(ids), be.H, be.KV, be.D
     torch.manual_seed(0)
     q = torch.randn(H, L, D, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(KV, L, D, device="cuda", dtype=torch.bfloat16)
     v = torch.randn(KV, L, D, device="cuda", dtype=torch.bfloat16)
     sub_t = torch.tensor(sub, device="cuda", dtype=torch.int32)
-    kmin, kmax = be._key_bounds(sub_t)
-    got = be._attention(q, k, v, sub_t, kmin, kmax).float()
+    kmin, kmax = be._key_bounds(sub_t, spans)
+    got = be._attention(q, k, v, sub_t, kmin, kmax, be._tiles(spans, range(L))).float()
     kk, vv = k.float().repeat_interleave(H // KV, 0), v.float().repeat_interleave(H // KV, 0)
     s = (q.float() @ kk.transpose(1, 2)) / D ** 0.5
     s = s.masked_fill(~mask.cuda()[None], float("-inf"))
     ref = (torch.softmax(s, -1) @ vv).transpose(0, 1).reshape(L, H * D)
     assert (got - ref).abs().max().item() < 2e-2
     # readout-only queries (the last layer): any ascending subset gives the same rows
-    tok = torch.tensor(sorted(random.Random(3).sample(range(L), 23)), device="cuda", dtype=torch.int32)
-    sel = be._attention(q, k, v, sub_t, kmin, kmax, tok=tok).float()
+    rows = sorted(random.Random(3).sample(range(L), 23))
+    tok = torch.tensor(rows, device="cuda", dtype=torch.int32)
+    sel = be._attention(q, k, v, sub_t, kmin, kmax, be._tiles(spans, rows), tok=tok).float()
     assert torch.equal(sel, got[tok.long()])
 
 
@@ -210,24 +212,17 @@ def causal(n):
     return (tokens(n), list(range(n)), [0] * n, [n - 1], [-1]), [7, 8], 0, 0
 
 
-def test_pack_chunk_puts_every_unit_in_whole_key_blocks():
-    """Packing: every unit starts on a multiple of the attention key-block size and is padded up to the next one, the
-    last unit too; padding sits at position 0, sees only itself (sub_end = own index + 1) and is never read out, and a
-    unit's own tokens keep the sub_end they have alone (off + n for a causal prompt)."""
+def test_pack_chunk_packs_units_back_to_back():
+    """Packing: units follow each other without padding, each with its span; a unit's own tokens keep the sub_end they
+    have alone, shifted by its start (start + n for a causal prompt)."""
     from basal.strix import StrixHaloFastBackend as B
-    bn = 32
     units = [causal(n) for n in (5, 7, 33)]
-    ids, pos, sub, reads = B._pack_chunk(units, [0, 1, 2], bn, 0)
-    starts = [0, 32, 64]
-    assert len(ids) == len(pos) == len(sub) == 128
-    assert reads == [s + n - 1 for s, n in zip(starts, (5, 7, 33))]
-    real = {i for s, n in zip(starts, (5, 7, 33)) for i in range(s, s + n)}
-    for s, n in zip(starts, (5, 7, 33)):
-        assert sub[s: s + n] == [s + n] * n
-    for i, v in enumerate(sub):
-        if i not in real:  # padding
-            assert v == i + 1 and pos[i] == 0 and ids[i] == 0
-    assert set(reads) <= real
+    ids, pos, sub, reads, spans = B._pack_chunk(units, [0, 1, 2])
+    assert spans == [(0, 5), (5, 12), (12, 45)]
+    assert len(ids) == len(pos) == len(sub) == 45
+    assert reads == [e - 1 for _, e in spans]
+    for s, e in spans:
+        assert sub[s:e] == [e] * (e - s) and pos[s:e] == list(range(e - s))
 
 
 def branched(n):
@@ -241,70 +236,80 @@ def branched(n):
 @pytest.mark.parametrize("place", [0, 1, 2])
 @pytest.mark.parametrize("n", [5, 31, 32, 33, 100])
 def test_a_unit_packs_the_same_alone_and_next_to_others(n, place, kind):
-    """The region a unit occupies (its tokens and the padding after it, whole key blocks) holds the same ids,
-    positions, sub_end and readout rows (relative to its start) alone and first, in the middle or last among other
-    units, so in every full-length layer the attention kernel computes its rows from the same data in the same blocks.
-    Before the trailing padding, a unit that ended the sequence alone had its last blocks cut short, and on the 8060S
-    its last row then came out one bf16 step apart from the same unit followed by padding (19 of 351 batched requests
-    of the typed-decisions test split)."""
+    """A unit holds the same ids, positions, sub_end and readout rows (relative to its start) alone and first, in the
+    middle or last among other units, and its span is where it sits."""
     from basal.strix import StrixHaloFastBackend as B
     units = [causal(13), causal(40)]
     units.insert(place, kind(n))
-    alone = B._pack_chunk(units, [place], 32, 0)
-    ids, pos, sub, reads = B._pack_chunk(units, [0, 1, 2], 32, 0)
-    s = sum(-(-len(u[0][0]) // 32) * 32 for u in units[:place])
+    alone = B._pack_chunk(units, [place])
+    ids, pos, sub, reads, spans = B._pack_chunk(units, [0, 1, 2])
+    s = sum(len(u[0][0]) for u in units[:place])
     r = sum(len(u[0][3]) for u in units[:place])
     w = len(alone[0])
-    assert w % 32 == 0
+    assert alone[4] == [(0, w)] and spans[place] == (s, s + w)
     assert ids[s: s + w] == alone[0] and pos[s: s + w] == alone[1]
     assert [x - s for x in sub[s: s + w]] == alone[2]
     assert [x - s for x in reads[r: r + len(alone[3])]] == alone[3]
 
 
 @pytest.mark.parametrize("budget", [64, 100, 200])
-def test_chunks_stay_within_the_budget_including_padding(budget):
-    """The chunk budget counts the alignment padding: every chunk packs to exactly the units' sizes rounded up to whole
-    key blocks, and a chunk of several units to at most TOKEN_BUDGET tokens (a unit too long on its own still goes
-    alone)."""
+def test_chunks_stay_within_the_budget(budget):
+    """Every chunk packs to exactly its units' tokens, a chunk of several units to at most TOKEN_BUDGET tokens (a unit
+    too long on its own still goes alone)."""
     from basal.strix import StrixHaloFastBackend as B
-    fake = SimpleNamespace(ATTN={"BN": 32}, TOKEN_BUDGET=budget)
+    fake = SimpleNamespace(TOKEN_BUDGET=budget)
     units = [causal(n) for n in (5, 7, 33, 40, 61, 90)]
     chunks = B._chunks_tok(fake, units)
     assert len(chunks) > 1
     for idx in chunks:
-        n = len(B._pack_chunk(units, idx, 32, 0)[0])
-        assert n == sum(-(-len(units[k][0][0]) // 32) * 32 for k in idx)
+        n = len(B._pack_chunk(units, idx)[0])
+        assert n == sum(len(units[k][0][0]) for k in idx)
         if len(idx) > 1:
             assert n <= budget
 
 
 @gpu
-@pytest.mark.parametrize("blocks", [1, 3, 10])
-def test_attention_ignores_an_aligned_prefix(be, blocks):
-    """The kernel's own invariance, and the one the packing relies on: a tree placed after an aligned prefix of other
-    rows gives bit-identical rows, full rows and the last layer's readout-only rows. (A tree starting mid-block does
-    not: that is why units are padded.)"""
-    torch.manual_seed(blocks)
-    n, P, H, KV, D = 96, blocks * be.ATTN["BN"], be.H, be.KV, be.D
-    q = torch.randn(H, P + n, D, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(KV, P + n, D, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(KV, P + n, D, device="cuda", dtype=torch.bfloat16)
-    sub = torch.tensor([i + 1 for i in range(P)] + [P + n] * n, device="cuda", dtype=torch.int32)
-    alone_sub = torch.tensor([n] * n, device="cuda", dtype=torch.int32)
-    kmin, kmax = be._key_bounds(sub)
-    akmin, akmax = be._key_bounds(alone_sub)
-    aq, ak, av = q[:, P:].contiguous(), k[:, P:].contiguous(), v[:, P:].contiguous()
-    assert torch.equal(be._attention(q, k, v, sub, kmin, kmax)[P:], be._attention(aq, ak, av, alone_sub, akmin, akmax))
-    tok = torch.tensor(sorted(random.Random(blocks).sample(range(P, P + n), 17)), device="cuda", dtype=torch.int32)
-    assert torch.equal(be._attention(q, k, v, sub, kmin, kmax, tok=tok),
-                       be._attention(aq, ak, av, alone_sub, akmin, akmax, tok=(tok - P).to(torch.int32)))
+@pytest.mark.parametrize("kind", [causal, branched])
+@pytest.mark.parametrize("before, after", [(1, 0), (8, 0), (31, 5), (33, 0), (100, 37), (0, 13), (0, 32)])
+def test_attention_of_a_unit_ignores_the_others(be, kind, before, after):
+    """The kernel's batch invariance: a unit placed after a unit of `before` tokens and before one of `after` (any
+    lengths, mid-block too) gives bit-identical rows to the unit alone, full rows and the last layer's readout-only
+    rows. Its query tiles and key blocks start at its first token and keys past its end load as zeros, as alone. (With
+    key blocks aligned to the whole sequence, 11-16% of the outputs of a unit starting mid-block were one bf16 step
+    apart on the 8060S.)"""
+    from basal.strix import StrixHaloFastBackend as B
+    torch.manual_seed(before * 100 + after)
+    target = kind(96)
+    units = ([causal(before)] if before else []) + [target] + ([causal(after)] if after else [])
+    _, _, sub, reads, spans = B._pack_chunk(units, list(range(len(units))))
+    _, _, asub, areads, aspans = B._pack_chunk([target], [0])
+    s, e = spans[1 if before else 0]
+    L, n, H, KV, D = len(sub), e - s, be.H, be.KV, be.D
+    q = torch.randn(H, L, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(KV, L, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(KV, L, D, device="cuda", dtype=torch.bfloat16)
+    sub = torch.tensor(sub, device="cuda", dtype=torch.int32)
+    asub = torch.tensor(asub, device="cuda", dtype=torch.int32)
+    aq, ak, av = q[:, s:e].contiguous(), k[:, s:e].contiguous(), v[:, s:e].contiguous()
+    kb, akb = be._key_bounds(sub, spans), be._key_bounds(asub, aspans)
+    full = be._attention(q, k, v, sub, *kb, be._tiles(spans, range(L)))
+    assert torch.equal(full[s:e], be._attention(aq, ak, av, asub, *akb, be._tiles(aspans, range(n))))
+    rows = sorted(random.Random(before).sample(range(s, e), 17) + [r for r in reads if not s <= r < e])
+    mine = [i for i, r in enumerate(rows) if s <= r < e]
+    got = be._attention(q, k, v, sub, *kb, be._tiles(spans, rows), tok=torch.tensor(rows, device="cuda",
+                                                                                    dtype=torch.int32))
+    arows = [rows[i] - s for i in mine]
+    alone = be._attention(aq, ak, av, asub, *akb, be._tiles(aspans, arows), tok=torch.tensor(arows, device="cuda",
+                                                                                            dtype=torch.int32))
+    assert torch.equal(got[mine], alone)
 
 
 @gpu
 @pytest.mark.parametrize("others", [(37,), (13, 71), (7, 33, 101)])
 def test_batched_request_equals_alone(be, others):
     """A request's probabilities are bit-identical alone and in one run_shared call after one to three requests whose
-    lengths are not multiples of the key-block size: the padding in _pack_chunk is what makes this hold."""
+    lengths are not multiples of the key-block size, so that it starts mid-block: the attention kernel keeps to its own
+    tiles and key blocks."""
     random.seed(11)
     state = [random.randrange(2, 60) for _ in range(60)]
     target = request(state, 1)
@@ -314,11 +319,10 @@ def test_batched_request_equals_alone(be, others):
     assert len(chunks) == 1
     start, off = None, 0
     for k in chunks[0]:
-        off += (-off) % be.ATTN["BN"]
         if units[k][2] == len(others):
             start = off
         off += len(units[k][0][0])
-    assert start and start % be.ATTN["BN"] == 0, "the request under test must not be the first unit"
+    assert start and start % be.ATTN["BN"], "the request under test must start mid-block, not first"
     alone = be.run_shared([target])[0][0]
     together = be.run_shared(groups)[-1][0]
     assert torch.equal(torch.tensor(alone), torch.tensor(together))
@@ -328,7 +332,7 @@ def test_batched_request_equals_alone(be, others):
 @pytest.mark.parametrize("extra", [(37,), (13, 71)])
 def test_first_request_equals_alone(be, extra):
     """The first request of a forward (offset 0, five questions) answers bit-identically alone and before one or two
-    longer requests: its last rows are followed by padding either way."""
+    longer requests: the keys after its end load as zeros either way, and no query tile reaches past it."""
     random.seed(12)
     state = [random.randrange(2, 60) for _ in range(61)]
     target = request(state, 5)

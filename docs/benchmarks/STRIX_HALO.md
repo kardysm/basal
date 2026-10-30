@@ -58,6 +58,14 @@ reaches 16–19 useful TFLOPS at every request size. GPU time by operation, from
   every query sees run without a mask, so a packed row costs what a causal row of the same length costs. Rows of
   several requests are separate trees of one sequence: no padding, no captured shapes, no graphs, up to 16,384 tokens
   per forward; longer requests are bisected like in GraphBackend.
+- **A request's answers do not depend on what shares its forward.** The attention kernel keeps to each request (each
+  packed unit): its query tiles never cross one, its key blocks of 32 start at the unit's first token, and keys past
+  the unit's end load as zeros, so every block is the one the unit has alone. Engine 2.4.1 and earlier aligned the key
+  blocks to the whole sequence: a request packed after others had its keys split differently, and 11–16% of its
+  attention outputs came out one bf16 step apart. On the typed-decisions test split (2,000 decisions), 8 requests in
+  flight then changed 13 decisions against one at a time, and the probabilities of 1,468 (by up to 0.09); now none,
+  and a request alone gets exactly the answers of 2.4.1. Speed is unchanged (interleaved A/B against 2.4.1, S to XL
+  with 1–20 questions: 0.99–1.00×; 32 clients 18.5 → 18.9 decisions/s). `--deterministic` is not needed for this.
 - The last layer computes attention, o and the FFN for the readout rows only.
 - Rounding follows the stock bf16 forward step by step (RMSNorm in fp32 then the weight in bf16, rotary as
   round(q cos) + round(rot(q) sin), silu(gate) and its product with up rounded to bf16, bias then residual each
@@ -219,9 +227,9 @@ questions keep `strix`'s answers. On the test split:
 - With `--near-tie-margin 1.01` every decision is computed again, and all 2,000 equal the eager bf16 reference with
   every probability: the questions it computes again get exactly eager's answer.
 - 8 requests in flight give the same answers as one at a time, every probability.
-- Cost: eager takes 7.4× `strix`'s time per decision, so the server time grows 1.42× (1.39× with 8 in flight); a
-  request with a near tie waits 0.48 s longer (median; at most 1.2 s), the median request 9 ms. No second copy of the
-  weights: the stock modules share `strix`'s.
+- Cost: eager takes 7.4× `strix`'s time per decision, so the server time grows 1.39–1.42× (two runs, one at a time
+  and 8 in flight); a request with a near tie waits 0.48 s longer (median; at most 1.2 s), the median request 9–15
+  ms. No second copy of the weights: the stock modules share `strix`'s.
 - Against fp32 it agrees less (0.9915 vs 0.9935): the near-ties now carry eager bf16's own rounding.
 
 Off by default. It exists for checks against `--mode eager` bf16; against fp32, plain `strix` is closer.

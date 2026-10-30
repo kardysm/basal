@@ -19,12 +19,12 @@ The last layer runs attention, o and the FFN for the readout rows only. q, k and
 concatenated at start-up; the Hugging Face modules keep views of them, so the evidence head still runs the stock
 model). Rounding follows the Hugging Face bf16 forward step by step (RMSNorm in fp32 then the weight in bf16, rotary as
 round(q cos) + round(rot(q) sin), silu(gate) and its product with up rounded to bf16, bias then residual each rounded),
-so answers match the other bf16 engines. Every packed row of a chunk is one sequence (no shapes, no graphs): rows of
-different requests are separate trees of the same interval mask. Every unit fills whole key blocks of the attention
-kernel (it starts on a block boundary and padding follows it up to the next one), so in every full-length layer its
-rows are computed from the same data in the same blocks alone or next to other requests. In the last layer its readout
-rows can share a query tile with another unit's; the blocks that adds or drops are fully masked for them. Its answers
-do not depend on what else shares the forward (docs/benchmarks/STRIX_HALO.md)."""
+so answers match the other bf16 engines. Every packed row of a chunk is one sequence (no padding, no shapes, no
+graphs): rows of different requests are separate trees of the same interval mask. The attention kernel keeps to each
+unit: its query tiles never cross one, its key blocks start at the unit's first token, and keys past the unit's end
+load as zeros. So in every layer a unit's rows are computed from the same data in the same blocks alone or next to
+other requests, and its answers do not depend on what else shares the forward (docs/benchmarks/STRIX_HALO.md)."""
+import bisect
 import math
 import time
 
@@ -40,40 +40,50 @@ from .prompt import PREFILL
 
 # -- kernels -------------------------------------------------------------------------------------------------------
 @triton.jit
-def _attn_fwd(Q, K, V, O, SUB, KMIN, KMAX, TOK, L, NQ, som, scale,
+def _attn_fwd(Q, K, V, O, SUB, KMIN, KMAX, TOK, TILES, L, som, scale,
               HPG: tl.constexpr, D: tl.constexpr, BT: tl.constexpr, BN: tl.constexpr, GATHER: tl.constexpr):
-    """One program = BT query tokens x the HPG query heads of one kv head (GQA packed: each key / value tile is
-    loaded once for the whole group). Q [H, L, D], K / V [KV, L, D] head-major; O [NQ, H * D]. GATHER: the query
-    tokens are TOK[0:NQ] (ascending), else 0..L-1."""
+    """One program = one query tile (at most BT query rows of one unit) x the HPG query heads of one kv head (GQA
+    packed: each key / value tile is loaded once for the whole group). Q [H, L, D], K / V [KV, L, D] head-major;
+    O [rows, H * D]. TILES [tiles, 5]: the tile's first and end row, its unit's first and end token, and the index of
+    the unit's first key block in KMIN / KMAX. The rows are the tokens 0..L-1, or with GATHER the tokens TOK[rows]
+    (ascending). Key blocks start at the unit's first token and keys past its end load as zeros, as for the unit alone
+    at the start of a sequence of its own length: every value and every branch below is then the same alone and next
+    to other units, shifted by the unit's start."""
     pid_t = tl.program_id(0)
     kvh = tl.program_id(1)
+    t0 = tl.load(TILES + pid_t * 5)
+    t1 = tl.load(TILES + pid_t * 5 + 1)
+    us = tl.load(TILES + pid_t * 5 + 2)
+    ue = tl.load(TILES + pid_t * 5 + 3)
+    ub = tl.load(TILES + pid_t * 5 + 4)
     R: tl.constexpr = BT * HPG
     r = tl.arange(0, R)
     head = kvh * HPG + r // BT
-    qi = pid_t * BT + r % BT  # query index (row of O)
-    live = qi < NQ
+    qi = t0 + r % BT  # row of O
+    live = qi < t1
     if GATHER:
         tok = tl.load(TOK + qi, mask=live, other=0)
-        q0 = tl.load(TOK + pid_t * BT)
-        q_last = tl.load(TOK + tl.minimum(pid_t * BT + BT, NQ) - 1)
+        q0 = tl.load(TOK + t0)
+        q_last = tl.load(TOK + t1 - 1)
     else:
         tok = qi
-        q0 = pid_t * BT
-        q_last = tl.minimum(q0 + BT, L) - 1
+        q0 = t0
+        q_last = t1 - 1
     rd = tl.arange(0, D)
     q = tl.load(Q + (head[:, None] * L + tok[:, None]) * D + rd[None, :], mask=live[:, None], other=0.0)
     m_i = tl.full((R,), float("-inf"), tl.float32)
     l_i = tl.zeros((R,), tl.float32)
     acc = tl.zeros((R, D), tl.float32)
     qs = scale * 1.4426950408889634  # exp2 below
-    for k0 in range(0, q_last + 1, BN):  # causal: no key after the block's last query
-        kb = k0 // BN
+    for k0 in range(us, q_last + 1, BN):  # the unit's keys; causal: none after the tile's last query
+        kb = ub + (k0 - us) // BN
         if tl.load(KMAX + kb) > q0:  # some key of the block is still visible to some query of this block
             rn = k0 + tl.arange(0, BN)
-            k = tl.load(K + (kvh * L + rn[None, :]) * D + rd[:, None], mask=rn[None, :] < L, other=0.0)
+            kin = rn < ue  # the unit's own keys
+            k = tl.load(K + (kvh * L + rn[None, :]) * D + rd[:, None], mask=kin[None, :], other=0.0)
             s = tl.dot(q, k) * qs
             if ((k0 + BN - 1) > q0) | (tl.load(KMIN + kb) <= q_last) | GATHER:  # not all keys visible to all
-                se = tl.load(SUB + rn, mask=rn < L, other=0)
+                se = tl.load(SUB + rn, mask=kin, other=0)
                 vis = (rn[None, :] <= tok[:, None]) & (tok[:, None] < se[None, :])
                 s = tl.where(vis, s, float("-inf"))
             m_new = tl.maximum(m_i, tl.max(s, 1))
@@ -84,7 +94,7 @@ def _attn_fwd(Q, K, V, O, SUB, KMIN, KMAX, TOK, L, NQ, som, scale,
             alpha = tl.exp2(m_i - m_use)
             l_i = l_i * alpha + tl.sum(p, 1)
             acc = acc * alpha[:, None]
-            v = tl.load(V + (kvh * L + rn[:, None]) * D + rd[None, :], mask=rn[:, None] < L, other=0.0)
+            v = tl.load(V + (kvh * L + rn[:, None]) * D + rd[None, :], mask=kin[:, None], other=0.0)
             acc += tl.dot(p.to(v.dtype), v)
             m_i = m_new
     acc = acc / l_i[:, None]
@@ -195,8 +205,8 @@ class StrixHaloFastBackend(GraphBackend):
     """`--mode strix` (see the module docstring). Rows of one chunk are concatenated into a single sequence of at
     most TOKEN_BUDGET tokens; a packed row longer than that is bisected like in GraphBackend (exact). A single prompt
     longer than that runs alone in one forward, as GraphBackend runs one past its largest graph (the server keeps
-    prompts within the model's context; activations grow linearly, attention memory does not grow with length). Every
-    unit fills whole key blocks of the attention kernel (see `_pack_chunk`)."""
+    prompts within the model's context; activations grow linearly, attention memory does not grow with length). The
+    attention kernel keeps to each unit's query tiles and key blocks (_key_bounds, _tiles)."""
 
     streams, inflight = False, 1  # its own run_shared: no early readouts, one call at a time
     TOKEN_BUDGET = 16384  # tokens per forward (the GGUF context): ~0.4 GB of FFN activations
@@ -318,12 +328,14 @@ class StrixHaloFastBackend(GraphBackend):
         return rows
 
     def _warm_row(self, L, nq):
-        """Inputs of `forward` for one packed row of L tokens and its last nq tokens read out: causal sequences of
-        at most the context each (positions within the rotary tables), token ids within the vocabulary."""
+        """Inputs of `forward` for one packed row of L tokens and its last nq tokens read out: causal sequences (units)
+        of at most the context each (positions within the rotary tables), token ids within the vocabulary."""
         i = torch.arange(L, device=self.dev)
         P = self.cos.shape[0]
         ends = torch.clamp((i // P + 1) * P, max=L)
-        return (i + 1000) % self.embed.shape[0], (i % P).to(torch.int32), ends.to(torch.int32), i[L - nq:]
+        spans = [(a, min(a + P, L)) for a in range(0, L, P)]
+        return ((i + 1000) % self.embed.shape[0], (i % P).to(torch.int32), ends.to(torch.int32),
+                list(range(L - nq, L)), spans)
 
     @torch.no_grad()
     def _warm_shapes(self):
@@ -357,37 +369,26 @@ class StrixHaloFastBackend(GraphBackend):
         return len(pack[0]) > self.TOKEN_BUDGET
 
     def _chunks_tok(self, units):
-        """Units sorted by length, cut into chunks of at most TOKEN_BUDGET tokens, each unit counted with the padding
-        that rounds it up to whole key blocks (see _pack_chunk)."""
-        bn = self.ATTN["BN"]
+        """Units sorted by length, cut into chunks of at most TOKEN_BUDGET tokens."""
         out, cur, n = [], [], 0
         for k in sorted(range(len(units)), key=lambda k: len(units[k][0][0])):
-            t = -(-len(units[k][0][0]) // bn) * bn
+            t = len(units[k][0][0])
             if cur and n + t > self.TOKEN_BUDGET:
                 out.append(cur); cur, n = [], 0
             cur.append(k); n += t
         return out + ([cur] if cur else [])
 
     @staticmethod
-    def _pack_chunk(units, idx, bn, pad_id):
-        """Units -> one packed sequence: ids, positions, sub_end per token, readout rows. Every unit fills whole blocks
-        of bn tokens, the attention kernel's key-block size: it starts on a multiple of bn and up to bn - 1 pad tokens
-        follow it, after the last unit too. In every full-length layer its rows then see the same keys in the same
-        blocks, next to the same padding, alone or with others. Padding only between units is not enough: a unit that
-        ends the sequence has its last blocks cut at the end, and its last rows came out one bf16 step apart from the
-        same unit followed by padding (8060S, Triton 3.7). Pad tokens sit at position 0, each visible only to itself
-        (sub_end = its own index + 1, so its softmax is not empty), and are never read out."""
-        ids, pos, sub, reads, off = [], [], [], [], 0
+    def _pack_chunk(units, idx):
+        """Units -> one packed sequence, back to back: ids, positions, sub_end per token, readout rows, and the
+        (start, end) of every unit, which the attention kernel keeps to (_key_bounds, _tiles)."""
+        ids, pos, sub, reads, spans, off = [], [], [], [], [], 0
         for k in idx:
             t, pp, sg, last, par = pk = units[k][0]
             ids += t; pos += pp; sub += StrixHaloFastBackend._sub_end(pk, off); reads += [off + i for i in last]
+            spans.append((off, off + len(t)))
             off += len(t)
-            n = -off % bn
-            ids += [pad_id] * n
-            pos += [0] * n
-            sub += [off + i + 1 for i in range(n)]
-            off += n
-        return ids, pos, sub, reads
+        return ids, pos, sub, reads, spans
 
     @staticmethod
     def _sub_end(pack, off):
@@ -413,26 +414,51 @@ class StrixHaloFastBackend(GraphBackend):
                                num_warps=1)
         return q, k, v
 
-    def _key_bounds(self, sub):
-        """Smallest and largest sub_end of every key block of the attention kernel: blocks no query of a query block
-        can see are skipped, blocks every query sees run without a mask."""
-        BN = self.ATTN["BN"]
-        nb = triton.cdiv(sub.shape[0], BN)
-        pad = nb * BN - sub.shape[0]
-        kmin = F.pad(sub, (0, pad), value=2 ** 30).view(nb, BN).amin(1).contiguous()
-        kmax = F.pad(sub, (0, pad), value=0).view(nb, BN).amax(1).contiguous()
-        return kmin, kmax
+    def _blocks(self, spans):
+        """Index of every unit's first key block: a unit's key blocks start at its first token, BN keys each, the last
+        one cut at its end -> (first block per unit, number of blocks)."""
+        BN, first, n = self.ATTN["BN"], [], 0
+        for s, e in spans:
+            first.append(n)
+            n += -(-(e - s) // BN)
+        return first, n
 
-    def _attention(self, q, k, v, sub, kmin, kmax, tok=None):
-        """Attention of every token (tok None) or of the query tokens tok (ascending) -> [n, H * D]."""
+    def _key_bounds(self, sub, spans):
+        """Smallest and largest sub_end of every key block of every unit (_blocks): blocks no query of a query tile can
+        see are skipped, blocks every query sees run without a mask. The keys past a unit's end count as they do for
+        the unit alone at the end of a sequence (2 ** 30 for the smallest, 0 for the largest)."""
+        BN, dev = self.ATTN["BN"], sub.device
+        first, nb = self._blocks(spans)
+        lens = torch.tensor([e - s for s, e in spans], device=dev)
+        shift = torch.tensor([b * BN - s for (s, _), b in zip(spans, first)], device=dev)
+        slot = torch.arange(sub.shape[0], device=dev) + torch.repeat_interleave(shift, lens, output_size=sub.shape[0])
+        kmin = torch.full((nb * BN,), 2 ** 30, device=dev, dtype=sub.dtype).scatter_(0, slot, sub)
+        kmax = torch.zeros(nb * BN, device=dev, dtype=sub.dtype).scatter_(0, slot, sub)
+        return kmin.view(nb, BN).amin(1).contiguous(), kmax.view(nb, BN).amax(1).contiguous()
+
+    def _tiles(self, spans, rows):
+        """Query tiles of the attention kernel: rows (ascending tokens) -> int32 [tiles, 5] (first row, end row, unit
+        start, unit end, the unit's first key block), rows counted as indices into `rows`. A tile never crosses a unit,
+        and each unit's tiles start at its first row, BT rows each, as for the unit alone."""
+        BT = self.ATTN["BT"]
+        first, _ = self._blocks(spans)
+        out = []
+        for (s, e), b in zip(spans, first):
+            lo, hi = bisect.bisect_left(rows, s), bisect.bisect_left(rows, e)
+            out += [(a, min(a + BT, hi), s, e, b) for a in range(lo, hi, BT)]
+        return torch.tensor(out, device=self.dev, dtype=torch.int32).view(-1, 5)
+
+    def _attention(self, q, k, v, sub, kmin, kmax, tiles, tok=None):
+        """Attention of every token (tok None) or of the query tokens tok (ascending), in the query tiles `tiles`
+        (_tiles of 0..L-1 or of tok) -> [n, H * D]."""
         H, L, D = q.shape
         n = L if tok is None else tok.shape[0]
         o = torch.empty(n, H * D, device=q.device, dtype=q.dtype)
         c = self.ATTN
-        _attn_fwd[(triton.cdiv(n, c["BT"]), self.KV)](q, k, v, o, sub, kmin, kmax, tok if tok is not None else sub,
-                                                      L, n, o.stride(0), 1.0 / math.sqrt(D), HPG=H // self.KV, D=D,
-                                                      BT=c["BT"], BN=c["BN"], GATHER=tok is not None,
-                                                      num_warps=c["num_warps"], num_stages=c["num_stages"])
+        _attn_fwd[(tiles.shape[0], self.KV)](q, k, v, o, sub, kmin, kmax, tok if tok is not None else sub, tiles,
+                                             L, o.stride(0), 1.0 / math.sqrt(D), HPG=H // self.KV, D=D,
+                                             BT=c["BT"], BN=c["BN"], GATHER=tok is not None,
+                                             num_warps=c["num_warps"], num_stages=c["num_stages"])
         return o
 
     def _ffn_in(self, x, wg, bg, wu, bu):
@@ -464,20 +490,23 @@ class StrixHaloFastBackend(GraphBackend):
         return x
 
     @torch.no_grad()
-    def forward(self, ids, pos, sub, reads):
-        """One sequence of packed rows -> final-normalised hidden states at the readout rows. The last layer runs
+    def forward(self, ids, pos, sub, reads, spans):
+        """One sequence of packed rows -> final-normalised hidden states at the readout rows (a list of token
+        indices). spans: the (start, end) of every unit, in order, covering the sequence. The last layer runs
         attention, o and the FFN for the readout rows only (nothing else reads its output)."""
-        kmin, kmax = self._key_bounds(sub)
+        kmin, kmax = self._key_bounds(sub, spans)
+        tiles, rtiles = self._tiles(spans, range(ids.shape[0])), self._tiles(spans, sorted(reads))
+        reads = torch.tensor(reads, device=self.dev)
         h = F.embedding(ids, self.embed)
         x = self._norm(h, self.layers[0][0])
         n = len(self.layers)
         for i, (_, wqkv, bqkv, wo, bo, ln2, wg, bg, wu, bu, wd, bd) in enumerate(self.layers):
             q, k, v = self._qkv_heads(self._linear("qkv", x, wqkv, bqkv), pos)
             if i + 1 < n:
-                a = self._attention(q, k, v, sub, kmin, kmax)
+                a = self._attention(q, k, v, sub, kmin, kmax, tiles)
             else:  # last layer: readout rows only (sorted for the attention kernel)
                 rs, order = torch.sort(reads)
-                a = self._attention(q, k, v, sub, kmin, kmax, tok=rs.to(torch.int32))
+                a = self._attention(q, k, v, sub, kmin, kmax, rtiles, tok=rs.to(torch.int32))
                 h = h[rs]
             x = self._norm(self._linear("o", a, wo, bo, h), ln2)  # h += o_proj(a)
             g = self._ffn_in(x, wg, bg, wu, bu)
@@ -503,13 +532,13 @@ class StrixHaloFastBackend(GraphBackend):
         units = self._units(groups)
         probs = [None] * len(units)
         for idx in self._chunks_tok(units):
-            ids, pos, sub, reads = self._pack_chunk(units, idx, self.ATTN["BN"], self.tok.pad_token_id)
+            ids, pos, sub, reads, spans = self._pack_chunk(units, idx)
             if max(pos) >= self.cos.shape[0]:
                 raise ValueError(f"prompt too long for --mode strix: position {max(pos)}, the model has "
                                  f"{self.cos.shape[0]}")
             dev = self.dev
             h = self.forward(torch.tensor(ids, device=dev), torch.tensor(pos, device=dev, dtype=torch.int32),
-                             torch.tensor(sub, device=dev, dtype=torch.int32), torch.tensor(reads, device=dev))
+                             torch.tensor(sub, device=dev, dtype=torch.int32), reads, spans)
             self._wait()
             pr = self._readout(h, [x for k in idx for x in units[k][1]])
             j = 0
