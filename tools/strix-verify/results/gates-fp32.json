@@ -1,6 +1,6 @@
 {
  "ref": "eager-fp32.jsonl",
- "dir": "/home/kardysm/strix-verify",
+ "dir": ".",
  "files": {
   "eager.jsonl": {
    "decisions": 2000,

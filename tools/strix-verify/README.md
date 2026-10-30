@@ -1,8 +1,35 @@
-# strix phase 2 on the 8060S: findings (2026-10-28)
+# strix phase 2 on the 8060S: findings (2026-10-28 to 2026-10-30)
 
 Verification of `basal-strix-phase2-padding.patch` (phase 2 of `basal-strix-verified-plan.md`) on the box it was
 written for: AMD Radeon 8060S, torch 2.12.0+rocm7.2, Triton 3.7.0, basal-2.0-4.5B, code `strix-warm-shapes` @ 7f4628f
 plus the patch.
+
+**Current state (2026-10-30): the padding is gone.** It cost 7.5% at 32 clients; the attention kernel now keeps to
+each unit instead (section "Unit tiles" below): batch-invariant at no measurable cost. The sections from "Result" to
+"Review" describe the padding version (commit aaa07a5) and why padding between units alone was not enough; the
+`experiments/` scripts call that version's API.
+
+## Unit tiles instead of padding (2026-10-30)
+
+Each query tile of the attention kernel stays inside one unit and walks the unit's own key blocks, starting at its
+first token; keys past its end load as zeros (`TILES` rows: first / end row, unit start / end, the unit's first block
+in KMIN / KMAX, which are per unit block). That is the configuration of the unit alone, shifted by its start, in every
+layer, the last one's readout tiles included: the padding's two problems (key blocks aligned to the sequence, a
+unit's end inside a shared block) cannot occur.
+
+| check (test split, 2,000 decisions) | 7f4628f (2.4.1 + warm-up) | padding (aaa07a5) | unit tiles |
+|---|---|---|---|
+| 8 in flight vs one at a time | **13 decisions and 1,468 probabilities differ** (max \|Δp\| 0.09) | 0 differ | **0 differ** (`--deterministic` 8 in flight too) |
+| one at a time vs 7f4628f | | 28 probabilities differ | **identical** |
+| `--near-ties eager` vs eager bf16 | | 0.9990 | 0.9990 (G2 and EXACT pass) |
+| `bench_ab.py` vs 7f4628f, single requests S to XL | | 0–2% slower | 0.99–1.00× |
+| 32 clients | 18.3 / 18.5 decisions/s | 16.9 (−7.5%) | **18.9** (rounds 18.5–20.6 vs 18.4–19.3: noise) |
+| `tests/test_strix.py` | | 73 | 85 passed |
+
+The kernel test `test_attention_of_a_unit_ignores_the_others` (a causal or branched unit after 1, 8, 31, 33 or 100
+tokens and before 0, 5, 13, 32 or 37) is bit-identical to the unit alone; with one span over the whole sequence (the
+old alignment emulated) 2.3–11.7% of the outputs differ for every mid-block start. Full suite 894 passed / 7 failed /
+25 skipped (the same 7 as at 7f4628f).
 
 ## Result
 
@@ -75,6 +102,7 @@ alone and batched, so the full-length layers compute its rows from the same data
   phase 1 must be (and was) regenerated with this code.
 - **Speed** (measured 2026-10-29, below): single requests 0–2% slower, **32 clients 7.5% slower**, over the plan's
   3% budget. A single request carries up to 31 pad rows: +3% rows on a 715-token case, +60% on a 20-token one.
+  Superseded by the unit tiles (top).
 - The new GPU test `test_first_request_equals_alone` does **not** reproduce the effect on the tiny test model (it
   passes on the old patch too). The guards are `test_a_unit_packs_the_same_alone_and_next_to_others` (first, middle
   and last unit, causal and branched packs) and the exact-size assert in the budget test: 31 of their 34 cases fail on
@@ -121,10 +149,10 @@ Phase 1 on the test split (2,000 decisions), engine 2.4.1; eager runs one prompt
 - A bf16 GGUF (made from the safetensors with the official Q8_0 file's metadata; F32 tensors bit-equal to it) runs in
   `--mode gguf`: 49 / 50 decisions equal to eager bf16 in a smoke test, about eager's speed. Not run on the full split.
 
-**Speed of this branch** (`bench_ab.py`, two servers interleaved, median of 5, old = 7f4628f): S-q1 165 → 166 ms, M-q1
-278 → 283, L-q1 753 → 763, XL-q20 3056 → 3123 (0–2% slower); 32 clients 18.3 → 16.9 decisions/s (**−7.5%**). The
-padding adds 9.5% rows to the 32-client burst (128 units, median 151 tokens); BN = 16 would add 4.7%, 8-row padding with
-unit-relative key blocks in the kernel 2.4%.
+**Speed of the padding version** (`bench_ab.py`, two servers interleaved, median of 5, old = 7f4628f): S-q1 165 →
+166 ms, M-q1 278 → 283, L-q1 753 → 763, XL-q20 3056 → 3123 (0–2% slower); 32 clients 18.3 → 16.9 decisions/s
+(**−7.5%**). The padding adds 9.5% rows to the 32-client burst (128 units, median 151 tokens); BN = 16 would add 4.7%,
+8-row padding with unit-relative key blocks in the kernel 2.4%; the unit tiles add none.
 
 ## `--near-ties eager` (branch `strix-near-ties`, 2026-10-30)
 
@@ -138,7 +166,9 @@ strix's weights, alone as `--mode eager --soam off --max-batch 1` runs it (`docs
 | G2: 8 in flight vs one at a time | 0 probabilities differ |
 | vs eager fp32 | 0.9915 (17 flips; strix alone 0.9935) |
 | computed again | 114 decisions (5.7%) in 104 of 400 requests |
-| server time | ×1.42 one at a time, ×1.39 with 8 in flight; +0.48 s median on a touched request (max 1.2 s) |
+| server time | ×1.39–1.42 (two runs, one at a time and 8 in flight); +0.48 s median on a touched request (max 1.2 s) |
+
+Same results on the unit-tile kernel (rerun 2026-10-30).
 
 The 2 flips left have strix margins of 0.059 and 0.090; one of them (`customer_service_000056`) is a decision where
 eager bf16 alone disagrees with fp32 at a margin of 0.107 and strix agrees with fp32.
@@ -151,7 +181,8 @@ eager bf16 alone disagrees with fp32 at a margin of 0.107 and strix agrees with 
 | `basal-strix-gates.py` | agreement tables, G1 / G2 and EXACT identity checks, per decision |
 | `basal-strix-verified-plan.md` | the plan, as written before this verification |
 | `results/gates-bf16.json`, `results/gates-fp32.json` | the gate numbers of every run above (answer files: `~/strix-verify/*.jsonl` on the box; the patch-as-written ones are `*.prev-patch-7f4628f-padding-v1`) |
-| `results/bench-ab.json` | `bench_ab.py`, 7f4628f vs this branch |
+| `results/bench-ab.json`, `results/bench-ab-unit-tiles.json` | `bench_ab.py`, 7f4628f vs the padding version and vs the unit tiles |
+| `results/gates-7f4628f.json` | 7f4628f one at a time and 8 in flight (`~/strix-verify/unpatched/`) |
 | `experiments/` | `serve_capture.py` (server that records every `run_shared` call), `replay.py` (alone vs batched per group, fix variants), `trace.py` (first differing op), `isolate.py` (which input moves the last row), `rowdep.py`, `exp_split.py`, `exp_real.py` |
 
 This directory is verification tooling, not part of the upstream change: drop the commit that adds it before a PR

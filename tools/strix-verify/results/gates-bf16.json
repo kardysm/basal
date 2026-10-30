@@ -1,6 +1,6 @@
 {
  "ref": "eager.jsonl",
- "dir": "/home/kardysm/strix-verify",
+ "dir": ".",
  "files": {
   "eager-packed.jsonl": {
    "decisions": 2000,

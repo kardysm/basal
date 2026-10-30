@@ -1,0 +1,185 @@
+{
+ "ref": "../eager.jsonl",
+ "dir": ".",
+ "files": {
+  "strix.jsonl": {
+   "decisions": 2000,
+   "flips": 20,
+   "agreement": 0.99,
+   "agreement_ci": [
+    0.9846039417177715,
+    0.9935172830337258
+   ],
+   "flip_rate": 0.01,
+   "p_pass_1000": 0.0661395116072514,
+   "failed_cases": 0,
+   "bands": {
+    ">=0.10": {
+     "agree": 1769,
+     "of": 1769
+    },
+    "0.02-0.05": {
+     "agree": 61,
+     "of": 68
+    },
+    "0.05-0.10": {
+     "agree": 119,
+     "of": 119
+    },
+    "<0.02": {
+     "agree": 31,
+     "of": 44
+    }
+   },
+   "flip_ids": [
+    "agent_trace_observability_000000/risk",
+    "agent_trace_observability_000003/risk",
+    "agent_trace_observability_000026/outcome",
+    "agent_trace_observability_000033/urgency",
+    "agent_trace_observability_000043/risk",
+    "agent_trace_observability_000052/action",
+    "customer_service_000004/urgency",
+    "customer_service_000016/action",
+    "customer_service_000056/action",
+    "customer_service_000091/urgency",
+    "invoice_processing_000004/discrepancy_severity",
+    "invoice_processing_000056/disposition",
+    "invoice_processing_000061/disposition",
+    "invoice_processing_000075/urgency",
+    "invoice_processing_000084/discrepancy_severity",
+    "security_incidents_000021/urgency",
+    "security_incidents_000022/disposition",
+    "security_incidents_000068/severity",
+    "security_incidents_000091/true_positive",
+    "security_incidents_000092/true_positive"
+   ]
+  },
+  "strix-c8.jsonl": {
+   "decisions": 2000,
+   "flips": 19,
+   "agreement": 0.9905,
+   "agreement_ci": [
+    0.9852094988443749,
+    0.993909808789522
+   ],
+   "flip_rate": 0.0095,
+   "p_pass_1000": 0.0874952226636031,
+   "failed_cases": 0,
+   "bands": {
+    ">=0.10": {
+     "agree": 1769,
+     "of": 1769
+    },
+    "0.02-0.05": {
+     "agree": 62,
+     "of": 68
+    },
+    "0.05-0.10": {
+     "agree": 119,
+     "of": 119
+    },
+    "<0.02": {
+     "agree": 31,
+     "of": 44
+    }
+   },
+   "flip_ids": [
+    "agent_trace_observability_000003/risk",
+    "agent_trace_observability_000026/outcome",
+    "agent_trace_observability_000043/risk",
+    "agent_trace_observability_000052/action",
+    "agent_trace_observability_000054/needs_review",
+    "customer_service_000004/urgency",
+    "customer_service_000016/action",
+    "customer_service_000056/action",
+    "customer_service_000091/urgency",
+    "customer_service_000094/action",
+    "invoice_processing_000061/disposition",
+    "security_incidents_000021/urgency",
+    "security_incidents_000022/disposition",
+    "security_incidents_000045/severity",
+    "security_incidents_000061/severity",
+    "security_incidents_000068/severity",
+    "security_incidents_000070/severity",
+    "security_incidents_000082/credential_compromise",
+    "security_incidents_000092/true_positive"
+   ]
+  }
+ },
+ "decisions": 2000,
+ "cases": 400,
+ "G2": {
+  "strix-c8.jsonl": {
+   "base": "strix.jsonl",
+   "decisions": 2000,
+   "decision_diffs": [
+    "agent_trace_observability_000000/risk",
+    "agent_trace_observability_000033/urgency",
+    "agent_trace_observability_000054/needs_review",
+    "customer_service_000094/action",
+    "invoice_processing_000004/discrepancy_severity",
+    "invoice_processing_000056/disposition",
+    "invoice_processing_000075/urgency",
+    "invoice_processing_000084/discrepancy_severity",
+    "security_incidents_000045/severity",
+    "security_incidents_000061/severity",
+    "security_incidents_000070/severity",
+    "security_incidents_000082/credential_compromise",
+    "security_incidents_000091/true_positive"
+   ],
+   "probability_diffs": [
+    "agent_trace_observability_000000/action",
+    "agent_trace_observability_000000/needs_review",
+    "agent_trace_observability_000000/outcome",
+    "agent_trace_observability_000000/urgency",
+    "agent_trace_observability_000002/action",
+    "agent_trace_observability_000002/needs_review",
+    "agent_trace_observability_000002/outcome",
+    "agent_trace_observability_000002/risk",
+    "agent_trace_observability_000002/urgency",
+    "agent_trace_observability_000003/action",
+    "agent_trace_observability_000003/needs_review",
+    "agent_trace_observability_000003/outcome",
+    "agent_trace_observability_000003/risk",
+    "agent_trace_observability_000003/urgency",
+    "agent_trace_observability_000004/action",
+    "agent_trace_observability_000004/needs_review",
+    "agent_trace_observability_000004/outcome",
+    "agent_trace_observability_000004/risk",
+    "agent_trace_observability_000004/urgency",
+    "agent_trace_observability_000005/action",
+    "agent_trace_observability_000005/needs_review",
+    "agent_trace_observability_000005/outcome",
+    "agent_trace_observability_000005/risk",
+    "agent_trace_observability_000005/urgency",
+    "agent_trace_observability_000006/action",
+    "agent_trace_observability_000006/needs_review",
+    "agent_trace_observability_000006/outcome",
+    "agent_trace_observability_000006/risk",
+    "agent_trace_observability_000006/urgency",
+    "agent_trace_observability_000007/action",
+    "agent_trace_observability_000007/needs_review",
+    "agent_trace_observability_000007/outcome",
+    "agent_trace_observability_000007/risk",
+    "agent_trace_observability_000007/urgency",
+    "agent_trace_observability_000009/action",
+    "agent_trace_observability_000009/needs_review",
+    "agent_trace_observability_000009/outcome",
+    "agent_trace_observability_000009/risk",
+    "agent_trace_observability_000009/urgency",
+    "agent_trace_observability_000011/action",
+    "agent_trace_observability_000011/needs_review",
+    "agent_trace_observability_000011/outcome",
+    "agent_trace_observability_000011/risk",
+    "agent_trace_observability_000011/urgency",
+    "agent_trace_observability_000012/action",
+    "agent_trace_observability_000012/needs_review",
+    "agent_trace_observability_000012/outcome",
+    "agent_trace_observability_000012/risk",
+    "agent_trace_observability_000012/urgency",
+    "agent_trace_observability_000013/action"
+   ],
+   "passed": false
+  }
+ }
+}
