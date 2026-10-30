@@ -14,7 +14,11 @@
 #   ./basal-strix-verify.sh status         # what is in $WORK
 #   ./basal-strix-verify.sh sdpa           # which SDPA kernel the eager reference really runs (one profiled forward)
 #
-# Env: PY, REPO (code under test), MODEL, PORT, WORK, PW (pairwise.py), SNAP (dataset snapshot), DRY=1, FORCE=1.
+#   CASES=their.jsonl WORK=~/floor ./basal-strix-verify.sh all; WORK=~/floor ./basal-strix-verify.sh gates
+#                                          # the same runs and tables on another prompt set (basal-run input lines)
+#
+# Env: PY, REPO (code under test), MODEL, PORT, WORK, PW (pairwise.py), SNAP (dataset snapshot), CASES (case file
+# for the test slot instead of $WORK/cases-test.jsonl), DRY=1, FORCE=1.
 set -euo pipefail
 
 PY=${PY:-$HOME/basal-env/bin/python}
@@ -161,6 +165,7 @@ run_one() {  # name, split
     local name=$1 split=$2 cases out
     set_conf "$name" || die "unknown config $name"
     cases="$WORK/cases-$split.jsonl"
+    if [ "$split" = test ] && [ -n "${CASES:-}" ]; then cases=$CASES; fi  # another prompt set in the test slot
     out="$WORK/$(out_name "$name" "$split")"
     [ -f "$cases" ] || die "no $cases (run: $0 setup)"
     if [ -s "$out" ] && [ "$FORCE" != 1 ]; then

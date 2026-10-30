@@ -1,0 +1,89 @@
+{
+ "ref": "strix.jsonl",
+ "dir": ".",
+ "files": {
+  "strix-1ulp.jsonl": {
+   "decisions": 2000,
+   "flips": 17,
+   "agreement": 0.9915,
+   "agreement_ci": [
+    0.9864291960388386,
+    0.9946862773598572
+   ],
+   "flip_rate": 0.0085,
+   "p_pass_1000": 0.14847509225653,
+   "failed_cases": 0,
+   "bands": {
+    ">=0.10": {
+     "agree": 1766,
+     "of": 1766
+    },
+    "0.02-0.05": {
+     "agree": 69,
+     "of": 74
+    },
+    "0.05-0.10": {
+     "agree": 119,
+     "of": 120
+    },
+    "<0.02": {
+     "agree": 29,
+     "of": 40
+    }
+   },
+   "flip_ids": [
+    "agent_trace_observability_000000/risk",
+    "agent_trace_observability_000033/urgency",
+    "agent_trace_observability_000052/action",
+    "agent_trace_observability_000054/needs_review",
+    "customer_service_000091/urgency",
+    "invoice_processing_000003/discrepancy_severity",
+    "invoice_processing_000013/urgency",
+    "invoice_processing_000019/urgency",
+    "invoice_processing_000025/disposition",
+    "invoice_processing_000057/urgency",
+    "invoice_processing_000075/urgency",
+    "security_incidents_000021/urgency",
+    "security_incidents_000045/severity",
+    "security_incidents_000061/severity",
+    "security_incidents_000068/severity",
+    "security_incidents_000070/disposition",
+    "security_incidents_000091/true_positive"
+   ]
+  }
+ },
+ "decisions": 2000,
+ "cases": 400,
+ "G2": {
+  "strix-c8.jsonl": {
+   "base": "strix.jsonl",
+   "decisions": 2000,
+   "decision_diffs": [],
+   "probability_diffs": [],
+   "passed": true
+  },
+  "strix-det-c8.jsonl": {
+   "base": "strix.jsonl",
+   "decisions": 2000,
+   "decision_diffs": [],
+   "probability_diffs": [],
+   "passed": true
+  },
+  "strix-ties-c8.jsonl": {
+   "base": "strix-ties.jsonl",
+   "decisions": 2000,
+   "decision_diffs": [],
+   "probability_diffs": [],
+   "passed": true
+  }
+ },
+ "EXACT": {
+  "strix-ties-all.jsonl": {
+   "base": "eager.jsonl",
+   "decisions": 2000,
+   "decision_diffs": [],
+   "probability_diffs": [],
+   "passed": true
+  }
+ }
+}

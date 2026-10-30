@@ -173,6 +173,43 @@ Same results on the unit-tile kernel (rerun 2026-10-30).
 The 2 flips left have strix margins of 0.059 and 0.090; one of them (`customer_service_000056`) is a decision where
 eager bf16 alone disagrees with fp32 at a margin of 0.107 and strix agrees with fp32.
 
+## Why not 99.5% against eager bf16 without a slowdown (2026-10-30)
+
+**Per op** (`experiments/exact_probe.py`, basal-2.0 layer 10, random bf16 inputs): outputs of the strix op that
+differ from the stock op of the eager forward.
+
+| op | 300 rows | 700 rows | 2,000 rows |
+|---|---|---|---|
+| qkv (vs `F.linear`, hipBLASLt) | 0 | 0 | 0.08% |
+| o + residual | 0 | 0 | 0.01% |
+| gate / up / SwiGLU (vs the HF MLP) | 0 | 0.21% | 0 |
+| down + residual | 0 | 0 | 0 |
+| RMSNorm (vs the HF module) | 0 | 0 | 0 |
+| attention (vs math SDPA, what eager runs on gfx1151) | 36.1% | 38.0% | 39.2% |
+
+**Sensitivity** (`experiments/serve_perturb.py`: element 0 of the first token after the embedding moved one bf16
+step, test split, one at a time): 17 of 2,000 decisions differ from strix (0.9915; `results/gates-1ulp.json`), median
+largest |Δp| 0.0044 and p99 0.034, against 0.0046 and 0.039 between strix and eager bf16. Against eager bf16 the
+perturbed run scores 0.9895 (strix 0.9900).
+
+One bf16 step in one value grows into the full bf16 noise over the 60 layers, so a forward that matches eager in
+99.9% of its values agrees with it no better than fp32 does. Beyond the floor needs every value bit-identical: an
+attention kernel that reproduces the math kernel's fp32 arithmetic and reduction orders (several times the attention
+time), the state recomputed per question at each prompt's length as eager does (hipBLASLt changes kernel with the
+row count, so eager's state rows differ between questions), and the maintainers' exact PyTorch / ROCm build. Options
+without a slowdown are what is done (batch invariance) and the bar: an fp32 reference, a floor-relative bar, or a
+margin-filtered one.
+
+**The floor on another prompt set** (the decisive measurement for the maintainers' 1,000 prompts): with their cases in
+basal-run's input format,
+
+```bash
+CASES=their-cases.jsonl WORK=~/floor ./basal-strix-verify.sh all   # eager, eager fp32, eager packed, strix x3
+WORK=~/floor ./basal-strix-verify.sh gates                        # eager-packed and fp32 vs eager: the floor
+```
+
+If eager-packed and eager fp32 also stay under 99.5% against eager there, the bar is below the bf16 floor of that set.
+
 ## Files
 
 | file | what |
@@ -183,7 +220,8 @@ eager bf16 alone disagrees with fp32 at a margin of 0.107 and strix agrees with 
 | `results/gates-bf16.json`, `results/gates-fp32.json` | the gate numbers of every run above (answer files: `~/strix-verify/*.jsonl` on the box; the patch-as-written ones are `*.prev-patch-7f4628f-padding-v1`) |
 | `results/bench-ab.json`, `results/bench-ab-unit-tiles.json` | `bench_ab.py`, 7f4628f vs the padding version and vs the unit tiles |
 | `results/gates-7f4628f.json` | 7f4628f one at a time and 8 in flight (`~/strix-verify/unpatched/`) |
-| `experiments/` | `serve_capture.py` (server that records every `run_shared` call), `replay.py` (alone vs batched per group, fix variants), `trace.py` (first differing op), `isolate.py` (which input moves the last row), `rowdep.py`, `exp_split.py`, `exp_real.py` |
+| `results/gates-1ulp.json` | strix vs strix with one value moved one bf16 step |
+| `experiments/` | `exact_probe.py` (strix ops vs stock ops, bit for bit) and `serve_perturb.py` (the one-step server), current API; `serve_capture.py` (server that records every `run_shared` call), `replay.py` (alone vs batched per group, fix variants), `trace.py` (first differing op), `isolate.py` (which input moves the last row), `rowdep.py`, `exp_split.py`, `exp_real.py`, the padding version's API |
 
 This directory is verification tooling, not part of the upstream change: drop the commit that adds it before a PR
 to rkinas/basal.
