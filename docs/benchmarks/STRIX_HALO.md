@@ -58,6 +58,14 @@ reaches 16–19 useful TFLOPS at every request size. GPU time by operation, from
   every query sees run without a mask, so a packed row costs what a causal row of the same length costs. Rows of
   several requests are separate trees of one sequence: no padding, no captured shapes, no graphs, up to 16,384 tokens
   per forward; longer requests are bisected like in GraphBackend.
+- **A request's answers do not depend on what shares its forward.** The attention kernel keeps to each request (each
+  packed unit): its query tiles never cross one, its key blocks of 32 start at the unit's first token, and keys past
+  the unit's end load as zeros, so every block is the one the unit has alone. Engine 2.4.1 and earlier aligned the key
+  blocks to the whole sequence: a request packed after others had its keys split differently, and 11–16% of its
+  attention outputs came out one bf16 step apart. On the typed-decisions test split (2,000 decisions), 8 requests in
+  flight then changed 13 decisions against one at a time, and the probabilities of 1,468 (by up to 0.09); now none,
+  and a request alone gets exactly the answers of 2.4.1. Speed is unchanged (interleaved A/B against 2.4.1, S to XL
+  with 1–20 questions: 0.99–1.00×; 32 clients 18.5 → 18.9 decisions/s). `--deterministic` is not needed for this.
 - The last layer computes attention, o and the FFN for the readout rows only.
 - Rounding follows the stock bf16 forward step by step (RMSNorm in fp32 then the weight in bf16, rotary as
   round(q cos) + round(rot(q) sin), silu(gate) and its product with up rounded to bf16, bias then residual each
@@ -190,6 +198,55 @@ reference (one does not fit in 32 GB): `strix` and `gguf` 142 of 144 decisions e
   the Q8_0 file 5 GB.
 - Llama models with silu, a power-of-two hidden size and an FFN size divisible by 64 (checked at start-up); bf16 only.
   Tile configs were tuned on the 8060S; the mode has not been run on other GPUs.
+
+## Agreement with `--mode eager` bf16, and `--near-ties eager`
+
+Public test split of `LocalLLaMA/typed-decisions` (400 cases, 2,000 decisions), basal-2.0-4.5B, engine 2.4.1, one
+request at a time; references `--mode eager` bf16 and fp32, each with every prompt alone (`--soam off --max-batch 1`):
+
+| engine | vs eager bf16 | vs eager fp32 |
+|---|---|---|
+| eager bf16, default packing | 0.9910 (18 flips) | 0.9935 (13) |
+| eager fp32 | 0.9905 (19) | reference |
+| `strix` | 0.9900 (20) | 0.9935 (13) |
+| `strix --near-ties eager` | **0.9990** (2) | 0.9915 (17) |
+
+Every bf16 forward of the model is as far from every other as from fp32 (largest probability change per decision:
+median 0.004–0.005, 99th percentile 0.034–0.039), eager against itself in another packing included, and the flips are
+the near-ties that this noise tips. Without an error of its own, a forward agrees with eager bf16 as often as fp32 does
+(0.9905), so no kernel change brings `strix` to 99.5% against eager bf16. Every flip of `strix` and of eager-packed has
+a reference top-two margin under 0.05 (largest 0.046 and 0.040); eager fp32 has one at 0.089. Two measurements show
+why:
+
+- **Most of `strix` already computes what eager does, bit for bit.** On basal-2.0's layer weights, its qkv, o and
+  down matmuls, residual adds, FFN input and RMSNorm give the same outputs as the stock ops at 300, 700 and 2,000 rows,
+  except 0.01–0.21% of the outputs at some row counts (where hipBLASLt picks another kernel). Its attention differs in
+  36–39% (flash attention with bf16 weights against PyTorch's math kernel in fp32).
+- **Any difference grows to the full noise.** Moving one value by one bf16 step (element 0 of the first token after
+  the embedding) changes 17 of 2,000 decisions of `strix` against itself, as far as it is from eager bf16 (median
+  largest probability change 0.0044 against 0.0046).
+
+So `strix` would agree with eager bf16 beyond the floor only if every value of every layer were bit-identical to
+eager's: attention in fp32 the way the math kernel computes it, the state computed again for each question at each
+prompt's length (hipBLASLt's kernel changes with the row count), and the same PyTorch / ROCm build. That is eager's
+speed.
+
+`--near-ties eager` answers near-ties as eager bf16 does. A question (each label of a `multi`) whose calibrated
+top-two margin under `strix` is below `--near-tie-margin` (default 0.05) is computed again by the transformers forward
+on the same weights, alone as `--mode eager --soam off --max-batch 1` computes it, and answered from it; the other
+questions keep `strix`'s answers. On the test split:
+
+- 114 of 2,000 decisions (5.7%, in 104 of 400 requests) were computed again; the 2 flips left are decisions with a
+  `strix` margin of 0.059 and 0.090.
+- With `--near-tie-margin 1.01` every decision is computed again, and all 2,000 equal the eager bf16 reference with
+  every probability: the questions it computes again get exactly eager's answer.
+- 8 requests in flight give the same answers as one at a time, every probability.
+- Cost: eager takes 7.4× `strix`'s time per decision, so the server time grows 1.39–1.42× (two runs, one at a time
+  and 8 in flight); a request with a near tie waits 0.48 s longer (median; at most 1.2 s), the median request 9–15
+  ms. No second copy of the weights: the stock modules share `strix`'s.
+- Against fp32 it agrees less (0.9915 vs 0.9935): the near-ties now carry eager bf16's own rounding.
+
+Off by default. It exists for checks against `--mode eager` bf16; against fp32, plain `strix` is closer.
 
 ## Method
 

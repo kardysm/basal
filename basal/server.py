@@ -748,6 +748,15 @@ class Server:
                              "nvfp4)")
         if getattr(a, "mlx_packed", False) and kind != "mlx":
             raise SystemExit("--mlx-packed needs --mode mlx (or mlx-q8)")
+        if getattr(a, "near_ties", "off") != "off":
+            if kind != "strix":
+                raise SystemExit("--near-ties eager needs --mode strix (the transformers forward on strix's weights "
+                                 "answers the near ties)")
+            if a.orders == "auto":
+                raise SystemExit("--near-ties eager is not combined with --orders auto (the second option order would "
+                                 "be chosen from strix's first one)")
+            if not a.near_tie_margin > 0:
+                raise SystemExit("--near-tie-margin must be above 0")
         if kind == "mps" and a.device == "cuda":
             raise SystemExit("--mode mps runs on Apple Silicon or the CPU (--device mps / cpu); on CUDA: --mode fast")
         if kind in ("graph", "exit"):  # before the weights are downloaded (mps: MPSBackend, when it shares prefixes)
@@ -832,6 +841,11 @@ class Server:
         self.states_cached = bool(getattr(a, "state_cache_gb", 0))  # --state-cache-gb: requests are cut at their state
         model = getattr(self.backend, "model", None)  # evidence head: needs the in-process HF model
         self.evidence = Evidence(md, model, self.tok, self.fmt) if isinstance(model, torch.nn.Module) else None
+        self.ties = None  # --near-ties eager: the transformers forward that answers near ties (recheck)
+        if getattr(a, "near_ties", "off") == "eager":
+            self.ties, self.tie_margin = EagerBackend.around(model, self.tok), a.near_tie_margin
+            print(f"basal: --near-ties eager: questions with a top-two margin under {self.tie_margin} are answered by "
+                  "the transformers forward (as --mode eager --soam off --max-batch 1)", flush=True)
         self.md, self.kind = md, kind
         self.context = context_limit(md, self.backend)
         self.cal, cal, self.cal_unvalidated = load_calibration(md, kind, a.calibration, quant, self.orders,
@@ -1064,6 +1078,28 @@ class Server:
             return self.band[0] <= p[0] <= self.band[1]
         return max(p) < self.tau
 
+    async def recheck(self, qs, branches, outs, pol):
+        """--near-ties eager: every branch (a question, or one label of a multi question) whose calibrated top-two
+        margin is under --near-tie-margin is computed again by the transformers forward, alone in its forward as --mode
+        eager --soam off --max-batch 1 computes it, and answered from that forward (outs is updated in place). Its
+        answer is then the one --mode eager gives in that configuration; the other branches keep strix's.
+        -> the number of branches computed again."""
+        ties = getattr(self, "ties", None)
+        if ties is None:
+            return 0
+        redo = []
+        for j, (b, o) in enumerate(zip(branches, outs)):
+            q = qs[b[0]]
+            t = "noul" if q["type"] == "multi" or q.get("multi") else q.get("base", q["type"])  # as in assemble
+            p = sorted(self.canonical(t, b[2], o), reverse=True)
+            if len(p) > 1 and p[0] - p[1] < self.tie_margin:
+                redo.append(j)
+        loop = asyncio.get_running_loop()
+        for j in redo:  # one branch per call (its prompts in every option order), as --soam off queues it
+            b = branches[j]
+            outs[j] = (await loop.run_in_executor(None, functools.partial(ties.run_shared, [(b[3], b[4])], pol)))[0]
+        return len(redo)
+
     def code_ids(self, prompt, k):
         """Option code ids at the answer position. They depend only on the number of options, so the ids of all codes of
         the format are computed once (first prompt) and sliced; per k if one of them is not a single token."""
@@ -1260,6 +1296,7 @@ class Server:
             outs, n_tok, longest, n_media = await self.ask_media(qs, branches, m)
         else:
             qs, branches, outs, n_tok, longest, truncation, cut, lane = await self.ask_text(body, qs, branches, pol)
+        n_ties = await self.recheck(qs, branches, outs, pol)
         second = []
         if self.orders == "auto":  # the reversed option order, only for the branches that are uncertain in order 1
             redo = [j for j, (b, o) in enumerate(zip(branches, outs)) if self.uncertain(qs[b[0]], b[2], o)]
@@ -1274,13 +1311,14 @@ class Server:
                     o2 = await self.ask(second, pol, cut, lane)
                 for j, b2, o in zip(redo, second, o2):
                     branches[j][2].extend(b2[2]); outs[j] = outs[j] + o
-        out = await self.assemble(body, qs, branches, outs, m, n_tok, n_media, longest, second, truncation, lane, t0)
+        out = await self.assemble(body, qs, branches, outs, m, n_tok, n_media, longest, second, truncation, lane, t0,
+                                  near_ties=n_ties if getattr(self, "ties", None) is not None else None)
         if plans:  # the task answers from their decision answers; extract's spans need a second round of decisions
             r2, a2 = tasks.second_round(out, orig, plans, self.max_options), None
             if r2 is not None:
                 out2 = await self.decide(r2)
                 a2 = out2["answers"]
-                for k in ("input_tokens", "branches"):
+                for k in ("input_tokens", "branches") + (("near_ties",) if "near_ties" in out["usage"] else ()):
                     out["usage"][k] = out["usage"].get(k, 0) + out2["usage"].get(k, 0)
             out = tasks.finish(out, orig, plans, self.cal, a2)
             out["usage"]["latency_ms"] = round((time.perf_counter() - t0) * 1000, 2)
@@ -1355,8 +1393,10 @@ class Server:
         outs = await self.ask(branches, pol, cut, lane)
         return qs, branches, outs, n_tok, longest, truncation, cut, lane
 
-    async def assemble(self, body, qs, branches, outs, m, n_tok, n_media, longest, second, truncation, lane, t0):
-        """Answers and usage of a request from the position probabilities of its branches."""
+    async def assemble(self, body, qs, branches, outs, m, n_tok, n_media, longest, second, truncation, lane, t0,
+                       near_ties=None):
+        """Answers and usage of a request from the position probabilities of its branches (near_ties: the branches
+        --near-ties eager computed again, in usage)."""
         loop = asyncio.get_running_loop()
         per_q = [[] for _ in qs]
         for b, o in zip(branches, outs):
@@ -1409,6 +1449,8 @@ class Server:
                                      "detail": m["detail"]}
         if self.orders == "auto":
             out["usage"]["second_order_branches"] = len(second)
+        if near_ties is not None:
+            out["usage"]["near_ties"] = near_ties
         out["usage"]["longest_prompt_tokens"] = max(longest, default=0)
         if truncation:
             out["usage"]["truncated"] = truncation
@@ -1581,6 +1623,14 @@ def add_engine_args(ap):
                     help="extra time to wait for more requests before a forward (default 0: adaptive batching)")
     ap.add_argument("--batch-window-ms", dest="batch_window_ms", type=float, default=3.0,
                     help="under load, wait up to this long for as many requests as the previous forward had (0: off)")
+    ap.add_argument("--near-ties", dest="near_ties", choices=["off", "eager"], default="off",
+                    help="--mode strix: a question (each label of a multi question) whose calibrated top-two margin is "
+                         "under --near-tie-margin is computed again by the transformers forward on the same weights, "
+                         "alone as --mode eager --soam off --max-batch 1 runs it, and answered from it; the other "
+                         "questions keep strix's answers (default off)")
+    ap.add_argument("--near-tie-margin", dest="near_tie_margin", type=float, default=0.05,
+                    help="--near-ties eager: the top-two margin under which a question is computed again (default "
+                         "0.05; 1 or more: every question)")
     return ap
 
 

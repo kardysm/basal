@@ -159,6 +159,28 @@ class EagerBackend:
             if forward == "basal":
                 from .gemma4 import Gemma4Forward, attention_plan
                 self.g4 = Gemma4Forward(self.model, attn=attention_plan(attn))
+        self._ready(dev)
+
+    @classmethod
+    def around(cls, model, tok):
+        """An eager backend on a transformers model that is already loaded (no second copy of the weights), as the
+        constructor sets one up for text: the transformers forward, its SDPA kernels, the fp32 option-code head.
+        --near-ties eager runs it next to --mode strix on the strix backend's model."""
+        from .gemma4 import is_gemma4
+        if is_gemma4(model):
+            raise ValueError("EagerBackend.around takes the transformers forward; Gemma 4 runs basal/gemma4.py")
+        self = cls.__new__(cls)
+        self.tok, self.model = tok, model
+        self.media_kinds, self.max_audio_s, self.proc = (), None, None
+        self.lock, self.media_lock = threading.Lock(), threading.Lock()
+        dev = next(model.parameters()).device
+        if dev.type == "cuda":
+            torch.backends.cuda.enable_cudnn_sdp(False)  # as the constructor does
+        self._ready(dev)
+        return self
+
+    def _ready(self, dev):
+        """The rest of the set-up once the model is on `dev`: SDPA kernels, prefill and the option-code head."""
         self.dev = dev
         self.sdpa_kernels = eager_sdpa_kernels(dev)
         self.prefill = PREFILL
